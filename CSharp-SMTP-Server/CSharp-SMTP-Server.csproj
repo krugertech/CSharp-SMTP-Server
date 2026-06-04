@@ -7,12 +7,12 @@
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
 
-    <RootNamespace>CSharp_SMTP_Server</RootNamespace>
+    <RootNamespace>Krugertech_CSharp_SMTP_Server</RootNamespace>
     <Authors>Łukasz Jurczyk, Llewellyn Kruger</Authors>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <Copyright>Copyright by Łukasz Jurczyk, 2019-2023, Llewellyn Kruger 2026</Copyright>
-    <PackageProjectUrl>https://github.com/zabszk/CSharp-SMTP-Server</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/zabszk/CSharp-SMTP-Server</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/krugertech/CSharp-SMTP-Server</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/krugertech/CSharp-SMTP-Server</RepositoryUrl>
     <RepositoryType>GIT</RepositoryType>
     <Description>SMTP Server library for C#.</Description>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
@@ -22,7 +22,10 @@
     <LangVersion>11</LangVersion>
     <Nullable>enable</Nullable>
     <PackageVersion>1.1.6-krugertech.1</PackageVersion>
-    <Title>CSharp SMTP Server</Title>
+    <Title>Krugertech CSharp SMTP Server</Title>
+    <Description>
+      Krugertech fork of CSharp-SMTP-Server v1.1.6 with ACK-gated DATA delivery support.
+    </Description>
     <GenerateAssemblyInformationalVersionAttribute>false</GenerateAssemblyInformationalVersionAttribute>
     <GenerateAssemblyFileVersionAttribute>false</GenerateAssemblyFileVersionAttribute>
     <GenerateAssemblyVersionAttribute>false</GenerateAssemblyVersionAttribute>
