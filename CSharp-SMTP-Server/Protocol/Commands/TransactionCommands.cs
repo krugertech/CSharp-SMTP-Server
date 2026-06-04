@@ -261,11 +261,11 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					catch (Exception ex)
 					{
 						processor.Server.LoggerInterface?.LogError("[DATA] Delivery handler threw before SMTP ACK: " + ex.GetType().FullName + ": " + ex.Message);
-						await processor.WriteCode(451, "Requested action aborted: local error in processing");
+						await processor.WriteCode(451, "4.3.0", "Requested action aborted: local error in processing");
 						return;
 					}
 
-					await processor.WriteCode(deliveryResult.StatusCode, deliveryResult.Message);
+					await processor.WriteCode((ushort)deliveryResult.StatusCode, deliveryResult.EnhancedStatus, deliveryResult.Message);
 					return;
 				}
 
