@@ -253,9 +253,19 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					var delivery = (MailTransaction)processor.Transaction.Clone();
 					processor.Transaction = null;
 
-					_ = processor.Server.DeliverMessage(delivery);
+					SmtpDeliveryResult deliveryResult;
+					try
+					{
+						deliveryResult = await processor.Server.DeliverMessage(delivery, processor.ConnectionToken);
+					}
+					catch (Exception ex)
+					{
+						processor.Server.LoggerInterface?.LogError("[DATA] Delivery handler threw before SMTP ACK: " + ex.GetType().FullName + ": " + ex.Message);
+						await processor.WriteCode(451, "Requested action aborted: local error in processing");
+						return;
+					}
 
-					await processor.WriteCode(250, "2.3.0");
+					await processor.WriteCode(deliveryResult.StatusCode, deliveryResult.Message);
 					return;
 				}
 

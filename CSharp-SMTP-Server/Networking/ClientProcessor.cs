@@ -40,6 +40,7 @@ namespace CSharp_SMTP_Server.Networking
 
 		private readonly CancellationTokenSource _ts = new();
 		private readonly CancellationToken _t;
+		internal CancellationToken ConnectionToken => _t;
 
 		internal readonly IPEndPoint? RemoteEndPoint;
 
@@ -166,6 +167,13 @@ namespace CSharp_SMTP_Server.Networking
 		internal async Task WriteCode(ushort code) => await SMTPCodes.SendCode(this, code);
 		internal async Task WriteCode(ushort code, string enhanced) => await SMTPCodes.SendCode(this, code, enhanced);
 		internal async Task WriteCode(ushort code, string enhanced, string text) => await SMTPCodes.SendCode(this, code, enhanced, text);
+		internal async Task WriteCode(int code, string message)
+		{
+			// Sanitize to prevent SMTP response-splitting: CR/LF in a message field would let a
+			// delivery handler inject spurious response lines visible to the remote client.
+			var safe = message.Replace('\r', ' ').Replace('\n', ' ');
+			await WriteText($"{code} {safe}");
+		}
 
 		internal SMTPServer Server => _listener.Server;
 

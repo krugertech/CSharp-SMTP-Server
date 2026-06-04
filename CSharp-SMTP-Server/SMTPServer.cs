@@ -1,11 +1,13 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
+using System.Threading;
 using System.Threading.Tasks;
 using CSharp_SMTP_Server.Interfaces;
 using CSharp_SMTP_Server.Networking;
 using CSharp_SMTP_Server.Protocol;
+using CSharp_SMTP_Server.Protocol.Responses;
 using CSharp_SMTP_Server.Protocol.SPF;
 using CSharp_SMTP_Server.Protocol.DMARC;
 using DnsClient;
@@ -20,9 +22,14 @@ namespace CSharp_SMTP_Server
 	public class SMTPServer : IDisposable
 	{
 		/// <summary>
-		/// Library version
+		/// Library version (NuGet / informational — may include pre-release suffix).
 		/// </summary>
-		public const string VersionString = "1.1.6";
+		public const string VersionString = "1.1.6-krugertech.1";
+
+		/// <summary>
+		/// Numeric-only assembly version required by AssemblyVersion / AssemblyFileVersion attributes.
+		/// </summary>
+		public const string AssemblyVersionString = "1.1.6.1";
 
 		/// <summary>
 		/// Server options
@@ -139,7 +146,8 @@ namespace CSharp_SMTP_Server
 		// ReSharper disable once InconsistentNaming
 		public void SetTLSCertificate(X509Certificate certificate) => Certificate = certificate;
 
-		internal Task DeliverMessage(MailTransaction transaction) => MailDeliveryInterface.EmailReceived(transaction);
+		internal Task<SmtpDeliveryResult> DeliverMessage(MailTransaction transaction, CancellationToken cancellationToken = default) =>
+			MailDeliveryInterface.EmailReceivedAsync(transaction, cancellationToken);
 
 		/// <summary>
 		/// Adds a new listener to the server.

@@ -6,11 +6,11 @@
     <DebugSymbols>true</DebugSymbols>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    
+
     <RootNamespace>CSharp_SMTP_Server</RootNamespace>
-    <Authors>Łukasz Jurczyk</Authors>
+    <Authors>Łukasz Jurczyk, Llewellyn Kruger</Authors>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <Copyright>Copyright by Łukasz Jurczyk, 2019-2023</Copyright>
+    <Copyright>Copyright by Łukasz Jurczyk, 2019-2023, Llewellyn Kruger 2026</Copyright>
     <PackageProjectUrl>https://github.com/zabszk/CSharp-SMTP-Server</PackageProjectUrl>
     <RepositoryUrl>https://github.com/zabszk/CSharp-SMTP-Server</RepositoryUrl>
     <RepositoryType>GIT</RepositoryType>
@@ -21,7 +21,7 @@
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <LangVersion>11</LangVersion>
     <Nullable>enable</Nullable>
-    <PackageVersion>1.1.6</PackageVersion>
+    <PackageVersion>1.1.6-krugertech.1</PackageVersion>
     <Title>CSharp SMTP Server</Title>
     <GenerateAssemblyInformationalVersionAttribute>false</GenerateAssemblyInformationalVersionAttribute>
     <GenerateAssemblyFileVersionAttribute>false</GenerateAssemblyFileVersionAttribute>
@@ -44,7 +44,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="MimeKit" Version="4.3.0" />
+    <PackageReference Include="MimeKit" Version="4.17.0" />
     <PackageReference Include="zabszk.DnsClient" Version="1.0.1" />
   </ItemGroup>
 </Project>

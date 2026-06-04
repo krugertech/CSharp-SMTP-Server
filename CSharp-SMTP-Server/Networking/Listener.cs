@@ -8,6 +8,31 @@ namespace CSharp_SMTP_Server.Networking
 {
 	internal class Listener : IDisposable
 	{
+		// TODO (thread-safety): ClientProcessors is a plain List<> that is written from three distinct
+		// execution contexts without synchronisation:
+		//   1. The listener thread (Listen loop) calls Add() when a new TCP connection is accepted.
+		//   2. Each ClientProcessor's async receive loop calls Remove() via ClientProcessor.Dispose()
+		//      when that connection closes normally or due to an error.
+		//   3. Listener.Dispose() iterates the list to dispose all active processors on shutdown.
+		//
+		// Under load this can produce InvalidOperationException ("collection was modified during
+		// enumeration") in Dispose(), lost Add/Remove updates, or duplicate disposals.
+		//
+		// Recommended fix: protect every access with a shared lock object, and in Dispose() snapshot
+		// the list to an array *after* setting _dispose = true and stopping the listener (so no new
+		// Add() calls can race), then iterate the snapshot:
+		//
+		//   private readonly object _processorsLock = new();
+		//
+		//   // In Listen():      lock (_processorsLock) { ClientProcessors.Add(...); }
+		//   // In Dispose():     ClientProcessor[] snapshot;
+		//                        lock (_processorsLock) { snapshot = ClientProcessors.ToArray(); }
+		//                        foreach (var p in snapshot) p.Dispose(true, true);
+		//   // In CP.Dispose():  lock (_listener._processorsLock) { _listener.ClientProcessors.Remove(this); }
+		//                        (requires exposing the lock or a helper method on Listener)
+		//
+		// This was a pre-existing issue in the original library and has been left intentionally
+		// unchanged to minimise the diff scope of the ACK-gating fork. Fix before high-concurrency use.
 		internal readonly List<ClientProcessor> ClientProcessors;
 		internal readonly SMTPServer Server;
 
@@ -23,10 +48,9 @@ namespace CSharp_SMTP_Server.Networking
 			ClientProcessors = new List<ClientProcessor>();
 
 			var ipEndPoint = new IPEndPoint(address, port);
-			_listener = new TcpListener(ipEndPoint)
-			{
-				Server = { DualMode = dualMode }
-			};
+			_listener = new TcpListener(ipEndPoint);
+			if (dualMode && address.AddressFamily == AddressFamily.InterNetworkV6)
+				_listener.Server.DualMode = true;
 			_listenerThread = new Thread(Listen)
 			{
 				Name = "Listening on port " + port,

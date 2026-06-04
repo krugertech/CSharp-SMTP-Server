@@ -1,13 +1,48 @@
-# CSharp-SMTP-Server [![GitHub release](https://flat.badgen.net/github/release/zabszk/CSharp-SMTP-Server)](https://github.com/zabszk/CSharp-SMTP-Server/releases/) [![NuGet](https://flat.badgen.net/nuget/v/CSharp-SMTP-Server/latest)](https://www.nuget.org/packages/CSharp-SMTP-Server/) [![License](https://flat.badgen.net/github/license/zabszk/CSharp-SMTP-Server)](https://github.com/zabszk/CSharp-SMTP-Server/blob/master/LICENSE)
-Simple (receive only) SMTP server library for C#.
+# CSharp-SMTP-Server — ACK-Gated Fork
 
-This server is only returning all received emails to interface provided by the software running this library.
+> **This is a fork of [zabszk/CSharp-SMTP-Server](https://github.com/zabszk/CSharp-SMTP-Server) v1.1.6 (released 23 Dec 2023).**
+> It was branched specifically to add **ACK gating** to the DATA command.
+> It is not affiliated with or endorsed by the original author.
+> The original library is available on [NuGet](https://www.nuget.org/packages/CSharp-SMTP-Server/).
 
-# Supported features
+Simple (receive-only) SMTP server library for C#.
+
+---
+
+## What is ACK gating and why does it matter?
+
+In the original library the DATA command fires the delivery handler in a background task and immediately returns `250 OK` to the sending MTA — a pattern called *fire-and-forget*. This means the sending MTA considers the message delivered the moment the server acknowledges it, even though your application code has not yet finished (or even started) processing it.
+
+**This fork changes that contract:**
+
+- The server **awaits** your delivery handler before sending any SMTP response.
+- Your handler returns a `SmtpDeliveryResult` that controls exactly what code the client sees.
+- `250 OK` is sent **only after** your handler returns `SmtpDeliveryResult.Ok(...)`.
+- A transient failure (`451`) tells the sender to retry later.
+- A permanent failure (`554`) tells the sender not to retry.
+- An unhandled exception in your handler produces a `451` so the sender retries rather than silently losing the message.
+
+This makes the SMTP `250 OK` a true durability guarantee: the sending MTA will not discard its copy of the message until your handler says it has been safely accepted.
+
+### What this means if you are migrating from the original library
+
+| Original | This fork |
+|---|---|
+| `Task EmailReceived(MailTransaction transaction)` | `Task<SmtpDeliveryResult> EmailReceivedAsync(MailTransaction transaction, CancellationToken cancellationToken = default)` |
+| Return value ignored — always sends `250 OK` | Return value determines the SMTP response sent to the client |
+| Delivery runs in the background | Server blocks the SMTP session until delivery completes |
+| Exception in handler is silently swallowed | Exception produces `451`; sending MTA will retry |
+
+You must rename and update the signature of your `EmailReceived` implementation. No other interface changes are required.
+
+---
+
+## Supported features
 * TLS and STARTTLS
 * AUTH LOGIN and AUTH PLAIN
+* ACK-gated delivery (this fork)
 
-# Compatible with
+## Compatible with
 * RFC 822 (STANDARD FOR THE FORMAT OF ARPA INTERNET TEXT MESSAGES)
 * RFC 1869 (SMTP Service Extensions)
 * RFC 2554 (SMTP Service Extension for Authentication)
@@ -19,96 +54,160 @@ This server is only returning all received emails to interface provided by the s
 * RFC 7372 (Email Authentication Status Codes)
 * RFC 7489 (Domain-based Message Authentication, Reporting, and Conformance (DMARC)) [Partially Supported]
 
-# 3rd party services and libraries usage
-* This library by default uses Cloudflare Public DNS Servers (1.1.1.1) to perform SPF and DMARC validation. IP address of the DNS server can be changed or both validations can be disabled using ServerOptions class.
-* This library by default downloads Public Suffix List managed by Mozilla Foundation from GitHub. The list is licensed under Mozilla Public License v. 2.0. The download URL can be changed in ServerOptions class. The list is NOT downloaded if DnsServerEndpoint is set to null in ServerOptions class.
-* This library uses [MimeKit](https://github.com/jstedfast/MimeKit) library created by .NET Foundation and Contributors and licensed under [The MIT License](https://raw.githubusercontent.com/jstedfast/MimeKit/master/LICENSE).
+---
 
-# Basic usage
+## Basic usage
+
+### Server setup
+
 ```cs
 var server = new SMTPServer(new[]
 {
-	new ListeningParameters(IPAddress.IPv6Any, new ushort[]{25, 587}, new ushort[]{465}, true)
-}, new ServerOptions(){ServerName = "Test SMTP Server", RequireEncryptionForAuth = false}, new DeliveryInterface(), new LoggerInterface());
-//with TLS:
-//}, new ServerOptions() { ServerName = "Test SMTP Server", RequireEncryptionForAuth = true}, new DeliveryInterface(), new LoggerInterface(), new X509Certificate2("PathToCertWithKey.pfx"));
-		
+    new ListeningParameters(IPAddress.IPv6Any, new ushort[] { 25, 587 }, new ushort[] { 465 }, true)
+}, new ServerOptions { ServerName = "My SMTP Server", RequireEncryptionForAuth = false },
+   new DeliveryInterface(),
+   new LoggerInterface());
+
+// With TLS certificate:
+// }, new ServerOptions { ServerName = "My SMTP Server", RequireEncryptionForAuth = true },
+//    new DeliveryInterface(), new LoggerInterface(),
+//    new X509Certificate2("PathToCertWithKey.pfx"));
+
 server.SetAuthLogin(new AuthenticationInterface());
 server.SetFilter(new FilterInterface());
 server.Start();
 ```
-      
+
+### SmtpDeliveryResult
+
+Your delivery handler returns one of three factory results:
+
 ```cs
-class LoggerInterface : ILogger
-{
-	public void LogError(string text) => Console.WriteLine("[LOG] " + text);
-}
+// Message accepted — sends 250 OK to the client
+SmtpDeliveryResult.Ok()
+SmtpDeliveryResult.Ok("Message queued for delivery")
+
+// Transient failure — sends 451; the sending MTA will retry
+SmtpDeliveryResult.TemporaryFailure()
+SmtpDeliveryResult.TemporaryFailure("Storage unavailable, try again later")
+
+// Permanent failure — sends 554; the sending MTA will not retry
+SmtpDeliveryResult.PermanentFailure()
+SmtpDeliveryResult.PermanentFailure("Message policy violation")
 ```
-  
+
+### Delivery interface
+
 ```cs
 class DeliveryInterface : IMailDelivery
 {
-	//Let's just print all emails
-	public Task EmailReceived(MailTransaction transaction)
-	{
-		Console.WriteLine(
-			$"\n\n--- EMAIL TRANSACTION ---\nSource IP: {transaction.RemoteEndPoint}\nAuthenticated: {transaction.AuthenticatedUser ?? "(not authenticated)"}\nFrom: {transaction.From}\nTo (Commands): {transaction.DeliverTo.Aggregate((current, item) => current + ", " + item)}\nTo (Headers): {transaction.To.Aggregate((current, item) => current + ", " + item)}\nCc: {transaction.Cc.Aggregate((current, item) => current + ", " + item)}\nBcc: {transaction.Bcc.Aggregate((current, item) => current + ", " + item)}\nBody: {transaction.Body}\n--- END OF TRANSACTION ---\n\n");
-		return Task.CompletedTask;
-	}
+    public async Task<SmtpDeliveryResult> EmailReceivedAsync(
+        MailTransaction transaction,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // Do your durable work here — write to disk, insert to DB, etc.
+            // The sending MTA will not receive 250 OK until this method returns.
+            await SaveMessageAsync(transaction, cancellationToken);
+            return SmtpDeliveryResult.Ok();
+        }
+        catch (StorageUnavailableException)
+        {
+            // Transient — ask the sender to retry
+            return SmtpDeliveryResult.TemporaryFailure("Storage unavailable, please retry");
+        }
+        catch (PolicyViolationException ex)
+        {
+            // Permanent — do not retry
+            return SmtpDeliveryResult.PermanentFailure(ex.Message);
+        }
+        // Any unhandled exception becomes a 451 automatically
+    }
 
-	//We only own "@smtp.demo" and we don't want any emails to other domains
-	public Task<UserExistsCodes> DoesUserExist(string emailAddress) => Task.FromResult(emailAddress.EndsWith("@smtp.demo", StringComparison.OrdinalIgnoreCase)
-		? UserExistsCodes.DestinationAddressValid
-		: UserExistsCodes.BadDestinationSystemAddress);
+    // Called during RCPT TO — return DestinationAddressValid to accept the recipient
+    public Task<UserExistsCodes> DoesUserExist(string emailAddress) =>
+        Task.FromResult(emailAddress.EndsWith("@example.com", StringComparison.OrdinalIgnoreCase)
+            ? UserExistsCodes.DestinationAddressValid
+            : UserExistsCodes.BadDestinationSystemAddress);
 }
 ```
+
+### Logger interface
+
+```cs
+class LoggerInterface : ILogger
+{
+    public void LogError(string text) => Console.WriteLine("[LOG] " + text);
+}
+```
+
+### Authentication interface
 
 ```cs
 class AuthenticationInterface : IAuthLogin
 {
-	//123 is password for all users (NOT SECURE, ONLY FOR DEMO PURPOSES!)
+    // 123 is the password for all users — NOT SECURE, DEMO ONLY
+    public Task<bool> AuthPlain(string authorizationIdentity, string authenticationIdentity,
+        string password, EndPoint remoteEndPoint, bool secureConnection) =>
+        Task.FromResult(password == "123");
 
-	public Task<bool> AuthPlain(string authorizationIdentity, string authenticationIdentity, string password,
-		EndPoint remoteEndPoint,
-		bool secureConnection) => Task.FromResult(password == "123");
-
-	public Task<bool> AuthLogin(string login, string password, EndPoint remoteEndPoint, bool secureConnection) =>
-		Task.FromResult(password == "123");
+    public Task<bool> AuthLogin(string login, string password,
+        EndPoint remoteEndPoint, bool secureConnection) =>
+        Task.FromResult(password == "123");
 }
 ```
+
+### Filter interface
 
 ```cs
 class FilterInterface : IMailFilter
 {
-	//Allow all connections
-	public Task<SmtpResult> IsConnectionAllowed(EndPoint ep) => Task.FromResult(new SmtpResult(SmtpResultType.Success));
+    // Allow all connections
+    public Task<SmtpResult> IsConnectionAllowed(EndPoint ep) =>
+        Task.FromResult(new SmtpResult(SmtpResultType.Success));
 
-	//Let's block .invalid TLD
-	public Task<SmtpResult> IsAllowedSender(string source, EndPoint ep) => Task.FromResult(source.TrimEnd().EndsWith(".invalid")
-		? new SmtpResult(SmtpResultType.PermanentFail)
-		: new SmtpResult(SmtpResultType.Success));
-		
-	//Let's reject Softfail as well
-	public Task<SmtpResult> IsAllowedSenderSpfVerified(string source, EndPoint? ep, SpfResult spfResult) => Task.FromResult(spfResult == SpfResult.Softfail
-		? new SmtpResult(SmtpResultType.PermanentFail)
-		: new
-			SmtpResult(SmtpResultType.Success));
+    // Block .invalid TLD
+    public Task<SmtpResult> IsAllowedSender(string source, EndPoint ep) =>
+        Task.FromResult(source.TrimEnd().EndsWith(".invalid")
+            ? new SmtpResult(SmtpResultType.PermanentFail)
+            : new SmtpResult(SmtpResultType.Success));
 
-	//Let's block all emails to root at any domain
-	public Task<SmtpResult> CanDeliver(string source, string destination, bool authenticated, string username,
-		EndPoint ep) => Task.FromResult(destination.TrimStart().StartsWith("root@", StringComparison.OrdinalIgnoreCase)
-		? new SmtpResult(SmtpResultType.PermanentFail)
-		: new SmtpResult(SmtpResultType.Success));
+    // Reject SPF Softfail
+    public Task<SmtpResult> IsAllowedSenderSpfVerified(string source, EndPoint? ep,
+        string? username, ValidationResult spfResult) =>
+        Task.FromResult(spfResult == ValidationResult.Softfail
+            ? new SmtpResult(SmtpResultType.PermanentFail)
+            : new SmtpResult(SmtpResultType.Success));
 
-	//Let's blacklist word "spam"
-	public Task<SmtpResult> CanProcessTransaction(MailTransaction transaction) => Task.FromResult(transaction.GetMessageBody() != null && transaction.GetMessageBody()!.Contains("spam", StringComparison.OrdinalIgnoreCase)
-		? new SmtpResult(SmtpResultType.PermanentFail)
-		: new SmtpResult(SmtpResultType.Success));
+    // Block emails addressed to root@*
+    public Task<SmtpResult> CanDeliver(string source, string destination,
+        bool authenticated, string? username, EndPoint? ep) =>
+        Task.FromResult(destination.TrimStart().StartsWith("root@", StringComparison.OrdinalIgnoreCase)
+            ? new SmtpResult(SmtpResultType.PermanentFail)
+            : new SmtpResult(SmtpResultType.Success));
+
+    // Reject messages containing "spam"
+    public Task<SmtpResult> CanProcessTransaction(MailTransaction transaction) =>
+        Task.FromResult(transaction.GetMessageBody() != null &&
+                        transaction.GetMessageBody()!.Contains("spam", StringComparison.OrdinalIgnoreCase)
+            ? new SmtpResult(SmtpResultType.PermanentFail)
+            : new SmtpResult(SmtpResultType.Success));
 }
 ```
 
-# Generating PFX from PEM keys
-You can generate PFX from PEM certificate and PEM private key using openssl:
+---
+
+## 3rd party services and libraries
+
+* By default this library uses Cloudflare Public DNS (1.1.1.1) for SPF and DMARC validation. The DNS endpoint can be changed or both validations disabled via `ServerOptions`.
+* By default this library downloads the Public Suffix List managed by the Mozilla Foundation from GitHub (licensed under MPL v2.0). The URL can be changed in `ServerOptions`. The list is not downloaded when `DnsServerEndpoint` is `null`.
+* This library uses [MimeKit](https://github.com/jstedfast/MimeKit) 4.17.0 by the .NET Foundation and Contributors, licensed under the MIT License.
+
+---
+
+## Generating a PFX from PEM keys
+
 ```
 openssl pkcs12 -export -in public.pem -inkey private.pem -out CertWithKey.pfx
 ```
