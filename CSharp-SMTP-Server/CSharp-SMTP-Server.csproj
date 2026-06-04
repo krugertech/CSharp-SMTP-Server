@@ -7,14 +7,14 @@
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
 
-    <RootNamespace>Krugertech_CSharp_SMTP_Server</RootNamespace>
+    <PackageId>Krugertech.CSharp-SMTP-Server</PackageId>
+    <RootNamespace>CSharp_SMTP_Server</RootNamespace>
     <Authors>Łukasz Jurczyk, Llewellyn Kruger</Authors>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <Copyright>Copyright by Łukasz Jurczyk, 2019-2023, Llewellyn Kruger 2026</Copyright>
     <PackageProjectUrl>https://github.com/krugertech/CSharp-SMTP-Server</PackageProjectUrl>
     <RepositoryUrl>https://github.com/krugertech/CSharp-SMTP-Server</RepositoryUrl>
     <RepositoryType>GIT</RepositoryType>
-    <Description>SMTP Server library for C#.</Description>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <SignAssembly>false</SignAssembly>
