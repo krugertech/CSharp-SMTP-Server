@@ -21,7 +21,7 @@
     <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
     <LangVersion>11</LangVersion>
     <Nullable>enable</Nullable>
-    <PackageVersion>1.1.6-krugertech.2</PackageVersion>
+    <PackageVersion>1.1.6-krugertech.3</PackageVersion>
     <Title>Krugertech CSharp SMTP Server</Title>
     <Description>
       Krugertech fork of CSharp-SMTP-Server v1.1.6 with ACK-gated DATA delivery support.
