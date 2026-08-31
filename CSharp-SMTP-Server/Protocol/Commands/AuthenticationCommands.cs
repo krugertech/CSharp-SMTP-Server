@@ -25,9 +25,25 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			switch (args[0].ToUpper())
 			{
 				case "LOGIN":
+									// RFC 4954 allows an initial response with AUTH LOGIN: the base64-encoded username.
+				// Some clients (notably IIS SMTP relay) send it and then transmit only the password;
+				// without this support the password would be misread as a second username and
+				// authentication would fail. When present, skip straight to capturing the password.
+				var initialUsername = args.Length > 1 ? Misc.Base64.Base64Decode(args[1]) : null;
+
+				if (!string.IsNullOrEmpty(initialUsername))
+				{
+					processor.TempUsername = initialUsername;
+					processor.CaptureData = 3;
+					await processor.WriteText("334 UGFzc3dvcmQ6");
+				}
+				else
+				{
 					processor.CaptureData = 2;
 					await processor.WriteText("334 VXNlcm5hbWU6");
-					break;
+				}
+
+				break;
 
 				case "PLAIN":
 					if (args.Length == 1)
