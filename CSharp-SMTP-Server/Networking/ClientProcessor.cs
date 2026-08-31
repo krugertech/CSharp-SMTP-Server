@@ -358,8 +358,8 @@ namespace CSharp_SMTP_Server.Networking
 			_client.Close();
 			_client.Dispose();
 
-			if (!dontRemove && _listener.ClientProcessors.Contains(this))
-				_listener.ClientProcessors.Remove(this);
+			if (!dontRemove)
+				_listener.RemoveProcessor(this);
 		}
 	}
 }

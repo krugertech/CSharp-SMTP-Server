@@ -8,32 +8,17 @@ namespace CSharp_SMTP_Server.Networking
 {
 	internal class Listener : IDisposable
 	{
-		// TODO (thread-safety): ClientProcessors is a plain List<> that is written from three distinct
-		// execution contexts without synchronisation:
-		//   1. The listener thread (Listen loop) calls Add() when a new TCP connection is accepted.
-		//   2. Each ClientProcessor's async receive loop calls Remove() via ClientProcessor.Dispose()
-		//      when that connection closes normally or due to an error.
-		//   3. Listener.Dispose() iterates the list to dispose all active processors on shutdown.
+		// Thread-safety: ClientProcessors is written from three execution contexts — the accept loop
+		// (Add), each connection's dispose path (Remove) and Dispose() below. All mutations go through
+		// _processorsLock, and Dispose() snapshots the list to an array *after* stopping the listener,
+		// so no new Add can race with the enumeration.
 		//
-		// Under load this can produce InvalidOperationException ("collection was modified during
-		// enumeration") in Dispose(), lost Add/Remove updates, or duplicate disposals.
-		//
-		// Recommended fix: protect every access with a shared lock object, and in Dispose() snapshot
-		// the list to an array *after* setting _dispose = true and stopping the listener (so no new
-		// Add() calls can race), then iterate the snapshot:
-		//
-		//   private readonly object _processorsLock = new();
-		//
-		//   // In Listen():      lock (_processorsLock) { ClientProcessors.Add(...); }
-		//   // In Dispose():     ClientProcessor[] snapshot;
-		//                        lock (_processorsLock) { snapshot = ClientProcessors.ToArray(); }
-		//                        foreach (var p in snapshot) p.Dispose(true, true);
-		//   // In CP.Dispose():  lock (_listener._processorsLock) { _listener.ClientProcessors.Remove(this); }
-		//                        (requires exposing the lock or a helper method on Listener)
-		//
-		// This was a pre-existing issue in the original library and has been left intentionally
-		// unchanged to minimise the diff scope of the ACK-gating fork. Fix before high-concurrency use.
-		internal readonly List<ClientProcessor> ClientProcessors;
+		// This was a pre-existing upstream bug: unsynchronised concurrent Add/Remove corrupts List<>
+		// internals (a removed slot is nulled and a racing append can leave it inside the live range),
+		// so Dispose() could hit a null entry and throw NullReferenceException under load. Reproduced
+		// deterministically by ConcurrencyStress_ParallelSessions_AllDeliveriesSucceed in the test suite.
+		private readonly object _processorsLock = new();
+		private readonly List<ClientProcessor> ClientProcessors;
 		internal readonly SMTPServer Server;
 
 		private readonly TcpListener _listener;
@@ -60,6 +45,16 @@ namespace CSharp_SMTP_Server.Networking
 
 		internal void Start() => _listenerThread.Start();
 
+		internal void AddProcessor(ClientProcessor processor)
+		{
+			lock (_processorsLock) ClientProcessors.Add(processor);
+		}
+
+		internal void RemoveProcessor(ClientProcessor processor)
+		{
+			lock (_processorsLock) ClientProcessors.Remove(processor);
+		}
+
 		private void Listen()
 		{
 			try
@@ -70,7 +65,7 @@ namespace CSharp_SMTP_Server.Networking
 					try
 					{
 						var client = _listener.AcceptTcpClient();
-						ClientProcessors.Add(new ClientProcessor(client, this, _secure));
+						AddProcessor(new ClientProcessor(client, this, _secure));
 					}
 					catch (Exception e)
 					{
@@ -91,7 +86,13 @@ namespace CSharp_SMTP_Server.Networking
 
 			_listener.Stop();
 
-			foreach (var processor in ClientProcessors)
+			// Snapshot after Stop(): no new Add can race with the enumeration (an accept that slipped
+			// in just before Stop is either in the snapshot — and gets disposed here — or outlives it,
+			// in which case its own dispose path removes itself safely).
+			ClientProcessor[] snapshot;
+			lock (_processorsLock) snapshot = ClientProcessors.ToArray();
+
+			foreach (var processor in snapshot)
 				processor.Dispose(true, true);
 		}
 	}
