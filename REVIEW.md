@@ -37,6 +37,58 @@ Severity key: **P0** = fix before any release · **P1** = fix soon · **P2** = s
 
 ---
 
+## Part 0 — Working instructions for the implementer
+
+**Read first:** `SUMMARY.md` (handoff/orientation), then `TEST_PLAN.md` §2 for the B1–B5 / Q1–Q13
+evidence, then `ARCHITECTURE.md` if you need the connection-lifecycle model. This document assumes
+that context and does not repeat it.
+
+### Build and test
+
+```powershell
+dotnet build CSharp-SMTP-Server.sln
+# REQUIRED: tests target net7.0, machine has .NET 9 SDK. Without this they abort
+# with "framework not found" — it is not optional.
+$env:DOTNET_ROLL_FORWARD="Major"
+dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build
+```
+
+Baseline before you touch anything: **294/294 green, ~10 s.** If that is not what you see, stop and
+find out why before making changes.
+
+### Constraints
+
+- **The branch is already pushed.** `dev` and `origin/dev` are both at `fb820ac`. Fix forward in new
+  commits; **do not rewrite published history**.
+- **Test classes run serially** (`xunit.runner.json`: `parallelizeTestCollections: false`,
+  `maxParallelThreads: 1`) because the suite binds loopback ports. Don't re-enable parallelism without
+  first fixing port allocation (R8).
+- **Keep the pin-first/fix-second convention** (SUMMARY.md §9). It is sound — see R10. When you fix a
+  pinned bug, update its pin test in the *same commit* as the library change so history stays
+  bisectable, and drop the `_BugB#` / `_PinQ#` suffix once the behavior is no longer a known defect.
+- Several fixes below are **behavior-breaking for library consumers** (B1 especially). They need a
+  changelog entry and a version bump — and note `VersionString` is already stale (R5).
+
+### Per-finding: what to change, which tests move, and when you're done
+
+Test names below were enumerated from the current tree; they are the actual work, not estimates.
+
+| Finding | Library change | Tests that must change | Done when |
+|---|---|---|---|
+| **B1** (P0) | `MailTransaction.cs:58-73` — return `.Address` not `.Name`; use `.Mailboxes` to flatten groups | `MailTransactionTests`: `GetFrom_PlainAddress_ReturnsEmptyDisplayName_BugB1`, `GetFrom_DisplayName_ReturnsDisplayNameOnly_BugB1`, and the `GetTo` display-name assertion (line ~83). `DmarcValidatorTests.NormalFrom_DmarcIsInert_PinB1` **inverts** — it currently asserts zero DNS queries | A normal `From: user@domain` message causes real `_dmarc.` DNS lookups, and an unaligned message with `p=reject` reaches `Fail` → **554** at DATA. The `PinB1` test should now assert enforcement, not inertness |
+| **B3** (P2) | `MailTransaction.cs:139-150` — add `DMARCValidationResult` to the `Clone()` initializer | `MailTransactionTests.Clone_DropsDmarcValidationResult_BugB3`; `AckGatingAdditionsTests.DeliveryClone_DmarcResultIsNone_AndHandlerMutationIsSafe` (first half) | The delivered clone reports the real DMARC result, incl. `CheckDisabled` |
+| **B4** (P2) | `MailTransaction.cs:147` — `DeliverTo = new List<string>(DeliverTo)` | `MailTransactionTests.Clone_SharedDeliverToListInstance_BugB4`; same `AckGatingAdditionsTests` test (second half) | Handler mutation of `DeliverTo` no longer affects the server-side transaction |
+| **Q12(b)** (P1) | `SpfValidator.cs:177-192` — propagate `Temperror` from `CheckAddressMatch` instead of treating any non-`None` as a match; same shape for `mx` | `SpfValidatorTests.AMechanism_DnsFailure_ReturnsQualifierNotTemperror_PinQ12` — both assertions flip to `Temperror` | `v=spf1 a:failsrv.test` yields **Temperror**, not `Pass`, when the A lookup SERVFAILs |
+| **R11** (P1) | `Listener.cs:63-96` — check `_dispose` and register under one `_processorsLock` critical section; dispose a processor arriving post-shutdown | New test needed; extend `LifecycleAndRobustnessTests` alongside `Dispose_StopsListener_AndKillsOpenConnections`. Use a barrier to hold a connection between accept and registration while `Dispose()` runs | No connection survives `SMTPServer.Dispose()`; nothing is still using the certificate when it is disposed |
+| **R6** (P1) | `ClientProcessor.cs:71-97` — wrap the whole `Init()` body in try/catch (log + `Dispose()`), covering `Greet()` and the filter call | New test; mirror the B5 pattern in `TlsStartTlsTests`, using `ConfigurableFilter` set to throw | A filter throwing in `IsConnectionAllowed` drops only that connection; the process survives and the next client is greeted |
+| **R1** (P2) | `ClientProcessor.cs:196-203` — rename to `WriteCodeWithMessage`, or change param to `ushort` | **53 assertions across 10 files** — `AckGatingAdditionsTests`(4), `AuthProtocolTests`(5), `CommandSequencingTests`(5), `DataAndMessageTests`(5), `EhloHeloTests`(3), `LifecycleAndRobustnessTests`(2), `MailFromTests`(3+7 `InlineData`), `RcptToTests`(5+1), `SpfDmarcIntegrationTests`(6), `TlsStartTlsTests`(7). My earlier "~15" was wrong | `NOOP` → `250 2.0.0 OK`; `VRFY` → `252 5.5.1 Cannot VRFY user...`. Budget real time for the test sweep — it is the bulk of this fix |
+
+**Suggested commit shape** (matches the existing history): one commit per finding, library change plus
+its test updates together, docs-only commits last. Update `SUMMARY.md` §5/§6 as you close each B/Q item
+so the handoff document stays true.
+
+---
+
 ## Part 1 — Defects in the current code
 
 Highest-value items. Each is tagged with whether the `dev` branch introduced it.
@@ -88,7 +140,7 @@ branch. The prior model's Q7 label ("overload accident", current behavior to be 
 defensible as a description of the code it inherited; it simply never identified the cause or flagged
 it as a defect worth fixing.
 
-~15 tests assert the current stripped form (e.g.
+**53 assertions across 10 test files** assert the current stripped form (enumerated in Part 0; e.g.
 [CommandSequencingTests.cs:74-76](CSharp-SMTP-Server.Tests/CommandSequencingTests.cs#L74-L76),
 [AuthProtocolTests.cs:61](CSharp-SMTP-Server.Tests/AuthProtocolTests.cs#L61), commented
 `// Q7: no table text`), so any fix must update them together. They are labelled as Q7 pins, which is
@@ -96,7 +148,7 @@ the prior model's documented characterization-test convention — see R10.
 
 **Recommendation.** Worth fixing, but as cleanup rather than urgent work. Rename the overload to remove
 the ambiguity — e.g. `WriteCodeWithMessage(int code, string message)` — or change its first parameter to
-`ushort` so callers must be explicit. Then update the ~15 pinned tests to expect the restored table text
+`ushort` so callers must be explicit. Then update all 53 pinned assertions to expect the restored table text
 (`250 2.0.0 OK`, `252 5.5.1 Cannot VRFY user...`). Add the cause (the `50276ad` overload) to the Q7 entry
 in TEST_PLAN.md / SUMMARY.md, which records the symptom but not the mechanism. Verify no call site was
 *intending* the sanitizer.
@@ -542,7 +594,7 @@ Security-affecting items first; within a tier, cheapest first.
 **Tier 3 — cleanup, any order.**
 
 6. **B2, B4, R7, Q3, Q8, Q12(a/c), Q13** (P2) — correctness cleanups.
-7. **R1, R2, R4** (P2) — response text + the ~15 pinned tests; AUTH LOGIN malformed initial response;
+7. **R1, R2, R4** (P2) — response text + the 53 pinned assertions; AUTH LOGIN malformed initial response;
    status-code validation. Clear Q2/Q5 while touching R1.
 8. **Q10** (P2, docs) — Windows cert workaround in README. Cheap, high user value.
 9. **R3, R5, R8, R9, R10** (P3) — formatting, version suffix, test-port risk, timing sleeps, pin traits.
