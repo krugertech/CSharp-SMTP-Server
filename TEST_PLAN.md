@@ -3,14 +3,31 @@
 Working plan of everything worth testing, derived from a full read-through of the source on 2026-07.
 Each entry lists concrete cases and expected outcomes so implementation is mechanical.
 
-**Status:** Phase 1 (§3 + §9) implemented — 107 new tests (suite total 120/120 green):
-`SmtpDeliveryResultTests`, `ServerOptionsTests`, `MailTransactionTests` (pins B1–B4), `CheckCidrTests`,
-`DmarcOrganizationalDomainTests`, `Base64Tests`, `ProcessAddressTests`, `WireFormattingTests`
-(socket-pair harness for direct `WriteCode` access), `ValueTypesTests`, `VersionConsistencyTests`.
-Infrastructure delivered: `InternalsVisibleTo`, `NoopDelivery` + `LocalHttpServer` helpers. During
-implementation a pre-existing bug was found and fixed (commit `294adbe`): the ClientProcessor ctor
-blocked the listener accept thread when the greeting write completed synchronously → only one
-concurrent client could be handled; regression test `ConcurrentGreetingTests`. Phases 2–4 remain.
+**Status:** Phase 1 (§3 + §9) and Phase 2 (§4.1–4.7, §5, §8) implemented — suite total **227/227 green**
+(verified over repeated runs).
+
+- *Phase 1* (107 tests): `SmtpDeliveryResultTests`, `ServerOptionsTests`, `MailTransactionTests` (pins B1–B4),
+  `CheckCidrTests`, `DmarcOrganizationalDomainTests`, `Base64Tests`, `ProcessAddressTests`,
+  `WireFormattingTests`, `ValueTypesTests`, `VersionConsistencyTests`. Infrastructure: `InternalsVisibleTo`,
+  `NoopDelivery` + `LocalHttpServer` helpers.
+- *Phase 2* (107 tests): `GreetingAndFilterTests` (7), `EhloHeloTests` (9), `CommandSequencingTests` (13),
+  `MailFromTests` (13), `RcptToTests` (13), `DataAndMessageTests` (12), `AuthProtocolTests` (19),
+  `AckGatingAdditionsTests` (6), `LifecycleAndRobustnessTests` (15). Infrastructure: shared `SmtpSession`
+  helper + `TestServers` factory + `RecordingDelivery`/`ConfigurableFilter`/`RecordingLogger` fakes;
+  xUnit test-class parallelization disabled (`xunit.runner.json`) because the suite binds loopback ports.
+
+Bugs found & fixed during implementation (each with a regression test):
+1. ClientProcessor ctor blocked the listener accept thread → one concurrent client at a time on Windows
+   (commit `294adbe`, guard: `ConcurrentGreetingTests`).
+2. **`Listener.ClientProcessors` race** — the documented TODO was real: concurrent Add/Remove corrupts the
+   list and `Dispose()` threw NullReferenceException; reproduced deterministically by
+   `ConcurrencyStress_ParallelSessions_AllDeliveriesSucceed` (3/3 runs without the fix), fixed with lock +
+   snapshot-in-Dispose (commit `b0e241c`).
+
+New quirks pinned during Phase 2: **Q7** (two-arg `WriteCode(code, enhanced)` call sites bind to the
+`(int, string)` sanitizer overload — no implicit int→ushort conversion — so most responses carry no table
+text) and **Q8** (§5 finding that the delivery CancellationToken does **not** fire on client disconnect while
+`DeliverMessage` is in flight — nothing polls the socket). Phases 3–4 remain.
 
 ## 0. Current coverage (do not duplicate)
 
@@ -59,6 +76,8 @@ behavior changed silently.
 | Q4 | `ClientProcessor.ProcessResponse` STARTTLS | No protocol-version gate: STARTTLS is accepted **before EHLO/HELO** (all other extension commands require it). | code read |
 | Q5 | `TransactionCommands` RCPT TO | Syntax error returns bare `501` with **no enhanced status**, unlike every other response. | code read |
 | Q6 | `ServerOptions.MessageCharactersLimit` enforcement | Counter counts characters **excluding CRLF**; once exceeded, further lines are silently dropped from `RawBody` (moot — the transaction is rejected with 552 anyway). Boundary: exactly-at-limit is accepted (`>=`). | code read |
+| Q7 | All two-arg `WriteCode(code, enhanced)` call sites in the library | C# has **no implicit int→ushort conversion**, so `WriteCode(250, "2.0.0")` (int literal) can only bind to the `(int, string)` sanitizer overload — the table-text overload `(ushort, string)` is never reached from these call sites. Consequence: NOOP → `250 2.0.0` (no “OK”), HELP → `214 2.0.0`, QUIT → `221 2.0.0`, VRFY → `252 5.5.1`, MAIL FROM success → `250 2.0.0`, RCPT valid → `250 2.1.5`, unknown command → `502 5.5.1` — all without the `SMTPCodes` table text. Only single-arg calls (`WriteCode(354)`) and three-arg calls with explicit text get a message body. RFC-wise legal (text after an enhanced status is optional), but surprising; pinned by exact-wire assertions throughout Phase 2 | ✅ empirical |
+| Q8 | Delivery `CancellationToken` vs client disconnect | While the delivery handler is in flight, nothing polls the client socket (the receive loop is parked inside `DeliverMessage`) — a client RST does **not** fire the token; it only becomes observable after the handler returns, when the response write fails and the connection disposes. If delivery cancellation ever matters, this needs a fix | ✅ empirical (`AckGatingAdditionsTests`) |
 
 ## 3. Pure unit tests — no I/O (P0)
 
@@ -275,7 +294,7 @@ Wire-level matrix (SPF disabled in these tests):
 - `dualMode = true` with IPv4 address → DualMode **not** set on the socket (regression guard for our fork fix); with `IPv6Any` it is set (platform-permitting).
 - **Garbage input**: binary bytes, a single 1 MB line, UTF-8 multibyte sequences in DATA — server survives and serves the next client.
 - **Abrupt disconnect** at each phase (after greeting / mid-EHLO response / mid-DATA / during gated delivery) → no unhandled exceptions (recording logger asserts), listener keeps accepting new clients.
-- **Concurrency stress**: N parallel full SMTP sessions (e.g. 20 × 10 messages) — all succeed; guards the known unsynchronized `Listener.ClientProcessors` race (documented TODO in `Listener.cs`). Expected to be flaky-by-design until that fix lands — mark with a trait and treat failures as evidence, not regressions.
+- **Concurrency stress**: N parallel full SMTP sessions (e.g. 20 × 10 messages) — all succeed; guards the known unsynchronized `Listener.ClientProcessors` race (documented TODO in `Listener.cs`). Expected to be flaky-by-design until that fix lands — mark with a trait and treat failures as evidence, not regressions. ✅ **Done & fixed**: implemented as `ConcurrencyStress_ParallelSessions_AllDeliveriesSucceed` (10 × 5 open/close sessions); it reproduced the race deterministically (NRE in `Listener.Dispose`) before the lock+snapshot fix landed — now a permanent regression guard.
 
 ## 9. Meta / consistency tests (P1, cheap)
 
@@ -295,7 +314,7 @@ Wire-level matrix (SPF disabled in these tests):
 | Phase | Sections | Est. test count | New infra needed |
 |---|---|---|---|
 | 1 ✅ done | §3 (pure) + §9 (meta) | 107 delivered (+1 regression test for the ctor fix, `294adbe`) | IVT, NoopDelivery, LocalHttpServer |
-| 2 | §4.1–4.7, §5, §8 (loopback protocol + robustness) | ~80 | shared SmtpSession helper |
+| 2 ✅ done | §4.1–4.7, §5, §8 (loopback protocol + robustness) | 107 delivered (+ `Listener.ClientProcessors` fix, `b0e241c`) | shared SmtpSession helper, TestServers factory, recording fakes, xunit.runner.json |
 | 3 | §4.8 (TLS) | ~10 | cert helper |
 | 4 | §6, §7 (SPF/DMARC) | ~30 | suffix-list HTTP helper + DNS stub |
 

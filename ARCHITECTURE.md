@@ -16,7 +16,7 @@ MTA keeps its copy until your handler says the message was safely accepted.
 
 Not affiliated with or endorsed by the original author.
 
-## 2. Git history (8 commits)
+## 2. Git history (11 commits)
 
 | Commit | Meaning |
 |---|---|
@@ -31,6 +31,9 @@ Not affiliated with or endorsed by the original author.
 | `274069a` Fix EHLO/HELO parsing of bracketed IPv6 literals | Upstream issue #18, fixed here (no upstream fix exists; see §9) |
 | `294adbe` Fix ClientProcessor ctor blocking the listener accept thread | Fork fix found during Phase 1 testing — when the greeting write completes synchronously (typical on Windows), `Init()` ran inline in the ctor and parked inside `Receive()`'s `EndOfStream` check, consuming the accept thread: a second concurrent client never got its 220. `Init` now runs on the thread pool; regression test `ConcurrentGreetingTests` |
 | `e8a241f` Add Phase 1 unit tests (TEST_PLAN.md §3 + §9): 107 new tests | Pure unit suite per `TEST_PLAN.md`; includes pins for confirmed upstream bugs B1–B4 in `MailTransaction` (see TEST_PLAN.md §2) |
+| `994eb07` Extract shared SmtpSession helper for integration tests (§1.2) | Test infrastructure — connect/send/read with 10 s timeouts, raw-byte send, RST abort; existing test files refactored onto it |
+| `4a4cb06` Add Phase 2 protocol matrix tests (TEST_PLAN.md §4.1–4.7): 86 new tests | Exact-wire assertions for every command group; pins quirks Q1/Q2/Q3/Q5/Q6 and the newly found **Q7** (two-arg `WriteCode(code, enhanced)` call sites bind to the `(int,string)` sanitizer overload — no table text on most responses) |
+| `df4636e` Fix Listener.ClientProcessors thread-safety; add §5/§8 tests | The documented TODO race was real: concurrent Add/Remove corrupted the list → NRE in `Dispose()` under load (deterministic repro via new `ConcurrencyStress` test); fixed with lock + snapshot-in-Dispose. Also pins **Q8**: delivery CancellationToken does not fire on client disconnect mid-delivery |
 
 To see exactly what the fork changed: `git diff 2f7386e..HEAD`.
 
@@ -177,7 +180,10 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj
 
 **Environment gotcha:** the test project targets **net7.0**. If only a newer runtime is installed
 (e.g. .NET 9 SDK on this machine), tests abort with "framework not found". Fix without touching the
-csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 120 tests pass (~0.5 s).
+csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 227 tests pass (~8 s).
+
+Test classes run **serially** (`xunit.runner.json`, `parallelizeTestCollections: false`) — the suite
+binds loopback ports, and concurrently running classes race on port allocation.
 
 Known build warnings (pre-existing, harmless): net7.0 EOL notice; CS8619 nullability mismatches in
 `MailTransaction.GetTo/GetCc/GetBcc` (`IEnumerable<string?>` vs `IEnumerable<string>` — MimeKit's
@@ -186,9 +192,11 @@ Known build warnings (pre-existing, harmless): net7.0 EOL notice; CS8619 nullabi
 ### Tests
 
 Integration-style test files share one pattern: allocate a free loopback port, start an actual
-`SMTPServer`, speak raw SMTP over TCP with 10 s read timeouts. Phase 1 (per `TEST_PLAN.md`) adds
-pure unit tests (no I/O) plus one socket-pair harness for the wire-output helpers; the test project
-gains `InternalsVisibleTo` access to internal helpers (`ProcessAddress`, `Base64`, `WriteCode`).
+`SMTPServer`, speak raw SMTP over TCP with 10 s read timeouts — all through the shared
+`SmtpSession` helper (connect/send/read-line/multi-line-response/RST-abort). Phase 1 (per
+`TEST_PLAN.md`) adds pure unit tests (no I/O) plus one socket-pair harness for the wire-output
+helpers; the test project gains `InternalsVisibleTo` access to internal helpers (`ProcessAddress`,
+`Base64`, `WriteCode`).
 
 **`AckGatingTests.cs`** (6 facts):
 1. DATA → 250 only after handler completes; handler called exactly once.
@@ -216,6 +224,17 @@ direct `WriteCode` tests on a socket pair incl. CR/LF sanitization), `ValueTypes
 **`ConcurrentGreetingTests.cs`** (1 fact): two concurrent clients both receive their 220 greeting while
 the first stays idle — regression guard for the accept-thread-blocking fix (`294adbe`).
 
+**Phase 2 protocol matrix** (86, see `TEST_PLAN.md` §4 for the full case list) — exact wire assertions:
+`GreetingAndFilterTests` (7), `EhloHeloTests` (9), `CommandSequencingTests` (13), `MailFromTests` (13),
+`RcptToTests` (13), `DataAndMessageTests` (12), `AuthProtocolTests` (19).
+
+**Phase 2 robustness & ACK-gating additions** (21): `AckGatingAdditionsTests` (6 — incl. the Q8 pin that
+the delivery token does not fire on client disconnect mid-delivery, and a deterministic parallel-handler
+no-cross-talk check) and `LifecycleAndRobustnessTests` (15 — ctor edge cases, AddListener-after-Start,
+multi-listener, Dispose RST semantics, port-in-use tolerance, dual-mode guards, binary-garbage / 1 MB-line
+survival, abrupt disconnect at four phases, and the `ConcurrencyStress` regression guard for the
+`ClientProcessors` thread-safety fix).
+
 ## 8. Known issues & gotchas
 
 - **Confirmed upstream bugs pinned by tests (B1–B4)** — see `TEST_PLAN.md` §2. Most important:
@@ -224,11 +243,18 @@ the first stays idle — regression guard for the accept-thread-blocking fix (`2
   in `ParsedMessage`; `Clone()` drops `DMARCValidationResult` and shares the `DeliverTo` list.
 - **Fixed during Phase 1 testing:** `ClientProcessor` ctor blocked the listener accept thread when the
   greeting write completed synchronously (one concurrent client at a time on Windows) — see `294adbe`.
-- **Thread-safety bug in `Listener.ClientProcessors`** (pre-existing, deliberately unfixed to keep the
-  fork diff minimal — see the big TODO comment at the top of `Networking/Listener.cs`). Plain
-  `List<>` mutated from three contexts: accept thread (`Add`), per-connection dispose (`Remove`), and
-  shutdown iteration. Under load can throw "collection was modified during enumeration" or lose updates.
-  Documented fix: shared lock + snapshot-in-Dispose pattern (sketched in the comment). **Fix before high-concurrency use.**
+- **Fixed during Phase 2 testing:** the long-documented `Listener.ClientProcessors` race was real —
+  unsynchronised Add/Remove corrupted the list and `Dispose()` threw NullReferenceException under load;
+  fixed with a shared lock + snapshot-in-Dispose, guarded by
+  `ConcurrencyStress_ParallelSessions_AllDeliveriesSucceed` (deterministic repro without the fix) — see `df4636e`.
+- **Q7 — most responses carry no table text:** every two-arg `WriteCode(code, enhanced)` call site binds to
+  the `(int, string)` sanitizer overload (no implicit int→ushort conversion), so NOOP → `250 2.0.0`,
+  HELP → `214 2.0.0`, QUIT → `221 2.0.0` etc. have no message body; only single-arg calls get the
+  `SMTPCodes` table text. RFC-wise legal, but surprising — pinned by exact-wire assertions.
+- **Q8 — delivery token does not fire on client disconnect:** while the handler is in flight nothing polls
+  the socket (the receive loop is parked inside `DeliverMessage`), so a client RST cannot cancel the
+  delivery; the token only fires after the handler returns, when the response write fails. If delivery
+  cancellation ever matters, this needs a fix — pinned by `AckGatingAdditionsTests`.
 - **Delivery runs inside the SMTP session**: a slow handler holds the connection open for as long as it
   takes — by design, but size your timeouts/worker pools accordingly. The `CancellationToken` is tied to
   the client connection; if the client disconnects mid-delivery the token fires (handlers should honor it).
