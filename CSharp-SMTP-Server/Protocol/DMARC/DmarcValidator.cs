@@ -125,7 +125,11 @@ public class DmarcValidator
 		if (from == null)
 			return ValidationResult.None;
 
-		TransactionCommands.ProcessAddress(from, out var fromDomain);
+		// GetFrom returns a bare address (MimeKit already parsed the header), so the domain is taken
+		// directly rather than through ProcessAddress, which parses SMTP command arguments and requires
+		// the angle-bracket form. Routing a bare address through ProcessAddress yields null and leaves
+		// DMARC silently inert — that was the second half of bug B1.
+		var fromDomain = TransactionCommands.GetAddressDomain(from);
 
 		if (fromDomain == null)
 			return ValidationResult.None;

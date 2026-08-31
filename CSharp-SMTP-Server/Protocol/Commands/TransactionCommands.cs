@@ -228,7 +228,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 								return;
 							}
 
-							ProcessAddress(processor.Transaction.GetFrom, out var fromDomain);
+							var fromDomain = GetAddressDomain(processor.Transaction.GetFrom);
 							processor.Transaction.AddHeader("Authentication-Results", $"{processor.Server.Options.ServerName}; dmarc={dmarcValidation.ToString().ToLowerInvariant()} header.from={fromDomain ?? "(none)"}");
 						}
 					}
@@ -276,6 +276,38 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					processor.DataBuilder!.AppendLine(dt);
 				}
 			}
+		}
+
+		/// <summary>
+		/// Extracts the domain from a bare email address ("user@example.com" → "example.com").
+		/// </summary>
+		/// <remarks>
+		/// Distinct from <see cref="ProcessAddress"/>, which parses an SMTP command argument and
+		/// therefore requires the RFC 5321 angle-bracket form ("&lt;user@example.com&gt;"). Header
+		/// addresses from <see cref="MailTransaction.GetFrom"/> are already parsed by MimeKit and come
+		/// without brackets, so they need this instead — feeding them to ProcessAddress returns null
+		/// and silently disables DMARC (that was bug B1's second half).
+		/// Applies the same validity rules ProcessAddress does: exactly one '@', and a dotted domain.
+		/// </remarks>
+		/// <param name="address">Bare email address, without angle brackets.</param>
+		/// <returns>The domain, or null if the address is missing or malformed.</returns>
+		internal static string? GetAddressDomain(string? address)
+		{
+			if (string.IsNullOrWhiteSpace(address))
+				return null;
+
+			var atIndex = address.LastIndexOf('@');
+			var lastDotIndex = address.LastIndexOf('.');
+
+			if (lastDotIndex == -1 || atIndex == -1 || lastDotIndex < atIndex)
+				return null;
+
+			if (address.Count(x => x == '@') != 1)
+				return null;
+
+			var domain = address[(atIndex + 1)..];
+
+			return domain.Contains('.') ? domain : null;
 		}
 
 		internal static string? ProcessAddress(string? data, out string? domain)

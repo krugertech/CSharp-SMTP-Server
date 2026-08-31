@@ -52,25 +52,43 @@ namespace CSharp_SMTP_Server
 		public List<string> DeliverTo { get; private set; }
 
 		/// <summary>
-		/// Sender of the message specified in the header
+		/// Sender of the message specified in the header, as an email address (e.g. "user@example.com").
+		/// Returns null if the From header is missing or contains no usable mailbox.
 		/// Note that this is NOT validated using SPF.
 		/// </summary>
-		public string? GetFrom => ParsedMessage.From.Count > 0 ? ParsedMessage.From[0].Name : null;
+		/// <remarks>
+		/// Returns the address, NOT the display name. Before v1.2.0 this returned MimeKit's display
+		/// name ("" for "user@example.com", "John" for "John &lt;j@e.c&gt;"), which made DMARC
+		/// validation inert. Use <see cref="GetFromName"/> if you need the display name.
+		/// </remarks>
+		public string? GetFrom => ParsedMessage.From.Mailboxes.FirstOrDefault()?.Address;
 
 		/// <summary>
-		/// Recipients specified in the header (To)
+		/// Display name of the sender specified in the header (e.g. "John Doe"), or null if the From
+		/// header is missing or contains no usable mailbox. Empty for an address with no display name.
 		/// </summary>
-		public IEnumerable<string> GetTo() => ParsedMessage.To.Select(x => x.Name);
+		public string? GetFromName => ParsedMessage.From.Mailboxes.FirstOrDefault()?.Name;
 
 		/// <summary>
-		/// Recipients specified in the header (CC)
+		/// Recipients specified in the header (To), as email addresses.
+		/// Group addresses are flattened to the mailboxes they contain.
 		/// </summary>
-		public IEnumerable<string> GetCc() => ParsedMessage.Cc.Select(x => x.Name);
+		/// <remarks>Returns addresses, NOT display names — see <see cref="GetFrom"/>.</remarks>
+		public IEnumerable<string> GetTo() => ParsedMessage.To.Mailboxes.Select(x => x.Address);
 
 		/// <summary>
-		/// Recipients specified in the header (BCC)
+		/// Recipients specified in the header (CC), as email addresses.
+		/// Group addresses are flattened to the mailboxes they contain.
 		/// </summary>
-		public IEnumerable<string> GetBcc() => ParsedMessage.Bcc.Select(x => x.Name);
+		/// <remarks>Returns addresses, NOT display names — see <see cref="GetFrom"/>.</remarks>
+		public IEnumerable<string> GetCc() => ParsedMessage.Cc.Mailboxes.Select(x => x.Address);
+
+		/// <summary>
+		/// Recipients specified in the header (BCC), as email addresses.
+		/// Group addresses are flattened to the mailboxes they contain.
+		/// </summary>
+		/// <remarks>Returns addresses, NOT display names — see <see cref="GetFrom"/>.</remarks>
+		public IEnumerable<string> GetBcc() => ParsedMessage.Bcc.Mailboxes.Select(x => x.Address);
 
 		/// <summary>
 		/// Returns email body without headers

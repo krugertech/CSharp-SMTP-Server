@@ -13,11 +13,11 @@ DATA delivery** — `IMailDelivery.EmailReceivedAsync(MailTransaction, Cancellat
 exception→451) and the SMTP response is only sent after the handler returns. Delivery runs inside
 the SMTP session by design.
 
-## 2. Current state (as of `bb880f0`)
+## 2. Current state
 
-- Branch: **`dev`, 17 commits ahead of `origin/master`, NOT pushed** (`git push origin dev` when ready).
+- Branch: **`dev`**, pushed. Tier 1 review fixes (B1, B3, B4, Q12(b), R11, R6) are new commits on top; version **1.2.0-krugertech.1**.
 - Build: 0 errors (pre-existing harmless warnings: net7.0 EOL notice, CS8619 in MailTransaction).
-- Tests: **294/294 green**, ~9 s per run, stable across repeated runs. Working tree clean.
+- Tests: **306/306 green**, ~11 s per run, stable across repeated runs. Working tree clean.
 
 ### Commit stack (newest first)
 
@@ -88,14 +88,26 @@ Details + repro evidence in TEST_PLAN.md §2; disposition per bug decided in REV
   filtering or deduplicating recipients mutated the server-side transaction too — a live risk now that
   delivery runs inside the session (ACK-gating). Now `new List<string>(DeliverTo)`. Guarded by
   `MailTransactionTests.Clone_CopiesDeliverToList_MutationIsIsolated` and the same end-to-end test.
+- **B1** *(fixed — breaking, see `CHANGELOG.md`)*: `GetFrom`/`GetTo`/`GetCc`/`GetBcc` returned MimeKit
+  *display names* rather than addresses (`From: sender@example.com` → `""`), so DMARC could never see
+  the header-From domain and `ValidateDMARC: true` enforced nothing.
+
+  **The fix needed two parts, not one.** Returning `.Address` (and `.Mailboxes` to flatten groups) is
+  necessary but insufficient: both `GetFrom` consumers fed the result to `ProcessAddress`, which parses
+  SMTP *command* arguments and requires the RFC 5321 angle-bracket form. A bare address returns null
+  there, leaving DMARC inert for a different reason. Header domains now go through a new
+  `TransactionCommands.GetAddressDomain` helper; `ProcessAddress` is untouched, so MAIL FROM / RCPT TO
+  envelope parsing still requires `<…>` as the RFC demands. Verified load-bearing: reverting just the
+  helper fails 11 DMARC tests.
+
+  Display names remain reachable via the new `GetFromName`. Version bumped to **1.2.0** (this also
+  cleared the pre-existing `VersionString` drift, R5).
 
 ### Not yet fixed (decision pending)
 
-- **B1**: `MailTransaction.GetFrom/GetTo/GetCc/GetBcc` return MimeKit *display names*, not addresses
-  (`From: sender@example.com` → `""`; `From: John <j@e.c>` → `"John"`) — makes DMARC validation effectively inert.
 - **B2**: `AddHeader` before first parse duplicates the header in `ParsedMessage`.
 
-Pinned by `MailTransactionTests`. Fixing these changes observable behavior.
+Pinned by `MailTransactionTests`. Fixing this changes observable behavior.
 
 ## 6. Pinned quirks Q1–Q10 (current behavior, asserted exactly — don't "fix" without review)
 
@@ -115,7 +127,7 @@ Pinned by `MailTransactionTests`. Fixing these changes observable behavior.
 | Q12 | SPF DNS error handling deviates from RFC 7208. **(b) FIXED**: a failed `a`/`mx` address lookup now returns Temperror instead of the mechanism's qualifier — it previously failed *open* (a bare `a` returned **Pass** on DNS failure). Still open: (a) top-level NXDOMAIN → Temperror (should be none); (c) redirect to nonexistent domain → Temperror (should be permerror) |
 | Q13 | SPF `redirect=` is evaluated positionally and short-circuits later mechanisms; RFC 7208 §6.1/§4.7 only consults it after all mechanisms have failed |
 
-## 7. Test suite layout (294 tests)
+## 7. Test suite layout (306 tests)
 
 - **Phase 1 — pure unit** (107): `SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9),
   `MailTransactionTests` (19, pins B1–B4), `CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7,
@@ -125,9 +137,11 @@ Pinned by `MailTransactionTests`. Fixing these changes observable behavior.
   `CommandSequencingTests` (13), `MailFromTests` (13), `RcptToTests` (13), `DataAndMessageTests` (12),
   `AuthProtocolTests` (19), `AckGatingAdditionsTests` (6, incl. Q8 pin), `LifecycleAndRobustnessTests` (15).
 - **Phase 3 — TLS** (11): `TlsStartTlsTests`.
-- **Phase 4 — SPF/DMARC** (56): `SpfValidatorTests` (27), `DmarcValidatorTests` (13, incl. the B1
-  end-to-end pin: a normal SPF-aligned message yields None with zero DNS queries),
-  `SpfDmarcIntegrationTests` (4 — SPF Fail 554 at MAIL FROM, DMARC Fail 554 at DATA, AR headers).
+- **Phase 4 — SPF/DMARC**: `SpfValidatorTests` (28), `DmarcValidatorTests` (15 — rewritten for B1: every
+  case used to smuggle the header domain through a quoted display name, so none exercised the path
+  normal mail takes; they now use ordinary From headers, and the old inertness pin asserts real
+  `_dmarc.` lookups plus a reachable Fail), `SpfDmarcIntegrationTests` (4 — SPF Fail 554 at MAIL FROM,
+  DMARC Fail 554 at DATA, AR headers).
   Infrastructure: `DnsStub` loopback UDP DNS responder (§1.5) + reused `LocalHttpServer` suffix-list
   fixture; test project LangVersion bumped to 12 (test-only).
 - **Upstream-fix regression tests**: `AckGatingTests` (6), `AuthLoginInitialResponseTests` (4),
@@ -140,12 +154,17 @@ Shared infrastructure: `SmtpSession` (raw-TCP client with timeouts, multi-line r
 
 ## 8. Remaining work
 
-All four test-plan phases are complete (294 tests). Left:
+All four test-plan phases are complete. **306 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
+Q12(b), R11, R6 — see `CHANGELOG.md` for the 1.2.0 release notes). Left:
 
-1. **Push**: `git push origin dev` (17 commits, unpushed).
-2. **Optional decisions** (user to make): fix B1–B4? (B1 is the important one — DMARC inert; now pinned
-   end-to-end by Phase 4); address the Q11/Q12/Q13-class deviations in SpfValidator / zabszk.DnsClient?
-   harden the filter-throwing path in `Init()`; anything from the upstream re-audit.
+1. **Remaining REVIEW.md items**, none started: **B2** (`AddHeader` duplicates the header before first
+   parse), **R1** (the `WriteCode(int,string)` overload accident — ~53 assertions across 10 files),
+   **Q1** (no dot-stuffing in DATA — data-integrity, arguably P1), **Q3**, **Q8**, **Q11** (multi-string
+   TXT records, needs a dependency decision), **Q12(a)/(c)**, **Q13**, plus R2/R4/R7/R8/R9.
+2. **R7 is now more visible**: `Listener._dispose` is a plain non-volatile `bool`. The R11 fix relies on
+   the flag-set and the snapshot sharing one `_processorsLock` critical section, which is correct as
+   written, but the *other* read (`while (!_dispose)` in the accept loop) is still unsynchronised.
+3. Anything from the upstream re-audit.
 
 ## 9. Working conventions used throughout (keep them)
 
@@ -163,7 +182,7 @@ All four test-plan phases are complete (294 tests). Left:
 git log --oneline -15          # commit stack (see §2)
 cat ARCHITECTURE.md            # how the code works + upstream sync record
 cat TEST_PLAN.md               # what's tested, what's pinned, what's left (§11 build order)
-$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 294/294 in ~9 s
+$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 306/306 in ~11 s
 ```
 
 Key source files: `CSharp-SMTP-Server/Networking/{ClientProcessor,Listener}.cs` (connection lifecycle —

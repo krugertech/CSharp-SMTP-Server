@@ -48,23 +48,31 @@ public sealed class MailTransactionTests
         Assert.Equal("Hello World", Tx(raw).Subject);
     }
 
-    // ─── GetFrom / GetTo / GetCc / GetBcc (bug B1 pins) ──────────────────────
+    // ─── GetFrom / GetFromName / GetTo / GetCc / GetBcc (B1 fixed) ───────────
 
     [Fact]
-    public void GetFrom_PlainAddress_ReturnsEmptyDisplayName_BugB1()
+    public void GetFrom_PlainAddress_ReturnsAddress()
     {
-        // BUG B1: returns MimeKit's display name, not the address. For a plain "sender@example.com"
-        // header the display name is empty — so DMARC validation (which needs "<…>" form) can never
-        // see the real sender domain for ordinary mail. Pin until fixed.
-        Assert.Equal(string.Empty, Tx(SimpleMessage).GetFrom);
+        // B1 (fixed): returns the address, not MimeKit's display name. This getter feeds DMARC
+        // validation, which could never see the sender domain while it returned "" for ordinary mail.
+        Assert.Equal("sender@example.com", Tx(SimpleMessage).GetFrom);
     }
 
     [Fact]
-    public void GetFrom_DisplayName_ReturnsDisplayNameOnly_BugB1()
+    public void GetFrom_DisplayName_ReturnsAddressNotDisplayName()
     {
         var raw = "From: John Doe <john@example.com>\r\nSubject: t\r\n\r\nx";
 
-        Assert.Equal("John Doe", Tx(raw).GetFrom); // not "john@example.com"
+        Assert.Equal("john@example.com", Tx(raw).GetFrom); // was "John Doe" before B1 was fixed
+    }
+
+    [Fact]
+    public void GetFromName_ReturnsDisplayName_ForConsumersThatWantIt()
+    {
+        // The display name is still reachable — GetFrom's old behavior moved here rather than vanishing.
+        Assert.Equal("John Doe", Tx("From: John Doe <john@example.com>\r\nSubject: t\r\n\r\nx").GetFromName);
+        Assert.Equal(string.Empty, Tx(SimpleMessage).GetFromName); // no display name in the header
+        Assert.Null(Tx("Subject: x\r\n\r\nbody").GetFromName);     // no From header at all
     }
 
     [Fact]
@@ -76,11 +84,38 @@ public sealed class MailTransactionTests
     }
 
     [Fact]
-    public void GetTo_ReturnsDisplayNames_NotAddresses_BugB1()
+    public void GetFrom_GroupAddressOnly_ReturnsFirstMailbox()
+    {
+        // From[0] would be a GroupAddress with no .Address at all; .Mailboxes flattens it.
+        var raw = "From: Team: alice@example.com, bob@example.com;\r\nSubject: t\r\n\r\nx";
+
+        Assert.Equal("alice@example.com", Tx(raw).GetFrom);
+    }
+
+    [Fact]
+    public void GetTo_ReturnsAddresses_NotDisplayNames()
     {
         var raw = "From: a@b.c\r\nTo: rcpt@example.com, R2 <r2@e.c>\r\nSubject: t\r\n\r\nx";
 
-        Assert.Equal(new[] { string.Empty, "R2" }, Tx(raw).GetTo().ToArray()); // first entry is the empty display name
+        Assert.Equal(new[] { "rcpt@example.com", "r2@e.c" }, Tx(raw).GetTo().ToArray());
+    }
+
+    [Fact]
+    public void GetTo_GroupAddress_IsFlattenedToItsMailboxes()
+    {
+        var raw = "From: a@b.c\r\nTo: Team: alice@e.c, bob@e.c;, solo@e.c\r\nSubject: t\r\n\r\nx";
+
+        Assert.Equal(new[] { "alice@e.c", "bob@e.c", "solo@e.c" }, Tx(raw).GetTo().ToArray());
+    }
+
+    [Fact]
+    public void GetCc_GetBcc_ReturnAddresses()
+    {
+        var raw = "From: a@b.c\r\nTo: t@e.c\r\nCc: C1 <c1@e.c>, c2@e.c\r\nBcc: b1@e.c\r\nSubject: t\r\n\r\nx";
+        var t = Tx(raw);
+
+        Assert.Equal(new[] { "c1@e.c", "c2@e.c" }, t.GetCc().ToArray());
+        Assert.Equal(new[] { "b1@e.c" }, t.GetBcc().ToArray());
     }
 
     [Fact]

@@ -24,12 +24,12 @@ namespace CSharp_SMTP_Server
 		/// <summary>
 		/// Library version (NuGet / informational — may include pre-release suffix).
 		/// </summary>
-		public const string VersionString = "1.1.6-krugertech.1";
+		public const string VersionString = "1.2.0-krugertech.1";
 
 		/// <summary>
 		/// Numeric-only assembly version required by AssemblyVersion / AssemblyFileVersion attributes.
 		/// </summary>
-		public const string AssemblyVersionString = "1.1.6.1";
+		public const string AssemblyVersionString = "1.2.0.0";
 
 		/// <summary>
 		/// Server options

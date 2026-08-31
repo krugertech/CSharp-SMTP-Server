@@ -97,7 +97,9 @@ public sealed class SpfDmarcIntegrationTests
     {
         using var stub = new DnsStub();
         using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
-        // Header domain (in the display name, per B1) is header.com; envelope is example.com → unaligned.
+        // Header-From domain is header.com, envelope is example.com → unaligned, and header.com
+        // publishes p=reject. Before B1 was fixed this scenario needed the header domain smuggled
+        // through a quoted display name; an ordinary From header now reaches the 554 gate.
         stub.AddTxt("_dmarc.header.com", "v=DMARC1; p=reject");
 
         var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
@@ -111,8 +113,7 @@ public sealed class SpfDmarcIntegrationTests
             await s.Send("DATA");
             Assert.StartsWith("354", await s.ReadLineAsync());
 
-            // Display name carries the header domain that DMARC validates (B1).
-            await s.Send("From: \"<a@header.com>\" <env@example.com>");
+            await s.Send("From: a@header.com");
             await s.Send("To: r@example.com");
             await s.Send("");
             await s.Send("body");
@@ -142,7 +143,7 @@ public sealed class SpfDmarcIntegrationTests
             await s.Send("DATA");
             Assert.StartsWith("354", await s.ReadLineAsync());
 
-            await s.Send("From: \"<a@example.com>\" <env@example.com>");
+            await s.Send("From: a@example.com");
             await s.Send("To: r@example.com");
             await s.Send("");
             await s.Send("body");
@@ -151,10 +152,10 @@ public sealed class SpfDmarcIntegrationTests
             Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
 
             var tx = delivery.Delivered.Single();
-            // B3 note: the delivered clone always shows DMARCValidationResult=None (Clone drops it) —
-            // assert on the wire-visible Authentication-Results header instead, which is added to the
-            // original transaction before cloning and survives in RawBody.
             Assert.Contains("Authentication-Results: test.local; dmarc=pass header.from=example.com", tx.RawBody);
+
+            // B3 (fixed): the delivered clone now carries the real result too, not just the header.
+            Assert.Equal(ValidationResult.Pass, tx.DMARCValidationResult);
         }
     }
 
