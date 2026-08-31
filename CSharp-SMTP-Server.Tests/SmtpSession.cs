@@ -1,6 +1,8 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 
 namespace CSharp_SMTP_Server.Tests;
 
@@ -14,8 +16,9 @@ public sealed class SmtpSession : IAsyncDisposable
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(10);
 
     private readonly TcpClient _client;
-    private readonly StreamReader _reader;
-    private readonly StreamWriter _writer;
+    private StreamReader _reader;
+    private StreamWriter _writer;
+    private SslStream? _ssl;
 
     public int Port { get; }
 
@@ -102,6 +105,36 @@ public sealed class SmtpSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Upgrades this session to TLS in place: wraps the underlying stream in an SslStream, performs
+    /// the client handshake and re-points reader/writer at it. Use after reading "220 Ready for TLS"
+    /// (STARTTLS) or immediately on connect (implicit-TLS port). Bounded by a 10 s timeout.
+    /// </summary>
+    public async Task UpgradeTlsAsync(string targetHost = "test.local", bool acceptCertificate = true)
+    {
+        var ssl = new SslStream(_client.GetStream(), false);
+        var options = new SslClientAuthenticationOptions { TargetHost = targetHost };
+        options.RemoteCertificateValidationCallback = (_, _, _, _) => acceptCertificate;
+
+        using var cts = new CancellationTokenSource(DefaultTimeout);
+        try
+        {
+            await ssl.AuthenticateAsClientAsync(options, cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            throw new TimeoutException($"timed out performing TLS handshake on port {Port}");
+        }
+
+        // The old reader/writer wrapped the raw stream; drop them before SslStream takes over.
+        _reader.Dispose();
+        _writer.Dispose();
+
+        _ssl = ssl;
+        _reader = new StreamReader(ssl, Encoding.UTF8, leaveOpen: true);
+        _writer = new StreamWriter(ssl, new UTF8Encoding(false), leaveOpen: true) { NewLine = "\r\n" };
+    }
+
     /// <summary>Abruptly closes the connection with RST (linger 0), simulating a client crash.</summary>
     public void Abort()
     {
@@ -130,6 +163,7 @@ public sealed class SmtpSession : IAsyncDisposable
 
         _reader.Dispose();
         _writer.Dispose();
+        _ssl?.Dispose();
         _client.Close();
     }
 }

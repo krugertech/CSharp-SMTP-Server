@@ -1,4 +1,5 @@
 using System.Net;
+using System.Security.Cryptography.X509Certificates;
 using CSharp_SMTP_Server;
 using CSharp_SMTP_Server.Interfaces;
 using CSharp_SMTP_Server.Networking;
@@ -17,15 +18,32 @@ public static class TestServers
     /// fake to leave it unset; the delivery handler defaults to <see cref="NoopDelivery.Instance"/>.
     /// </summary>
     public static SMTPServer Build(ushort? port = null, ServerOptions? options = null,
-        IMailDelivery? delivery = null, IAuthLogin? auth = null, IMailFilter? filter = null)
+        IMailDelivery? delivery = null, IAuthLogin? auth = null, IMailFilter? filter = null,
+        X509Certificate2? certificate = null, ILogger? logger = null)
     {
         var p = port ?? TestPorts.Allocate();
         var server = new SMTPServer(
             new[] { new ListeningParameters(IPAddress.Loopback, new[] { p }, null) },
-            options ?? DefaultOptions(), delivery ?? NoopDelivery.Instance);
+            options ?? DefaultOptions(), delivery ?? NoopDelivery.Instance, logger,
+            certificate: certificate);
 
         if (auth != null) server.SetAuthLogin(auth);
         if (filter != null) server.SetFilter(filter);
+        return server;
+    }
+
+    /// <summary>Builds (but does not start) a server with one implicit-TLS loopback port.</summary>
+    public static SMTPServer BuildTls(ushort? port = null, ServerOptions? options = null,
+        IMailDelivery? delivery = null, IAuthLogin? auth = null, X509Certificate2? certificate = null,
+        ILogger? logger = null)
+    {
+        var p = port ?? TestPorts.Allocate();
+        var server = new SMTPServer(
+            new[] { new ListeningParameters(IPAddress.Loopback, null, new[] { p }) },
+            options ?? DefaultOptions(), delivery ?? NoopDelivery.Instance, logger,
+            certificate: certificate);
+
+        if (auth != null) server.SetAuthLogin(auth);
         return server;
     }
 }

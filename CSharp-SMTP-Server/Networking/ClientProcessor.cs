@@ -74,7 +74,21 @@ namespace CSharp_SMTP_Server.Networking
 			{
 				Encryption = ConnectionEncryption.Tls;
 				_stream = new SslStream(_innerStream, false);
-				await ((SslStream)_stream).AuthenticateAsServerAsync(Server.Certificate!, false, Server.Options.Protocols, true);
+				try
+				{
+					await ((SslStream)_stream).AuthenticateAsServerAsync(Server.Certificate!, false, Server.Options.Protocols, true);
+				}
+				catch (Exception e)
+				{
+					// Init runs as async void with no other handler: a client that drops the connection
+					// mid-handshake, rejects our certificate, or sends plaintext to an implicit-TLS port
+					// would otherwise crash the whole process (any scanner touching the TLS port kills it).
+					// Log and drop just this connection — same policy as the receive loop below.
+					Server.LoggerInterface?.LogError("[Client TLS handshake] Exception: " + e.GetType().FullName + ", " + e.Message);
+
+					Dispose();
+					return;
+				}
 			}
 			else
 				await Greet();
