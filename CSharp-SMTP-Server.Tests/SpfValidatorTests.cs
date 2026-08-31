@@ -220,16 +220,29 @@ public sealed class SpfValidatorTests
     }
 
     [Fact]
-    public async Task AMechanism_DnsFailure_ReturnsQualifierNotTemperror_PinQ12()
+    public async Task AMechanism_DnsFailure_ReturnsTemperror()
     {
-        // RFC 7208 §5: a DNS error during an address lookup must stop evaluation with temperror.
-        // The validator instead treats any non-None CheckAddressMatch result as "matched" and returns
-        // the mechanism's own qualifier — pin both directions (Q12b):
+        // Q12(b) (fixed): RFC 7208 §5 — a DNS error during an address lookup stops evaluation with
+        // temperror. Previously any non-None CheckAddressMatch result counted as a match and returned
+        // the mechanism's own qualifier, so SPF failed *open*: a bare "a" (implicit "+") returned Pass
+        // during a resolver outage, turning SPF from a control into an authorizer.
         using var stub = new DnsStub();
         stub.SetServFail("failsrv.test");
 
-        Assert.Equal(ValidationResult.Fail, await Check(stub, "v=spf1 -a:failsrv.test -all", ClientV4)); // qualifier Fail, not Temperror
-        Assert.Equal(ValidationResult.Pass, await Check(stub, "v=spf1 a:failsrv.test", ClientV4));     // bare "a" → Pass on DNS failure!
+        Assert.Equal(ValidationResult.Temperror, await Check(stub, "v=spf1 -a:failsrv.test -all", ClientV4)); // was Fail (the qualifier)
+        Assert.Equal(ValidationResult.Temperror, await Check(stub, "v=spf1 a:failsrv.test", ClientV4));       // was Pass — the fail-open
+    }
+
+    [Fact]
+    public async Task MxMechanism_AddressLookupDnsFailure_ReturnsTemperror()
+    {
+        // Q12(b), the mx half: the MX query itself succeeds, but resolving the MX host's address
+        // SERVFAILs. That inner failure must surface as temperror rather than counting as a match.
+        using var stub = new DnsStub();
+        stub.AddMx(Domain, (10, "failsrv.test"));
+        stub.SetServFail("failsrv.test");
+
+        Assert.Equal(ValidationResult.Temperror, await Check(stub, "v=spf1 mx", ClientV4));
     }
 
     [Fact]

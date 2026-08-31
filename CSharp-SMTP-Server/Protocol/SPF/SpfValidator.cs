@@ -183,6 +183,13 @@ public class SpfValidator
 						requestsMade++;
 
 						var result = await CheckAddressMatch(ipAddress, domain, args, cidr, qualifier);
+
+						// RFC 7208 §5: a DNS error during the address lookup stops evaluation with
+						// temperror. Treating any non-None result as a match would fail *open* — a
+						// bare "a" (implicit "+") would return Pass during a resolver outage.
+						if (result == ValidationResult.Temperror)
+							return ValidationResult.Temperror;
+
 						if (result != ValidationResult.None)
 							return qualifier;
 					}
@@ -214,6 +221,12 @@ public class SpfValidator
 							requestsMade++;
 
 							var result = await CheckAddressMatch(ipAddress, ar.MailExchange, null, cidr, qualifier);
+
+							// Same fail-open as the "a" mechanism above: a failed A/AAAA lookup for an
+							// MX host is a temperror, not a match (RFC 7208 §5).
+							if (result == ValidationResult.Temperror)
+								return ValidationResult.Temperror;
+
 							if (result != ValidationResult.None)
 								return qualifier;
 						}

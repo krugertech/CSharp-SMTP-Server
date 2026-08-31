@@ -106,7 +106,7 @@ Pinned by `MailTransactionTests`. Fixing these changes observable behavior.
 | Q9 | No per-line responses during DATA — only the final response after `<CRLF>.<CRLF>`; clients waiting for a per-line ACK hang (RFC 5321 doesn't require them) |
 | Q10 | **Windows**: SChannel cannot use `CertificateRequest.CreateSelfSigned()` certs ("platform does not support ephemeral keys"); PFX round-trip re-import fixes it. Affects real library users generating certs in memory on Windows |
 | Q11 | zabszk.DnsClient silently drops multi-string TXT responses (only single character-strings are parsed) → split real-world SPF/DMARC records look like "no record" (SPF `None`; DMARC fallback/`None`) |
-| Q12 | SPF DNS error handling deviates from RFC 7208: top-level NXDOMAIN → Temperror (not none); failed `a`/`mx` lookup returns the mechanism's qualifier instead of temperror (bare `a` even PASSES on DNS failure); redirect to nonexistent domain → Temperror (not permerror) |
+| Q12 | SPF DNS error handling deviates from RFC 7208. **(b) FIXED**: a failed `a`/`mx` address lookup now returns Temperror instead of the mechanism's qualifier — it previously failed *open* (a bare `a` returned **Pass** on DNS failure). Still open: (a) top-level NXDOMAIN → Temperror (should be none); (c) redirect to nonexistent domain → Temperror (should be permerror) |
 | Q13 | SPF `redirect=` is evaluated positionally and short-circuits later mechanisms; RFC 7208 §6.1/§4.7 only consults it after all mechanisms have failed |
 
 ## 7. Test suite layout (294 tests)
