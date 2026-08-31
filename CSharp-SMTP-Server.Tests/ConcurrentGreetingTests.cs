@@ -1,8 +1,6 @@
 using System.Net;
-using System.Net.Sockets;
-using CSharp_SMTP_Server.Interfaces;
+using CSharp_SMTP_Server;
 using CSharp_SMTP_Server.Networking;
-using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
@@ -20,61 +18,22 @@ public sealed class ConcurrentGreetingTests : IDisposable
     [Fact]
     public async Task TwoConcurrentClients_BothReceiveGreeting_FirstStaysIdle()
     {
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         _server = new SMTPServer(
-            new[] { new ListeningParameters(IPAddress.Loopback, new ushort[] { port }, null) },
+            new[] { new ListeningParameters(IPAddress.Loopback, new[] { port }, null) },
             new ServerOptions(false, false),
-            new NoopDelivery());
+            NoopDelivery.Instance);
         _server.Start();
 
-        using var c1 = new TcpClient();
-        await c1.ConnectAsync(IPAddress.Loopback, port);
-        var r1 = new StreamReader(c1.GetStream(), leaveOpen: true);
-        Assert.StartsWith("220 ", await ReadLineWithTimeout(r1)); // client 1 greeted, then stays idle
+        await using var c1 = await SmtpSession.ConnectAsync(port);
+        Assert.StartsWith("220 ", await c1.ReadLineAsync()); // client 1 greeted, then stays idle
 
-        using var c2 = new TcpClient();
-        await c2.ConnectAsync(IPAddress.Loopback, port);
-        var r2 = new StreamReader(c2.GetStream(), leaveOpen: true);
+        await using var c2 = await SmtpSession.ConnectAsync(port);
 
-        // Without the fix this read blocks forever (the accept thread is parked inside client 1's processor).
-        Assert.StartsWith("220 ", await ReadLineWithTimeout(r2));
-    }
-
-    private static async Task<string?> ReadLineWithTimeout(StreamReader reader, int timeoutMs = 15_000)
-    {
-        using var cts = new CancellationTokenSource(timeoutMs);
-        try
-        {
-            return await reader.ReadLineAsync(cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            throw new TimeoutException("timed out waiting for the SMTP greeting");
-        }
-    }
-
-    private static ushort AllocatePort()
-    {
-        var tmp = new TcpListener(IPAddress.Loopback, 0);
-        try
-        {
-            tmp.Start();
-            return (ushort)((IPEndPoint)tmp.LocalEndpoint).Port;
-        }
-        finally
-        {
-            tmp.Stop();
-        }
+        // Without the fix this read would block forever (the accept thread is parked inside client 1's
+        // processor) — the shared helper's 10 s timeout turns that hang into a test failure.
+        Assert.StartsWith("220 ", await c2.ReadLineAsync());
     }
 
     public void Dispose() => _server?.Dispose();
-
-    private sealed class NoopDelivery : IMailDelivery
-    {
-        public Task<SmtpDeliveryResult> EmailReceivedAsync(MailTransaction transaction, CancellationToken cancellationToken = default) =>
-            Task.FromResult(SmtpDeliveryResult.Ok());
-
-        public Task<UserExistsCodes> DoesUserExist(string emailAddress) =>
-            Task.FromResult(UserExistsCodes.DestinationAddressValid);
-    }
 }

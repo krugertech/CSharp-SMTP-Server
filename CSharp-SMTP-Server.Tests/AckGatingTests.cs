@@ -1,8 +1,5 @@
 using System;
-using System.IO;
 using System.Net;
-using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using CSharp_SMTP_Server;
@@ -23,20 +20,6 @@ public sealed class AckGatingTests : IDisposable
 {
     // ─── helpers ────────────────────────────────────────────────────────────────
 
-    private static ushort AllocatePort()
-    {
-        var tmp = new TcpListener(IPAddress.Loopback, 0);
-        try
-        {
-            tmp.Start();
-            return (ushort)((IPEndPoint)tmp.LocalEndpoint).Port;
-        }
-        finally
-        {
-            tmp.Stop();
-        }
-    }
-
     private static SMTPServer BuildServer(IMailDelivery delivery, ushort port)
     {
         var opts = new ServerOptions(validateSPF: false, validateDMARC: false, dnsServerEndpoint: null);
@@ -52,53 +35,36 @@ public sealed class AckGatingTests : IDisposable
         return server;
     }
 
-    private static readonly TimeSpan ReadTimeout = TimeSpan.FromSeconds(10);
-
     /// <summary>
-    /// Opens a raw SMTP connection, drives EHLO → MAIL FROM → RCPT TO → DATA → body → "."
-    /// and returns the full response line that the server sends after ".".
-    /// Every read is bounded by <see cref="ReadTimeout"/> so a non-responsive server cannot
-    /// cause the test runner to hang indefinitely.
+    /// Opens a raw SMTP connection (shared <see cref="SmtpSession"/> helper), drives
+    /// EHLO → MAIL FROM → RCPT TO → DATA → body → "." and returns the full response line that
+    /// the server sends after ".". Every read is bounded by a 10 s timeout so a non-responsive
+    /// server cannot cause the test runner to hang indefinitely.
     /// </summary>
     private static async Task<string> SendMailAndGetDataResponseAsync(ushort port)
     {
-        using var tcp = new TcpClient();
-        await tcp.ConnectAsync(IPAddress.Loopback, port).WaitAsync(ReadTimeout);
+        await using var s = await SmtpSession.ConnectAsync(port);
 
-        using var stream = tcp.GetStream();
-        using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-
-        async Task<string> ReadLine()
-        {
-            var line = await reader.ReadLineAsync().WaitAsync(ReadTimeout);
-            return line ?? throw new InvalidOperationException("Server closed the connection unexpectedly.");
-        }
-
-        async Task Send(string line)
-        {
-            var bytes = Encoding.UTF8.GetBytes(line + "\r\n");
-            await stream.WriteAsync(bytes).AsTask().WaitAsync(ReadTimeout);
-        }
-
-        await ReadLine();                                   // 220 greeting
-        await Send("EHLO test.client");
-        while (true) { var l = await ReadLine(); if (l.StartsWith("250 ")) break; } // multi-line EHLO
-        await Send("MAIL FROM: <sender@example.com>");
-        await ReadLine();                                   // 250 2.0.0
-        await Send("RCPT TO: <rcpt@example.com>");
-        await ReadLine();                                   // 250 2.1.5
-        await Send("DATA");
-        await ReadLine();                                   // 354
+        Assert.StartsWith("220 ", await s.ReadLineAsync());  // greeting
+        await s.Send("EHLO test.client");
+        await s.ReadResponseAsync();                         // multi-line 250
+        await s.Send("MAIL FROM: <sender@example.com>");
+        await s.ReadLineAsync();                             // 250 2.0.0
+        await s.Send("RCPT TO: <rcpt@example.com>");
+        await s.ReadLineAsync();                             // 250 2.1.5
+        await s.Send("DATA");
+        Assert.StartsWith("354", await s.ReadLineAsync());
 
         // minimal RFC 5322 body
-        await Send("Subject: test");
-        await Send("From: sender@example.com");
-        await Send("To: rcpt@example.com");
-        await Send("");
-        await Send("Hello");
-        await Send(".");                                    // end of data
+        await s.Send("Subject: test");
+        await s.Send("From: sender@example.com");
+        await s.Send("To: rcpt@example.com");
+        await s.Send("");
+        await s.Send("Hello");
+        await s.Send(".");                                  // end of data
 
-        return await ReadLine();                            // ← the ACK we are testing
+        return (await s.ReadLineAsync())                     // ← the ACK we are testing
+               ?? throw new InvalidOperationException("Server closed the connection unexpectedly.");
     }
 
     public void Dispose() { }
@@ -184,7 +150,7 @@ public sealed class AckGatingTests : IDisposable
     public async Task Data_Returns250_AfterDeliveryHandlerCompletes()
     {
         var delivery = new OkDelivery();
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         using var server = BuildServer(delivery, port);
 
         var response = await SendMailAndGetDataResponseAsync(port);
@@ -198,7 +164,7 @@ public sealed class AckGatingTests : IDisposable
     public async Task Data_DoesNotReturn250_WhileHandlerIsRunning()
     {
         var delivery = new SlowDelivery();
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         using var server = BuildServer(delivery, port);
 
         // Start the full SMTP session in the background.
@@ -224,7 +190,7 @@ public sealed class AckGatingTests : IDisposable
     public async Task Data_Returns451_OnTemporaryDeliveryFailure()
     {
         var delivery = new TempFailDelivery();
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         using var server = BuildServer(delivery, port);
 
         var response = await SendMailAndGetDataResponseAsync(port);
@@ -237,7 +203,7 @@ public sealed class AckGatingTests : IDisposable
     public async Task Data_Returns451_WhenHandlerThrows()
     {
         var delivery = new ThrowingDelivery();
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         using var server = BuildServer(delivery, port);
 
         var response = await SendMailAndGetDataResponseAsync(port);
@@ -250,7 +216,7 @@ public sealed class AckGatingTests : IDisposable
     public async Task DeliveryHandler_CalledExactlyOnce_PerTransaction()
     {
         var delivery = new CountingDelivery();
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         using var server = BuildServer(delivery, port);
 
         await SendMailAndGetDataResponseAsync(port);
@@ -264,7 +230,7 @@ public sealed class AckGatingTests : IDisposable
     {
         // Uses SlowDelivery gate; response must not arrive before Release().
         var delivery = new SlowDelivery();
-        var port = AllocatePort();
+        var port = TestPorts.Allocate();
         using var server = BuildServer(delivery, port);
 
         var responseTask = SendMailAndGetDataResponseAsync(port);
