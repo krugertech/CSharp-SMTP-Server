@@ -45,9 +45,23 @@ namespace CSharp_SMTP_Server.Networking
 
 		internal void Start() => _listenerThread.Start();
 
-		internal void AddProcessor(ClientProcessor processor)
+		/// <summary>
+		/// Registers a freshly accepted connection, unless the listener is already shutting down.
+		/// </summary>
+		/// <returns><c>true</c> if registered; <c>false</c> if the listener is disposed.</returns>
+		internal bool AddProcessor(ClientProcessor processor)
 		{
-			lock (_processorsLock) ClientProcessors.Add(processor);
+			// The disposed-check and the registration must be atomic with respect to Dispose()'s
+			// snapshot: otherwise a connection accepted just before Dispose() could be added *after*
+			// the snapshot was taken and never be disposed at all (see the comment in Dispose()).
+			lock (_processorsLock)
+			{
+				if (_dispose)
+					return false;
+
+				ClientProcessors.Add(processor);
+				return true;
+			}
 		}
 
 		internal void RemoveProcessor(ClientProcessor processor)
@@ -65,7 +79,15 @@ namespace CSharp_SMTP_Server.Networking
 					try
 					{
 						var client = _listener.AcceptTcpClient();
-						AddProcessor(new ClientProcessor(client, this, _secure));
+
+						var processor = new ClientProcessor(client, this, _secure);
+
+						// Dispose() may have run between the accept above and this registration. If so
+						// the processor is not in its snapshot and nothing else will ever dispose it,
+						// so drop it here — otherwise it keeps serving a client after shutdown, still
+						// using the TLS certificate that SMTPServer.Dispose() is about to dispose.
+						if (!AddProcessor(processor))
+							processor.Dispose(true, true);
 					}
 					catch (Exception e)
 					{
@@ -86,11 +108,23 @@ namespace CSharp_SMTP_Server.Networking
 
 			_listener.Stop();
 
-			// Snapshot after Stop(): no new Add can race with the enumeration (an accept that slipped
-			// in just before Stop is either in the snapshot — and gets disposed here — or outlives it,
-			// in which case its own dispose path removes itself safely).
+			// Set the flag and take the snapshot in ONE critical section, using the same lock
+			// AddProcessor takes. That ordering is what closes the accept/registration window: a
+			// processor accepted just before shutdown either registers before this block — and is
+			// disposed from the snapshot — or finds _dispose already set and is refused, and the
+			// accept loop disposes it. It can no longer be added after the snapshot and survive
+			// shutdown unnoticed, still holding a socket and using the certificate that
+			// SMTPServer.Dispose() disposes next.
+			//
+			// (_dispose is also assigned above, unsynchronised, so the accept loop's `while (!_dispose)`
+			// and the exception filter observe shutdown promptly. The assignment here is the one this
+			// invariant relies on; the plain-bool visibility issue on that other read is R7.)
 			ClientProcessor[] snapshot;
-			lock (_processorsLock) snapshot = ClientProcessors.ToArray();
+			lock (_processorsLock)
+			{
+				_dispose = true;
+				snapshot = ClientProcessors.ToArray();
+			}
 
 			foreach (var processor in snapshot)
 				processor.Dispose(true, true);

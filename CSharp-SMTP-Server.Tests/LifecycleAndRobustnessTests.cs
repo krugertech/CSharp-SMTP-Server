@@ -93,6 +93,53 @@ public sealed class LifecycleAndRobustnessTests
     }
 
     [Fact]
+    public async Task ConnectionAcceptedDuringShutdown_IsRefusedAndDisposed_R11()
+    {
+        // R11: there is a window between AcceptTcpClient() returning and AddProcessor() registering
+        // the connection. If Dispose() snapshots the processor list inside that window, the connection
+        // used to be added afterwards — into a list nobody reads again — and was never disposed. It
+        // kept serving a client after shutdown, while SMTPServer.Dispose() went on to dispose the TLS
+        // certificate it may still have been using.
+        //
+        // This pins the invariant that closes the window: once the listener is disposed, registration
+        // is refused rather than silently succeeding, and the accept loop disposes what it turns away.
+        //
+        // A racing version of this test (N connections hammered against a concurrent Dispose()) was
+        // written and rejected: it took ~8 minutes and still PASSED against the unfixed library, because
+        // the accept/registration window is far too narrow to land in by chance from outside the
+        // process. Asserting the invariant directly is both deterministic and fast; the honest tradeoff
+        // is that it verifies the guard rather than reproducing the original race end-to-end.
+        var port = TestPorts.Allocate();
+        using var server = new SMTPServer(null, TestServers.DefaultOptions(), NoopDelivery.Instance);
+        var listener = new Listener(IPAddress.Loopback, port, server, false, false);
+        listener.Start();
+
+        // The listener is live and registering normally.
+        await using (var s = await SmtpSession.ConnectAsync(port))
+            Assert.StartsWith("220 ", await s.ReadLineAsync());
+
+        // Open a real connection, then dispose the listener while we hold the accepted client. This is
+        // the state the accept loop is in inside the window: it has a TcpClient and is about to
+        // register a processor for it.
+        var sink = new TcpListener(IPAddress.Loopback, TestPorts.Allocate());
+        sink.Start();
+        using var late = new TcpClient();
+        await late.ConnectAsync((IPEndPoint)sink.LocalEndpoint);
+        using var accepted = await sink.AcceptTcpClientAsync();
+
+        listener.Dispose();
+
+        // Registration must now be refused. Pre-fix, AddProcessor returned void and added it
+        // unconditionally — into a list already snapshotted, so it was never disposed.
+        var processor = new ClientProcessor(accepted, listener, false);
+        Assert.False(listener.AddProcessor(processor),
+            "AddProcessor accepted a registration after Dispose() — the R11 window is open again");
+
+        processor.Dispose(true, true); // what the accept loop now does with a refused processor
+        sink.Stop();
+    }
+
+    [Fact]
     public async Task PortAlreadyInUse_StartDoesNotThrow_OthersKeepWorking()
     {
         var blockedPort = TestPorts.Allocate();
