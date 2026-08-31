@@ -81,16 +81,10 @@ public sealed class SmtpSession : IAsyncDisposable
     /// <summary>Sends one command line (CRLF-terminated, flushed immediately).</summary>
     public async Task Send(string command)
     {
-        using var cts = new CancellationTokenSource(DefaultTimeout);
-        try
-        {
-            _writer.WriteLine(command);
-            await _writer.FlushAsync(cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            throw new TimeoutException($"timed out sending command on port {Port}");
-        }
+        // StreamWriter has no FlushAsync(CancellationToken) overload; a local socket flush cannot
+        // realistically hang, so the unbounded call is safe here.
+        _writer.WriteLine(command);
+        await _writer.FlushAsync();
     }
 
     /// <summary>Sends raw bytes without framing — for garbage-input tests.</summary>
