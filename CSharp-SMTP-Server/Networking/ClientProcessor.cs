@@ -33,7 +33,12 @@ namespace CSharp_SMTP_Server.Networking
 			if (Server.SpfValidator != null)
 				SpfResultsCache = new();
 
-			Init();
+			// Run Init on the thread pool. If the greeting write completes synchronously (typical for a
+			// small write into an empty socket buffer), Init would otherwise run inline in this ctor and
+			// block the caller inside Receive()'s EndOfStream check until the client sends data or goes
+			// away. For connections accepted by Listener that parks the accept loop, so a second client
+			// can never be greeted — the server would handle one connection at a time.
+			_ = Task.Run(Init);
 		}
 
 		internal readonly Dictionary<string, ValidationResult>? SpfResultsCache;
