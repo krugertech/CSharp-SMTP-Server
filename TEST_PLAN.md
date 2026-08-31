@@ -3,8 +3,9 @@
 Working plan of everything worth testing, derived from a full read-through of the source on 2026-07.
 Each entry lists concrete cases and expected outcomes so implementation is mechanical.
 
-**Status:** Phases 1 (§3 + §9), 2 (§4.1–4.7, §5, §8) and 3 (§4.8 TLS) implemented — suite total
-**238/238 green** (verified over repeated runs).
+**Status:** all four phases implemented: Phase 1 (§3 + §9), Phase 2 (§4.1–4.7, §5, §8),
+Phase 3 (§4.8 TLS) and Phase 4 (§6 SPF + §7 DMARC) — suite total **294/294 green**
+(verified over repeated runs).
 
 - *Phase 1* (107 tests): `SmtpDeliveryResultTests`, `ServerOptionsTests`, `MailTransactionTests` (pins B1–B4),
   `CheckCidrTests`, `DmarcOrganizationalDomainTests`, `Base64Tests`, `ProcessAddressTests`,
@@ -20,6 +21,9 @@ Each entry lists concrete cases and expected outcomes so implementation is mecha
   without-cert plaintext fallback pin, dynamic `SetTLSCertificate`, RequireEncryptionForAuth 538→235,
   and three failed-handshake survival guards. Infrastructure: `TlsTestCerts` helper (§1.3) +
   `SmtpSession.UpgradeTlsAsync` + `TestServers.BuildTls`.
+- *Phase 4* (56 tests): `SpfValidatorTests` (27), `DmarcValidatorTests` (13, incl. the B1 end-to-end
+  pin), `SpfDmarcIntegrationTests` (4). Infrastructure: `DnsStub` — the plan's "optional" UDP DNS
+  responder (§1.5) is now built and used; the Phase 1 suffix-list HTTP helper is reused.
 
 Bugs found & fixed during implementation (each with a regression test):
 1. ClientProcessor ctor blocked the listener accept thread → one concurrent client at a time on Windows
@@ -35,7 +39,10 @@ text) and **Q8** (§5 finding that the delivery CancellationToken does **not** f
 `DeliverMessage` is in flight — nothing polls the socket). Phase 3 added **Q9** (no per-line responses during
 DATA — clients waiting for a per-line ACK hang; RFC 5321 does not require them) and found & fixed bug
 **B5**: on an implicit-TLS port, any failed/aborted handshake threw inside `async void Init()` and crashed
-the whole process (commit `7cb9fd9`, guarded by three regression tests). Phase 4 remains.
+the whole process (commit `7cb9fd9`, guarded by three regression tests). Phase 4 added **Q11**
+(zabszk.DnsClient silently drops multi-string TXT responses — split real-world SPF/DMARC records are
+invisible to validation), **Q12** (SPF DNS error handling deviates from RFC 7208 in three ways) and
+**Q13** (`redirect=` is evaluated positionally, short-circuiting later mechanisms).
 
 ## 0. Current coverage (do not duplicate)
 
@@ -60,9 +67,11 @@ Everything below is **new**.
 4. **Local HTTP server helper** (`HttpListener` on loopback) serving a minimal Public Suffix List —
    required by `DmarcValidator` (its constructor downloads the list and blocks). Points at
    `ServerOptions.PublicSuffixList`; keeps DMARC tests offline.
-5. **Optional UDP DNS stub** (P2, biggest investment): minimal responder for TXT/MX/A/AAAA/PTR queries so
-   `SpfValidator.CheckHost` / `DmarcValidator.GetDmarcRecord` can be unit-tested deterministically.
-   `ServerOptions.DnsServerEndpoint` accepts any endpoint, so the stub slots in cleanly. Estimate 300–500 LOC.
+5. **Optional UDP DNS stub** (P2) ✅ built as `DnsStub.cs` (~330 LOC): minimal loopback responder for
+   TXT/MX/A/AAAA/PTR queries so `SpfValidator.CheckHost` / `DmarcValidator.GetDmarcRecord` can be unit-tested
+   deterministically. `ServerOptions.DnsServerEndpoint` accepts any endpoint, so the stub slots in cleanly.
+   Wire behavior verified against zabszk.DnsClient 1.0.1 by capturing its actual queries (plain UDP, no EDNS,
+   ID-matched responses with the question section echoed; never sets TC so the TCP fallback stays cold).
 6. **xUnit traits** for anything touching real network (`[Trait("Network","dns")]`) so offline CI runs only
    loopback tests by default. Keep the existing 10 s read-timeout pattern everywhere.
 
@@ -88,6 +97,9 @@ behavior changed silently.
 | Q8 | Delivery `CancellationToken` vs client disconnect | While the delivery handler is in flight, nothing polls the client socket (the receive loop is parked inside `DeliverMessage`) — a client RST does **not** fire the token; it only becomes observable after the handler returns, when the response write fails and the connection disposes. If delivery cancellation ever matters, this needs a fix | ✅ empirical (`AckGatingAdditionsTests`) |
 | Q9 | No per-line responses during DATA | After `354`, body lines are acknowledged with **nothing** — only the single final response after `<CRLF>.<CRLF>`. RFC 5321 does not require per-line ACKs, but many real-world servers send them; a client that waits for an ACK on every line will hang. Pinned by the Phase 3 full-flow tests (body lines sent back-to-back) | ✅ empirical (`TlsStartTlsTests`) |
 | Q10 | Windows: SChannel rejects `CertificateRequest`-created certs | A self-signed cert built with `CertificateRequest.CreateSelfSigned()` cannot be used as a server certificate on Windows — the handshake fails with “Authentication failed because the platform does not support ephemeral keys” (SChannel can’t use the embedded CNG key). Re-importing the same cert from PFX (`new X509Certificate2(pfx, pw)`) fixes it. Affects any library user who generates certs in memory on Windows; `TlsTestCerts` does the PFX round-trip | ✅ empirical (scratch repro matrix: legacy/modern API × minimal/full extensions all fail pre-roundtrip) |
+| Q11 | zabszk.DnsClient TXT parsing | Multi-string character-string TXT responses are **silently dropped** — only single-string RDATA is parsed (verified by wire capture). Consequence: SPF/DMARC records split across multiple strings (common in the wild due to the 255-byte limit) look like "no record" → SPF `None`, DMARC falls back / `None`. The test stub therefore emits one string per TXT RR. | ✅ empirical (scratch wire capture + `SpfValidatorTests`) |
+| Q12 | `SpfValidator` DNS error handling vs RFC 7208 | Three deviations: (a) top-level TXT **NXDOMAIN → Temperror** (§4.3 says "none"); (b) SERVFAIL/NXDOMAIN on an `a`/`mx` lookup returns the mechanism's **qualifier** instead of temperror — a bare `a` even PASSES when DNS fails (§5 intro); (c) redirect to a nonexistent domain → **Temperror** passes through (§6.1+§4.3 say permerror). | ✅ empirical (`SpfValidatorTests`) |
+| Q13 | `SpfValidator` `redirect=` evaluation order | The redirect is evaluated in **positional order** and returns immediately, short-circuiting later mechanisms; RFC 7208 §6.1/§4.7 only consults the redirect after ALL mechanisms have failed to match (`v=spf1 redirect:x ip4:<client>` → x's result wins today). | ✅ empirical (`SpfValidatorTests`) |
 
 ## 3. Pure unit tests — no I/O (P0)
 
@@ -278,7 +290,13 @@ Wire-level matrix (SPF disabled in these tests):
   (`552 5.4.3 too big`).
 - **Concurrent sessions**: two clients delivering simultaneously — both get correct responses, handlers run in parallel (no cross-talk).
 
-## 6. SPF validator (P2 — needs DNS stub §1.5)
+## 6. SPF validator (P2) ✅ done — `SpfValidatorTests` (27 tests), commit `bb880f0`
+
+**Implementation notes:** "redirect to nonexistent" resolves differently depending on what "nonexistent"
+means — target exists but has no SPF record → Permerror (as planned); target NXDOMAIN/SERVFAIL → Temperror
+passes through (Q12c; the plan's Permerror expectation holds only for the former). The include case where
+the included domain ends in fail/softfail/neutral is **not** a quirk: RFC 7208 §5.2 says those are "not
+match" and evaluation resumes — pinned as spec-compliance tests.
 
 `CheckHost(ip, domain)` against stub-controlled records:
 - No TXT record / query error → `Temperror`; no `v=spf1` record → `None`.
@@ -289,7 +307,12 @@ Wire-level matrix (SPF disabled in these tests):
 - Request-limit behavior: >10 DNS requests during evaluation → `Permerror` (or `Fail` when PTR was used) — construct a record with many mechanisms.
 - Final fallback: no mechanism matched → `Neutral`.
 
-## 7. DMARC validator (P2 — needs suffix-list HTTP helper + DNS stub)
+## 7. DMARC validator (P2) ✅ done — `DmarcValidatorTests` (13 tests), commit `bb880f0`
+
+**Implementation notes:** header-From domains are driven through **quoted display names containing <…>**
+(`From: "<a@header.com>" <env@example.com>`): GetFrom returns the display name (B1) and ProcessAddress takes
+the first <…> pair, so this is exactly what DMARC validates today. The B1 end-to-end pin asserts both the
+None result **and** zero DNS queries for a perfectly normal message.
 
 - `GetDmarcRecord`: TXT not starting `v=DMARC1;` ignored; two DMARC records in one response → treated as none; missing record → null.
 - `ValidateTransaction`: no From header / unparseable From domain → `None`; no `_dmarc` record on domain **or** org domain → `None`.
@@ -330,6 +353,7 @@ Wire-level matrix (SPF disabled in these tests):
 | 1 ✅ done | §3 (pure) + §9 (meta) | 107 delivered (+1 regression test for the ctor fix, `294adbe`) | IVT, NoopDelivery, LocalHttpServer |
 | 2 ✅ done | §4.1–4.7, §5, §8 (loopback protocol + robustness) | 107 delivered (+ `Listener.ClientProcessors` fix, `b0e241c`) | shared SmtpSession helper, TestServers factory, recording fakes, xunit.runner.json |
 | 3 ✅ done | §4.8 (TLS) | 11 delivered (+ B5 process-crash fix, `7cb9fd9`) | TlsTestCerts helper (§1.3), SmtpSession.UpgradeTlsAsync |
-| 4 | §6, §7 (SPF/DMARC) | ~30 | suffix-list HTTP helper + DNS stub |
+| 4 ✅ done | §6, §7 (SPF/DMARC) | 56 delivered (+ `DnsStub` UDP fixture, `bb880f0`) | suffix-list HTTP helper (Phase 1) + DnsStub (§1.5) |
 
-Total ≈ **190 test cases**. Phases 1–2 give the highest value-per-effort and need almost no new infrastructure.
+Total delivered: **294 tests** (per-phase estimates above were conservative). All four phases complete —
+see SUMMARY.md for remaining work (push dev; optional B1–B4 / filter-throwing decisions).

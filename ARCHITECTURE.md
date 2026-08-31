@@ -35,6 +35,7 @@ Not affiliated with or endorsed by the original author.
 | `4a4cb06` Add Phase 2 protocol matrix tests (TEST_PLAN.md §4.1–4.7): 86 new tests | Exact-wire assertions for every command group; pins quirks Q1/Q2/Q3/Q5/Q6 and the newly found **Q7** (two-arg `WriteCode(code, enhanced)` call sites bind to the `(int,string)` sanitizer overload — no table text on most responses) |
 | `df4636e` Fix Listener.ClientProcessors thread-safety; add §5/§8 tests | The documented TODO race was real: concurrent Add/Remove corrupted the list → NRE in `Dispose()` under load (deterministic repro via new `ConcurrencyStress` test); fixed with lock + snapshot-in-Dispose. Also pins **Q8**: delivery CancellationToken does not fire on client disconnect mid-delivery |
 | `7cb9fd9` Fix implicit-TLS handshake failure crashing the process; add Phase 3 TLS tests (§4.8) | Bug **B5**: on an implicit-TLS port any failed/aborted handshake (silent disconnect, cert rejection, plaintext probe) threw inside `async void Init()` and killed the whole process — now logged + connection dropped, guarded by three regression tests. Also pins Q9 (no per-line DATA ACKs) and Q10 (Windows SChannel rejects `CertificateRequest`-created certs; PFX round-trip required) |
+| `bb880f0` Add DnsStub UDP DNS fixture and Phase 4 SPF/DMARC tests (§6/§7): 56 new | Last plan phase — SpfValidator/DmarcValidator tested deterministically offline via a loopback UDP DNS stub (`DnsStub`). Pins Q11 (multi-string TXT responses silently dropped by zabszk.DnsClient), Q12 (SPF DNS error handling deviates from RFC 7208 in three ways) and Q13 (`redirect=` evaluated positionally); B1 end-to-end pin proves DMARC is inert for normal mail (None with zero DNS queries) |
 
 To see exactly what the fork changed: `git diff 2f7386e..HEAD`.
 
@@ -181,7 +182,7 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj
 
 **Environment gotcha:** the test project targets **net7.0**. If only a newer runtime is installed
 (e.g. .NET 9 SDK on this machine), tests abort with "framework not found". Fix without touching the
-csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 238 tests pass (~9 s).
+csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 294 tests pass (~9 s).
 
 Test classes run **serially** (`xunit.runner.json`, `parallelizeTestCollections: false`) — the suite
 binds loopback ports, and concurrently running classes race on port allocation.
@@ -242,6 +243,18 @@ accepted today), TLS-port-without-cert plaintext fallback pin, dynamic `SetTLSCe
 RequireEncryptionForAuth 538→235, and three failed-handshake survival guards for the B5 fix. Uses the
 `TlsTestCerts` helper (ephemeral self-signed cert with a PFX round-trip — see Q10) and
 `SmtpSession.UpgradeTlsAsync`.
+
+**Phase 4 SPF/DMARC** (56): `SpfValidatorTests` (27 — CheckHost matrix against the stub: record-lookup
+errors, all qualifiers + bare `all`, ip4/ip6 exact & CIDR match/mismatch, family-mismatch fall-through,
+IPv4-mapped client unmapping, a/mx lookups, include semantics incl. RFC 7208 §5.2 not-match-resume,
+redirect propagation and the >10-lookup limit in both its permerror and ptr-used-fail forms),
+`DmarcValidatorTests` (13 — strict vs relaxed alignment, p=/sp= policy mapping, org-domain fallback,
+two-records-in-one-response → none, and the B1 end-to-end pin) and `SpfDmarcIntegrationTests` (4 — full
+sessions: SPF Fail 554 5.7.23 at MAIL FROM with no delivery, DMARC Fail 554 5.7.1 at DATA with the handler
+never running, Authentication-Results headers on delivered messages). Infrastructure: `DnsStub` — loopback
+UDP responder for TXT/A/AAAA/MX/PTR with SERVFAIL/NXDOMAIN modes and a query log; wire behavior verified
+against zabszk.DnsClient 1.0.1 by capturing its actual queries. New pins: Q11 (multi-string TXT responses
+silently dropped), Q12 (SPF DNS error handling deviates from RFC 7208 ×3), Q13 (positional `redirect=`).
 
 ## 8. Known issues & gotchas
 

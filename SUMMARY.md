@@ -13,16 +13,18 @@ DATA delivery** — `IMailDelivery.EmailReceivedAsync(MailTransaction, Cancellat
 exception→451) and the SMTP response is only sent after the handler returns. Delivery runs inside
 the SMTP session by design.
 
-## 2. Current state (as of `715b075`)
+## 2. Current state (as of `bb880f0`)
 
-- Branch: **`dev`, 14 commits ahead of `origin/master`, NOT pushed** (`git push origin dev` when ready).
+- Branch: **`dev`, 17 commits ahead of `origin/master`, NOT pushed** (`git push origin dev` when ready).
 - Build: 0 errors (pre-existing harmless warnings: net7.0 EOL notice, CS8619 in MailTransaction).
-- Tests: **238/238 green**, ~9 s per run, stable across repeated runs. Working tree clean.
+- Tests: **294/294 green**, ~9 s per run, stable across repeated runs. Working tree clean.
 
 ### Commit stack (newest first)
 
 | Commit | What |
 |---|---|
+| `bb880f0` | **Phase 4 SPF/DMARC tests** (§6/§7): `DnsStub` UDP DNS fixture + 56 new; pins Q11–Q13 and B1 end-to-end |
+| `7eda61d` | Docs: SUMMARY.md handoff document |
 | `715b075` | Docs: Phase 3 completion, B5 fix, Q9/Q10 findings |
 | `7cb9fd9` | **Fix B5** (implicit-TLS handshake crash) + Phase 3 TLS tests (§4.8): 11 new |
 | `0c06e45` | Docs: Phase 2 completion, Q7/Q8, ClientProcessors fix |
@@ -91,8 +93,11 @@ separate decision (they change observable behavior).
 | Q8 | Delivery `CancellationToken` does NOT fire on client disconnect mid-delivery (nothing polls the socket while parked in `DeliverMessage`) |
 | Q9 | No per-line responses during DATA — only the final response after `<CRLF>.<CRLF>`; clients waiting for a per-line ACK hang (RFC 5321 doesn't require them) |
 | Q10 | **Windows**: SChannel cannot use `CertificateRequest.CreateSelfSigned()` certs ("platform does not support ephemeral keys"); PFX round-trip re-import fixes it. Affects real library users generating certs in memory on Windows |
+| Q11 | zabszk.DnsClient silently drops multi-string TXT responses (only single character-strings are parsed) → split real-world SPF/DMARC records look like "no record" (SPF `None`; DMARC fallback/`None`) |
+| Q12 | SPF DNS error handling deviates from RFC 7208: top-level NXDOMAIN → Temperror (not none); failed `a`/`mx` lookup returns the mechanism's qualifier instead of temperror (bare `a` even PASSES on DNS failure); redirect to nonexistent domain → Temperror (not permerror) |
+| Q13 | SPF `redirect=` is evaluated positionally and short-circuits later mechanisms; RFC 7208 §6.1/§4.7 only consults it after all mechanisms have failed |
 
-## 7. Test suite layout (238 tests)
+## 7. Test suite layout (294 tests)
 
 - **Phase 1 — pure unit** (107): `SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9),
   `MailTransactionTests` (19, pins B1–B4), `CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7,
@@ -102,6 +107,11 @@ separate decision (they change observable behavior).
   `CommandSequencingTests` (13), `MailFromTests` (13), `RcptToTests` (13), `DataAndMessageTests` (12),
   `AuthProtocolTests` (19), `AckGatingAdditionsTests` (6, incl. Q8 pin), `LifecycleAndRobustnessTests` (15).
 - **Phase 3 — TLS** (11): `TlsStartTlsTests`.
+- **Phase 4 — SPF/DMARC** (56): `SpfValidatorTests` (27), `DmarcValidatorTests` (13, incl. the B1
+  end-to-end pin: a normal SPF-aligned message yields None with zero DNS queries),
+  `SpfDmarcIntegrationTests` (4 — SPF Fail 554 at MAIL FROM, DMARC Fail 554 at DATA, AR headers).
+  Infrastructure: `DnsStub` loopback UDP DNS responder (§1.5) + reused `LocalHttpServer` suffix-list
+  fixture; test project LangVersion bumped to 12 (test-only).
 - **Upstream-fix regression tests**: `AckGatingTests` (6), `AuthLoginInitialResponseTests` (4),
   `EhloBracketedIpv6Tests` (3), `ConcurrentGreetingTests` (1).
 
@@ -112,12 +122,12 @@ Shared infrastructure: `SmtpSession` (raw-TCP client with timeouts, multi-line r
 
 ## 8. Remaining work
 
-1. **Phase 4 (only plan phase left)**: SPF/DMARC tests (~30) behind a UDP DNS stub / local resolver
-   fixture — TEST_PLAN.md §6/§7. Biggest investment of the four phases; needs the optional DNS-stub
-   infrastructure from §1.4.
-2. **Push**: `git push origin dev` (14 commits, unpushed).
-3. **Optional decisions** (user to make): fix B1–B4? (B1 is the important one — DMARC inert); harden the
-   filter-throwing path in `Init()`; anything from the upstream re-audit.
+All four test-plan phases are complete (294 tests). Left:
+
+1. **Push**: `git push origin dev` (17 commits, unpushed).
+2. **Optional decisions** (user to make): fix B1–B4? (B1 is the important one — DMARC inert; now pinned
+   end-to-end by Phase 4); address the Q11/Q12/Q13-class deviations in SpfValidator / zabszk.DnsClient?
+   harden the filter-throwing path in `Init()`; anything from the upstream re-audit.
 
 ## 9. Working conventions used throughout (keep them)
 
@@ -135,7 +145,7 @@ Shared infrastructure: `SmtpSession` (raw-TCP client with timeouts, multi-line r
 git log --oneline -15          # commit stack (see §2)
 cat ARCHITECTURE.md            # how the code works + upstream sync record
 cat TEST_PLAN.md               # what's tested, what's pinned, what's left (§11 build order)
-$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 238/238 in ~9 s
+$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 294/294 in ~9 s
 ```
 
 Key source files: `CSharp-SMTP-Server/Networking/{ClientProcessor,Listener}.cs` (connection lifecycle —
