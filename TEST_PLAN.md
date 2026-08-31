@@ -1,8 +1,16 @@
 # Unit Test Plan — Krugertech CSharp SMTP Server
 
 Working plan of everything worth testing, derived from a full read-through of the source on 2026-07.
-**No tests are written yet** — this is the backlog. Each entry lists concrete cases and expected
-outcomes so implementation is mechanical.
+Each entry lists concrete cases and expected outcomes so implementation is mechanical.
+
+**Status:** Phase 1 (§3 + §9) implemented — 107 new tests (suite total 120/120 green):
+`SmtpDeliveryResultTests`, `ServerOptionsTests`, `MailTransactionTests` (pins B1–B4), `CheckCidrTests`,
+`DmarcOrganizationalDomainTests`, `Base64Tests`, `ProcessAddressTests`, `WireFormattingTests`
+(socket-pair harness for direct `WriteCode` access), `ValueTypesTests`, `VersionConsistencyTests`.
+Infrastructure delivered: `InternalsVisibleTo`, `NoopDelivery` + `LocalHttpServer` helpers. During
+implementation a pre-existing bug was found and fixed (commit `294adbe`): the ClientProcessor ctor
+blocked the listener accept thread when the greeting write completed synchronously → only one
+concurrent client could be handled; regression test `ConcurrentGreetingTests`. Phases 2–4 remain.
 
 ## 0. Current coverage (do not duplicate)
 
@@ -116,7 +124,8 @@ The address-validation matrix, each case asserting `(address, domain)` out-value
 | `"<a@b>"` (domain without dot) | null |
 | `"<ab@c.d.e>"` | address + domain `c.d.e` |
 | `"<a.b@c>"` (dot before @) | null |
-| `"<a@@b.c>"`, `"<@b.c>"` | null (two @ / empty local part) |
+| `"<a@@b.c>"` | null (two @ signs) |
+| `"<@b.c>"` — empty local part is **accepted** today (returns `"@b.c"`, domain `"b.c"`). Pin it! | accepted per code |
 | `"<a@.c>"` — domain is `.c`: lastDot > atIndex and domain contains '.' → **accepted** with domain `.c`. Pin this surprising edge case! | accepted per code |
 | `"\"John Doe\" <john@example.com>"` (display name) | `john@example.com` |
 | leading colon from command parsing (`":<a@b.c>"`) | still parses (first `<…>`) |
@@ -285,7 +294,7 @@ Wire-level matrix (SPF disabled in these tests):
 
 | Phase | Sections | Est. test count | New infra needed |
 |---|---|---|---|
-| 1 | §3 (pure) + §9 (meta) | ~70 | IVT only |
+| 1 ✅ done | §3 (pure) + §9 (meta) | 107 delivered (+1 regression test for the ctor fix, `294adbe`) | IVT, NoopDelivery, LocalHttpServer |
 | 2 | §4.1–4.7, §5, §8 (loopback protocol + robustness) | ~80 | shared SmtpSession helper |
 | 3 | §4.8 (TLS) | ~10 | cert helper |
 | 4 | §6, §7 (SPF/DMARC) | ~30 | suffix-list HTTP helper + DNS stub |

@@ -16,7 +16,7 @@ MTA keeps its copy until your handler says the message was safely accepted.
 
 Not affiliated with or endorsed by the original author.
 
-## 2. Git history (6 commits)
+## 2. Git history (8 commits)
 
 | Commit | Meaning |
 |---|---|
@@ -29,6 +29,8 @@ Not affiliated with or endorsed by the original author.
 | `8fa02c8` Handled unhandled exceptions reported in #16 | **Cherry-pick from upstream** — IOException handling + write cancellation token (see §9) |
 | `7d0d50f` Support AUTH LOGIN initial response (RFC 4954)… | Adapted from upstream PR #17 — IIS SMTP relay compatibility (see §9) |
 | `274069a` Fix EHLO/HELO parsing of bracketed IPv6 literals | Upstream issue #18, fixed here (no upstream fix exists; see §9) |
+| `294adbe` Fix ClientProcessor ctor blocking the listener accept thread | Fork fix found during Phase 1 testing — when the greeting write completes synchronously (typical on Windows), `Init()` ran inline in the ctor and parked inside `Receive()`'s `EndOfStream` check, consuming the accept thread: a second concurrent client never got its 220. `Init` now runs on the thread pool; regression test `ConcurrentGreetingTests` |
+| `e8a241f` Add Phase 1 unit tests (TEST_PLAN.md §3 + §9): 107 new tests | Pure unit suite per `TEST_PLAN.md`; includes pins for confirmed upstream bugs B1–B4 in `MailTransaction` (see TEST_PLAN.md §2) |
 
 To see exactly what the fork changed: `git diff 2f7386e..HEAD`.
 
@@ -175,7 +177,7 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj
 
 **Environment gotcha:** the test project targets **net7.0**. If only a newer runtime is installed
 (e.g. .NET 9 SDK on this machine), tests abort with "framework not found". Fix without touching the
-csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 6 tests pass (~0.5 s).
+csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 120 tests pass (~0.5 s).
 
 Known build warnings (pre-existing, harmless): net7.0 EOL notice; CS8619 nullability mismatches in
 `MailTransaction.GetTo/GetCc/GetBcc` (`IEnumerable<string?>` vs `IEnumerable<string>` — MimeKit's
@@ -183,8 +185,10 @@ Known build warnings (pre-existing, harmless): net7.0 EOL notice; CS8619 nullabi
 
 ### Tests
 
-All test files use the same pattern: allocate a free loopback port, start an actual `SMTPServer`,
-speak raw SMTP over TCP with 10 s read timeouts.
+Integration-style test files share one pattern: allocate a free loopback port, start an actual
+`SMTPServer`, speak raw SMTP over TCP with 10 s read timeouts. Phase 1 (per `TEST_PLAN.md`) adds
+pure unit tests (no I/O) plus one socket-pair harness for the wire-output helpers; the test project
+gains `InternalsVisibleTo` access to internal helpers (`ProcessAddress`, `Base64`, `WriteCode`).
 
 **`AckGatingTests.cs`** (6 facts):
 1. DATA → 250 only after handler completes; handler called exactly once.
@@ -202,8 +206,24 @@ wrong password → 535; invalid base64 initial response falls back to the userna
 **`EhloBracketedIpv6Tests.cs`** (3 facts): `EHLO [IPv6:…]` is accepted and the session stays usable;
 plain-hostname EHLO regression guard; `MAIL FROM:<…@[IPv6:…]>` still parses as a MAIL FROM command.
 
+**Phase 1 unit tests** (107, see `TEST_PLAN.md` §3/§9 for the full case list):
+`SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9), `MailTransactionTests` (19 — pins bugs B1–B4),
+`CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7, suffix list served from a local HTTP
+helper — no internet), `Base64Tests` (10), `ProcessAddressTests` (15), `WireFormattingTests` (6,
+direct `WriteCode` tests on a socket pair incl. CR/LF sanitization), `ValueTypesTests` (6),
+`VersionConsistencyTests` (2).
+
+**`ConcurrentGreetingTests.cs`** (1 fact): two concurrent clients both receive their 220 greeting while
+the first stays idle — regression guard for the accept-thread-blocking fix (`294adbe`).
+
 ## 8. Known issues & gotchas
 
+- **Confirmed upstream bugs pinned by tests (B1–B4)** — see `TEST_PLAN.md` §2. Most important:
+  `MailTransaction.GetFrom/GetTo/GetCc/GetBcc` return MimeKit *display names*, not addresses, so DMARC
+  validation is effectively inert for ordinary mail; `AddHeader` before first parse duplicates the header
+  in `ParsedMessage`; `Clone()` drops `DMARCValidationResult` and shares the `DeliverTo` list.
+- **Fixed during Phase 1 testing:** `ClientProcessor` ctor blocked the listener accept thread when the
+  greeting write completed synchronously (one concurrent client at a time on Windows) — see `294adbe`.
 - **Thread-safety bug in `Listener.ClientProcessors`** (pre-existing, deliberately unfixed to keep the
   fork diff minimal — see the big TODO comment at the top of `Networking/Listener.cs`). Plain
   `List<>` mutated from three contexts: accept thread (`Add`), per-connection dispose (`Remove`), and
