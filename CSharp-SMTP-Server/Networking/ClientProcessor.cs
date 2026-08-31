@@ -70,33 +70,47 @@ namespace CSharp_SMTP_Server.Networking
 
 		private async void Init()
 		{
-			if (Secure)
+			// Init runs as async void with no other handler, so ANY exception escaping it crashes the
+			// whole process rather than the connection. The TLS handshake was the first case found
+			// (B5); Greet() is another — it awaits IMailFilter.IsConnectionAllowed, and a filter that
+			// throws (a database timeout in a real deployment is enough) is ordinary consumer code, not
+			// a hostile scanner. The outer catch covers the whole body, including anything added later
+			// on this path.
+			try
 			{
-				Encryption = ConnectionEncryption.Tls;
-				_stream = new SslStream(_innerStream, false);
-				try
+				if (Secure)
 				{
-					await ((SslStream)_stream).AuthenticateAsServerAsync(Server.Certificate!, false, Server.Options.Protocols, true);
-				}
-				catch (Exception e)
-				{
-					// Init runs as async void with no other handler: a client that drops the connection
-					// mid-handshake, rejects our certificate, or sends plaintext to an implicit-TLS port
-					// would otherwise crash the whole process (any scanner touching the TLS port kills it).
-					// Log and drop just this connection — same policy as the receive loop below.
-					Server.LoggerInterface?.LogError("[Client TLS handshake] Exception: " + e.GetType().FullName + ", " + e.Message);
+					Encryption = ConnectionEncryption.Tls;
+					_stream = new SslStream(_innerStream, false);
+					try
+					{
+						await ((SslStream)_stream).AuthenticateAsServerAsync(Server.Certificate!, false, Server.Options.Protocols, true);
+					}
+					catch (Exception e)
+					{
+						// Kept distinct from the outer handler for its specific log prefix: a client that
+						// drops mid-handshake, rejects our certificate, or sends plaintext to an
+						// implicit-TLS port is routine and worth identifying as such in the log.
+						Server.LoggerInterface?.LogError("[Client TLS handshake] Exception: " + e.GetType().FullName + ", " + e.Message);
 
-					Dispose();
-					return;
+						Dispose();
+						return;
+					}
 				}
+				else
+					await Greet();
+
+				if (!_dispose)
+					_reader = new StreamReader(_stream);
+
+				_ = Receive();
 			}
-			else
-				await Greet();
+			catch (Exception e)
+			{
+				Server.LoggerInterface?.LogError("[Client init] Exception: " + e.GetType().FullName + ", " + e.Message);
 
-			if (!_dispose)
-				_reader = new StreamReader(_stream);
-
-			_ = Receive();
+				Dispose();
+			}
 		}
 
 		private async Task Greet()
@@ -124,13 +138,27 @@ namespace CSharp_SMTP_Server.Networking
 
 		private async Task Receive()
 		{
-			if (Secure)
+			// Receive() is started as `_ = Receive()`, so like Init() it has no caller to observe its
+			// exceptions. On a TLS connection the greeting — and with it the IMailFilter call — happens
+			// HERE rather than in Init(), so this pre-greeting section needs the same guard: without it
+			// a throwing filter still takes the process down on exactly the TLS path (R6).
+			try
 			{
-				while (!_t.IsCancellationRequested && !((SslStream)_stream).IsAuthenticated)
-					await Task.Delay(5, _t);
+				if (Secure)
+				{
+					while (!_t.IsCancellationRequested && !((SslStream)_stream).IsAuthenticated)
+						await Task.Delay(5, _t);
 
-				if (!_greetSent)
-					await Greet();
+					if (!_greetSent)
+						await Greet();
+				}
+			}
+			catch (Exception e)
+			{
+				Server.LoggerInterface?.LogError("[Client greeting] Exception: " + e.GetType().FullName + ", " + e.Message);
+
+				Dispose();
+				return;
 			}
 
 			if (!_greetSent)

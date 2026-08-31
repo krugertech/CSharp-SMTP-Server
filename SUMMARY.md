@@ -66,8 +66,13 @@ Gotchas:
 | **B5** implicit-TLS crash | Failed/aborted handshake on a TLS port threw inside `async void Init()` → **whole process died** (silent disconnect, cert rejection, or plaintext probe — any scanner touching the port) | `7cb9fd9` (try/catch: log + drop connection) | 3 regression tests in `TlsStartTlsTests` (pre-fix: test run aborts outright) |
 | **R11** shutdown escape | Gap left by `df4636e`: a connection accepted but not yet registered when `Dispose()` snapshotted the list was added *afterwards*, into a list nobody reads again → never disposed, still serving a client (and still using the TLS certificate `SMTPServer.Dispose()` then disposes) | `AddProcessor` returns `bool`, refusing registration when `_dispose` is set; flag-set and snapshot now share one `_processorsLock` critical section; accept loop disposes a refused processor | `ConnectionAcceptedDuringShutdown_IsRefusedAndDisposed_R11` |
 
-Known limitation (documented, not fixed): a throwing `IMailFilter.IsConnectionAllowed` still crashes via
-the same `async void Init()` path.
+**R6 (fixed)** — a throwing `IMailFilter.IsConnectionAllowed` used to crash the process via the same
+`async void Init()` path as B5. It is now caught in *two* places, both needed: `Init()` (plaintext
+greeting) and the pre-greeting section of `Receive()` (TLS greeting — on a secure connection `Greet()`
+runs there, and `Receive()` is likewise started fire-and-forget). Guarding only `Init()` leaves the TLS
+path crashable; verified by disabling the second guard and watching
+`ThrowingFilter_ImplicitTlsConnection_OnlyThatConnectionDropped_R6` fail. Both guards have regression
+tests in `TlsStartTlsTests` (pre-fix: the test run aborts outright, same signature as B5).
 
 ## 5. Confirmed upstream bugs (B1–B4)
 

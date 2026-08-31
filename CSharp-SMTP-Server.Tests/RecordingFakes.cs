@@ -35,6 +35,9 @@ public sealed class ConfigurableFilter : IMailFilter
     public SmtpResult Deliver = new(SmtpResultType.Success);
     public SmtpResult ProcessTransaction = new(SmtpResultType.Success);
 
+    /// <summary>When set, IsConnectionAllowed throws this instead of returning (R6 regression tests).</summary>
+    public Exception? ConnectionThrows;
+
     // ── last-call argument recording ───────────────────────────────────────────
     public EndPoint? LastConnectionEp;
     public string? LastSender;
@@ -49,6 +52,7 @@ public sealed class ConfigurableFilter : IMailFilter
     public Task<SmtpResult> IsConnectionAllowed(EndPoint? ep)
     {
         LastConnectionEp = ep;
+        if (ConnectionThrows != null) throw ConnectionThrows;
         return Task.FromResult(Connection);
     }
 

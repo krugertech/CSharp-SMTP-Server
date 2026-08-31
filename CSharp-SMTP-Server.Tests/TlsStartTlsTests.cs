@@ -332,4 +332,73 @@ public class TlsStartTlsTests
         await s2.UpgradeTlsAsync();
         Assert.Equal("220 test.local ESMTP", await s2.ReadLineAsync());
     }
+
+    [Fact]
+    public async Task ThrowingFilter_PlaintextConnection_OnlyThatConnectionDropped_R6()
+    {
+        // R6: same async void crash class as B5, but reachable from ordinary consumer code rather than
+        // a hostile scanner. Init() awaits Greet(), which awaits IMailFilter.IsConnectionAllowed; a
+        // filter that throws (a database timeout is enough) propagated out of async void and killed the
+        // process. Now it is logged and only this connection is dropped.
+        var filter = new ConfigurableFilter { ConnectionThrows = new InvalidOperationException("filter backend down") };
+        var logger = new RecordingLogger();
+        var port = TestPorts.Allocate();
+        using var server = TestServers.Build(port, filter: filter, logger: logger);
+        server.Start();
+
+        await using (var s = await SmtpSession.ConnectAsync(port))
+        {
+            // No greeting arrives — the connection is dropped instead.
+            string? line;
+            try { line = await s.ReadLineAsync(); }
+            catch (IOException) { line = null; }
+            Assert.Null(line);
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (logger.Errors.Count == 0 && sw.Elapsed < TimeSpan.FromSeconds(5))
+            await Task.Delay(50);
+
+        Assert.Contains(logger.Errors, e => e.StartsWith("[Client init]") && e.Contains("filter backend down"));
+
+        // The process survived and the next client is greeted normally.
+        filter.ConnectionThrows = null;
+        await using var s2 = await SmtpSession.ConnectAsync(port);
+        Assert.Equal("220 test.local ESMTP", await s2.ReadLineAsync());
+    }
+
+    [Fact]
+    public async Task ThrowingFilter_ImplicitTlsConnection_OnlyThatConnectionDropped_R6()
+    {
+        // The TLS half of R6, which the plaintext test above does NOT cover: on a secure connection the
+        // greeting (and with it the filter call) happens in Receive(), not Init() — and Receive() is
+        // also started fire-and-forget. Guarding only Init() would leave the process crashable here.
+        var filter = new ConfigurableFilter { ConnectionThrows = new InvalidOperationException("filter backend down") };
+        var cert = TlsTestCerts.Create();
+        var logger = new RecordingLogger();
+        var port = TestPorts.Allocate();
+        using var server = TestServers.BuildTls(port, certificate: cert, logger: logger, filter: filter);
+        server.Start();
+
+        await using (var s = await SmtpSession.ConnectAsync(port))
+        {
+            await s.UpgradeTlsAsync(); // handshake succeeds; the filter throws while greeting
+            string? line;
+            try { line = await s.ReadLineAsync(); }
+            catch (IOException) { line = null; }
+            Assert.Null(line);
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (logger.Errors.Count == 0 && sw.Elapsed < TimeSpan.FromSeconds(5))
+            await Task.Delay(50);
+
+        Assert.Contains(logger.Errors, e => e.StartsWith("[Client greeting]") && e.Contains("filter backend down"));
+
+        // The process survived and the next TLS client is greeted normally.
+        filter.ConnectionThrows = null;
+        await using var s2 = await SmtpSession.ConnectAsync(port);
+        await s2.UpgradeTlsAsync();
+        Assert.Equal("220 test.local ESMTP", await s2.ReadLineAsync());
+    }
 }

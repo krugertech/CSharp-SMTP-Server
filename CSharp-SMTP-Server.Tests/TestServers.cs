@@ -35,7 +35,7 @@ public static class TestServers
     /// <summary>Builds (but does not start) a server with one implicit-TLS loopback port.</summary>
     public static SMTPServer BuildTls(ushort? port = null, ServerOptions? options = null,
         IMailDelivery? delivery = null, IAuthLogin? auth = null, X509Certificate2? certificate = null,
-        ILogger? logger = null)
+        ILogger? logger = null, IMailFilter? filter = null)
     {
         var p = port ?? TestPorts.Allocate();
         var server = new SMTPServer(
@@ -44,6 +44,7 @@ public static class TestServers
             certificate: certificate);
 
         if (auth != null) server.SetAuthLogin(auth);
+        if (filter != null) server.SetFilter(filter);
         return server;
     }
 }
