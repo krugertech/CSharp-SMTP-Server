@@ -7,7 +7,8 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <LangVersion>11</LangVersion>
+    <!-- C# 12 for collection expressions in the DNS stub / test helpers (test project only). -->
+    <LangVersion>12</LangVersion>
   </PropertyGroup>
 
   <ItemGroup>
