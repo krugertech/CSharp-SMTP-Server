@@ -192,14 +192,23 @@ public sealed class MailTransactionTests
     }
 
     [Fact]
-    public void Clone_SharedDeliverToListInstance_BugB4()
+    public void Clone_CopiesDeliverToList_MutationIsIsolated()
     {
-        // BUG B4: Clone copies the DeliverTo list by reference — clone and original share one instance.
+        // B4 (fixed): Clone takes a defensive copy of DeliverTo. A delivery handler that filters or
+        // deduplicates the recipient list on its clone must not mutate the server-side transaction.
         var t = Tx(SimpleMessage);
+        t.DeliverTo.Add("first@x.y");
 
         var c = (MailTransaction)t.Clone();
 
-        Assert.Same(t.DeliverTo, c.DeliverTo);
+        Assert.NotSame(t.DeliverTo, c.DeliverTo);
+        Assert.Equal(t.DeliverTo, c.DeliverTo); // same contents…
+
+        c.DeliverTo.Add("added-by-handler@x.y"); // …but independent storage
+        Assert.Equal(new[] { "first@x.y" }, t.DeliverTo);
+
+        t.DeliverTo.Add("added-by-server@x.y"); // and the isolation holds in both directions
+        Assert.Equal(new[] { "first@x.y", "added-by-handler@x.y" }, c.DeliverTo);
     }
 
     [Theory]

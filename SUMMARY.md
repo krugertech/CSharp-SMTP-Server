@@ -78,13 +78,16 @@ Details + repro evidence in TEST_PLAN.md §2; disposition per bug decided in REV
   `None` regardless of the real outcome — `CheckDisabled` was lost too. Now copied in the `Clone()`
   initializer. Guarded by `MailTransactionTests.Clone_CarriesDmarcValidationResult` (Pass/Fail/CheckDisabled)
   and `AckGatingAdditionsTests.DeliveryClone_CarriesDmarcResult_AndHandlerMutationIsSafe` end-to-end.
+- **B4** *(fixed)*: `Clone()` shared the `DeliverTo` `List<string>` by reference, so a delivery handler
+  filtering or deduplicating recipients mutated the server-side transaction too — a live risk now that
+  delivery runs inside the session (ACK-gating). Now `new List<string>(DeliverTo)`. Guarded by
+  `MailTransactionTests.Clone_CopiesDeliverToList_MutationIsIsolated` and the same end-to-end test.
 
 ### Not yet fixed (decision pending)
 
 - **B1**: `MailTransaction.GetFrom/GetTo/GetCc/GetBcc` return MimeKit *display names*, not addresses
   (`From: sender@example.com` → `""`; `From: John <j@e.c>` → `"John"`) — makes DMARC validation effectively inert.
 - **B2**: `AddHeader` before first parse duplicates the header in `ParsedMessage`.
-- **B4**: `Clone()` shares the `DeliverTo` list by reference.
 
 Pinned by `MailTransactionTests`. Fixing these changes observable behavior.
 

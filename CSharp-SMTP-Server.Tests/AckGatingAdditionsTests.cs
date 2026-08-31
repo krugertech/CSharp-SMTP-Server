@@ -80,8 +80,11 @@ public sealed class AckGatingAdditionsTests
             // The delivered clone carries the processor-side result: CheckDisabled, not None.
             Assert.Equal(ValidationResult.CheckDisabled, tx.DMARCValidationResult);
 
-            // B4: the clone shares the DeliverTo list instance with the processor's original. Mutating
-            // it here must not disturb server state — the original is discarded after delivery anyway.
+            // B4 end-to-end (fixed): the clone owns its own DeliverTo list, so a handler mutating it
+            // cannot reach the processor-side transaction. Each delivery must see exactly the
+            // recipients of its own transaction, unpolluted by the previous handler's mutation.
+            Assert.Equal(new[] { "c@d.e" }, tx.DeliverTo);
+
             tx.DeliverTo.Add("mutated@x.y");
             return SmtpDeliveryResult.Ok();
         };
@@ -104,6 +107,11 @@ public sealed class AckGatingAdditionsTests
             Assert.StartsWith("250", await s.ReadLineAsync());
 
             Assert.Equal(2, delivery.Delivered.Count);
+
+            // Both clones kept the handler's mutation on their own copy, and neither leaked into the
+            // other — two distinct list instances, each with its own transaction's recipient.
+            Assert.NotSame(delivery.Delivered[0].DeliverTo, delivery.Delivered[1].DeliverTo);
+            Assert.All(delivery.Delivered, d => Assert.Equal(new[] { "c@d.e", "mutated@x.y" }, d.DeliverTo));
         }
     }
 
