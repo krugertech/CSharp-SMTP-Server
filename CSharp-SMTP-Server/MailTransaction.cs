@@ -145,7 +145,8 @@ namespace CSharp_SMTP_Server
 				_parsedMessage = ParsedMessage,
 				RemoteEndPoint = RemoteEndPoint,
 				DeliverTo = DeliverTo,
-				Encryption = Encryption
+				Encryption = Encryption,
+				DMARCValidationResult = DMARCValidationResult
 			};
 		}
 	}

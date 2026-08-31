@@ -202,17 +202,20 @@ public sealed class MailTransactionTests
         Assert.Same(t.DeliverTo, c.DeliverTo);
     }
 
-    [Fact]
-    public void Clone_DropsDmarcValidationResult_BugB3()
+    [Theory]
+    [InlineData(ValidationResult.Pass)]
+    [InlineData(ValidationResult.Fail)]
+    [InlineData(ValidationResult.CheckDisabled)]
+    public void Clone_CarriesDmarcValidationResult(ValidationResult dmarc)
     {
-        // BUG B3: Clone does not copy DMARCValidationResult — the transaction handed to the delivery
-        // handler always shows None, even when DMARC validation ran and produced a real result.
+        // B3 (fixed): Clone copies DMARCValidationResult, so the transaction handed to the delivery
+        // handler reports the real outcome — including CheckDisabled, which must stay distinct from None.
         var t = Tx(SimpleMessage);
-        t.DMARCValidationResult = ValidationResult.Pass;
+        t.DMARCValidationResult = dmarc;
 
         var c = (MailTransaction)t.Clone();
 
-        Assert.Equal(ValidationResult.None, c.DMARCValidationResult);
+        Assert.Equal(dmarc, c.DMARCValidationResult);
     }
 
     [Fact]

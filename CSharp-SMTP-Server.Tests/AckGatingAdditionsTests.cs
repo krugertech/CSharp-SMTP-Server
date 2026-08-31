@@ -69,17 +69,16 @@ public sealed class AckGatingAdditionsTests
     }
 
     [Fact]
-    public async Task DeliveryClone_DmarcResultIsNone_AndHandlerMutationIsSafe()
+    public async Task DeliveryClone_CarriesDmarcResult_AndHandlerMutationIsSafe()
     {
-        // B3 end-to-end: with DMARC disabled the processor-side transaction carries CheckDisabled,
-        // but Clone() drops DMARCValidationResult — so the delivered clone always shows None.
-        // (The direct unit-level pin lives in MailTransactionTests.)
+        // B3 end-to-end (fixed): with DMARC disabled the processor-side transaction carries
+        // CheckDisabled, and Clone() now preserves it — the delivered clone reports the real result
+        // rather than a misleading None. (The direct unit-level test lives in MailTransactionTests.)
         var delivery = new RecordingDelivery();
         delivery.HandlerOverride = async (tx, ct) =>
         {
-            // B3 end-to-end: the delivered clone's DMARC result is None even though the
-            // processor-side transaction carried CheckDisabled (DMARC disabled).
-            Assert.Equal(ValidationResult.None, tx.DMARCValidationResult);
+            // The delivered clone carries the processor-side result: CheckDisabled, not None.
+            Assert.Equal(ValidationResult.CheckDisabled, tx.DMARCValidationResult);
 
             // B4: the clone shares the DeliverTo list instance with the processor's original. Mutating
             // it here must not disturb server state — the original is discarded after delivery anyway.

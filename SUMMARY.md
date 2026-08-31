@@ -68,16 +68,25 @@ Gotchas:
 Known limitation (documented, not fixed): a throwing `IMailFilter.IsConnectionAllowed` still crashes via
 the same `async void Init()` path.
 
-## 5. Confirmed upstream bugs — pinned by tests, NOT yet fixed (decision pending)
+## 5. Confirmed upstream bugs (B1–B4)
+
+Details + repro evidence in TEST_PLAN.md §2; disposition per bug decided in REVIEW.md Part 3.
+
+### Fixed
+
+- **B3** *(fixed)*: `Clone()` dropped `DMARCValidationResult`, so every delivered transaction reported
+  `None` regardless of the real outcome — `CheckDisabled` was lost too. Now copied in the `Clone()`
+  initializer. Guarded by `MailTransactionTests.Clone_CarriesDmarcValidationResult` (Pass/Fail/CheckDisabled)
+  and `AckGatingAdditionsTests.DeliveryClone_CarriesDmarcResult_AndHandlerMutationIsSafe` end-to-end.
+
+### Not yet fixed (decision pending)
 
 - **B1**: `MailTransaction.GetFrom/GetTo/GetCc/GetBcc` return MimeKit *display names*, not addresses
   (`From: sender@example.com` → `""`; `From: John <j@e.c>` → `"John"`) — makes DMARC validation effectively inert.
 - **B2**: `AddHeader` before first parse duplicates the header in `ParsedMessage`.
-- **B3**: `Clone()` drops `DMARCValidationResult` (delivered transaction always shows `None`).
 - **B4**: `Clone()` shares the `DeliverTo` list by reference.
 
-Pinned by `MailTransactionTests`; details + repro evidence in TEST_PLAN.md §2. Fixing any of these is a
-separate decision (they change observable behavior).
+Pinned by `MailTransactionTests`. Fixing these changes observable behavior.
 
 ## 6. Pinned quirks Q1–Q10 (current behavior, asserted exactly — don't "fix" without review)
 
