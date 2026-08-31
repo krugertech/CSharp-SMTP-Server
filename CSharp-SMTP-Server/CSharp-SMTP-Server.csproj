@@ -50,4 +50,10 @@
     <PackageReference Include="MimeKit" Version="4.17.0" />
     <PackageReference Include="zabszk.DnsClient" Version="1.0.1" />
   </ItemGroup>
+
+  <!-- Expose internal helpers (ProcessAddress, Base64, ClientProcessor.WriteCode, ...) to the test project.
+       The test assembly is unsigned, so no public key is required. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="CSharp-SMTP-Server.Tests" />
+  </ItemGroup>
 </Project>
