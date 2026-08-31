@@ -207,7 +207,26 @@ namespace CSharp_SMTP_Server.Networking
 			string command;
 			var data = string.Empty;
 
-			if (response.Contains(':', StringComparison.Ordinal)) command = response[..response.IndexOf(":", StringComparison.Ordinal)].ToUpperInvariant().TrimEnd();
+			// Find the first ':' outside square brackets so that bracketed IPv6 literals in EHLO/HELO
+			// (e.g. "EHLO [IPv6:fe80::1]", sent by Thunderbird) are not misparsed as a command
+			// separator, which previously made the server answer 503 "EHLO/HELO first".
+			// Upstream issue #18 (https://github.com/zabszk/CSharp-SMTP-Server/issues/18).
+			int colonIndex = -1;
+			bool inBrackets = false;
+
+			for (var i = 0; i < response.Length; i++)
+			{
+				var c = response[i];
+
+				if (inBrackets)
+				{
+					if (c == ']') inBrackets = false;
+				}
+				else if (c == '[') inBrackets = true;
+				else if (c == ':') { colonIndex = i; break; }
+			}
+
+			if (colonIndex >= 0) command = response[..colonIndex].ToUpperInvariant().TrimEnd();
 			else if (response.Contains(' ', StringComparison.Ordinal))
 				command = response[..response.IndexOf(" ", StringComparison.Ordinal)].ToUpper(CultureInfo.InvariantCulture).TrimEnd();
 			else command = response.ToUpperInvariant();
