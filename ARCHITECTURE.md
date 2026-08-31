@@ -16,7 +16,7 @@ MTA keeps its copy until your handler says the message was safely accepted.
 
 Not affiliated with or endorsed by the original author.
 
-## 2. Git history (11 commits)
+## 2. Git history (12 commits)
 
 | Commit | Meaning |
 |---|---|
@@ -34,6 +34,7 @@ Not affiliated with or endorsed by the original author.
 | `994eb07` Extract shared SmtpSession helper for integration tests (§1.2) | Test infrastructure — connect/send/read with 10 s timeouts, raw-byte send, RST abort; existing test files refactored onto it |
 | `4a4cb06` Add Phase 2 protocol matrix tests (TEST_PLAN.md §4.1–4.7): 86 new tests | Exact-wire assertions for every command group; pins quirks Q1/Q2/Q3/Q5/Q6 and the newly found **Q7** (two-arg `WriteCode(code, enhanced)` call sites bind to the `(int,string)` sanitizer overload — no table text on most responses) |
 | `df4636e` Fix Listener.ClientProcessors thread-safety; add §5/§8 tests | The documented TODO race was real: concurrent Add/Remove corrupted the list → NRE in `Dispose()` under load (deterministic repro via new `ConcurrencyStress` test); fixed with lock + snapshot-in-Dispose. Also pins **Q8**: delivery CancellationToken does not fire on client disconnect mid-delivery |
+| `7cb9fd9` Fix implicit-TLS handshake failure crashing the process; add Phase 3 TLS tests (§4.8) | Bug **B5**: on an implicit-TLS port any failed/aborted handshake (silent disconnect, cert rejection, plaintext probe) threw inside `async void Init()` and killed the whole process — now logged + connection dropped, guarded by three regression tests. Also pins Q9 (no per-line DATA ACKs) and Q10 (Windows SChannel rejects `CertificateRequest`-created certs; PFX round-trip required) |
 
 To see exactly what the fork changed: `git diff 2f7386e..HEAD`.
 
@@ -180,7 +181,7 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj
 
 **Environment gotcha:** the test project targets **net7.0**. If only a newer runtime is installed
 (e.g. .NET 9 SDK on this machine), tests abort with "framework not found". Fix without touching the
-csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 227 tests pass (~8 s).
+csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 238 tests pass (~9 s).
 
 Test classes run **serially** (`xunit.runner.json`, `parallelizeTestCollections: false`) — the suite
 binds loopback ports, and concurrently running classes race on port allocation.
@@ -235,6 +236,13 @@ multi-listener, Dispose RST semantics, port-in-use tolerance, dual-mode guards, 
 survival, abrupt disconnect at four phases, and the `ConcurrencyStress` regression guard for the
 `ClientProcessors` thread-safety fix).
 
+**Phase 3 TLS/STARTTLS** (11): `TlsStartTlsTests` — implicit-TLS port flow (`Encryption = Tls`), STARTTLS
+advertise/upgrade/second-attempt (`Encryption = StartTls`), no-cert 502, Q4 pin (STARTTLS before EHLO is
+accepted today), TLS-port-without-cert plaintext fallback pin, dynamic `SetTLSCertificate`,
+RequireEncryptionForAuth 538→235, and three failed-handshake survival guards for the B5 fix. Uses the
+`TlsTestCerts` helper (ephemeral self-signed cert with a PFX round-trip — see Q10) and
+`SmtpSession.UpgradeTlsAsync`.
+
 ## 8. Known issues & gotchas
 
 - **Confirmed upstream bugs pinned by tests (B1–B4)** — see `TEST_PLAN.md` §2. Most important:
@@ -255,6 +263,16 @@ survival, abrupt disconnect at four phases, and the `ConcurrencyStress` regressi
   the socket (the receive loop is parked inside `DeliverMessage`), so a client RST cannot cancel the
   delivery; the token only fires after the handler returns, when the response write fails. If delivery
   cancellation ever matters, this needs a fix — pinned by `AckGatingAdditionsTests`.
+- **Fixed during Phase 3 testing (B5):** on an implicit-TLS port, any failed/aborted handshake (client
+  disconnects without handshaking, rejects the certificate, or sends plaintext) threw inside
+  `async void Init()` and crashed the whole process — one scanner touching the TLS port killed the server.
+  Now logged + only that connection dropped; guarded by three regression tests in `TlsStartTlsTests` — see `7cb9fd9`.
+- **Q10 — Windows SChannel rejects `CertificateRequest`-created certs:** a self-signed cert built with
+  `CertificateRequest.CreateSelfSigned()` cannot be used as a server certificate on Windows ("platform does
+  not support ephemeral keys"); re-importing it from PFX fixes the handshake. Library users generating certs
+  in memory on Windows will hit this — pin/round-trip via PFX (as `TlsTestCerts` does).
+- **Known limitation (not fixed):** a throwing `IMailFilter.IsConnectionAllowed` also propagates through
+  `async void Init()` and would crash the process; only the TLS handshake path was hardened in B5.
 - **Delivery runs inside the SMTP session**: a slow handler holds the connection open for as long as it
   takes — by design, but size your timeouts/worker pools accordingly. The `CancellationToken` is tied to
   the client connection; if the client disconnects mid-delivery the token fires (handlers should honor it).

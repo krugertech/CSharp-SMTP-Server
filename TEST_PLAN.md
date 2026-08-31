@@ -3,8 +3,8 @@
 Working plan of everything worth testing, derived from a full read-through of the source on 2026-07.
 Each entry lists concrete cases and expected outcomes so implementation is mechanical.
 
-**Status:** Phase 1 (§3 + §9) and Phase 2 (§4.1–4.7, §5, §8) implemented — suite total **227/227 green**
-(verified over repeated runs).
+**Status:** Phases 1 (§3 + §9), 2 (§4.1–4.7, §5, §8) and 3 (§4.8 TLS) implemented — suite total
+**238/238 green** (verified over repeated runs).
 
 - *Phase 1* (107 tests): `SmtpDeliveryResultTests`, `ServerOptionsTests`, `MailTransactionTests` (pins B1–B4),
   `CheckCidrTests`, `DmarcOrganizationalDomainTests`, `Base64Tests`, `ProcessAddressTests`,
@@ -15,6 +15,11 @@ Each entry lists concrete cases and expected outcomes so implementation is mecha
   `AckGatingAdditionsTests` (6), `LifecycleAndRobustnessTests` (15). Infrastructure: shared `SmtpSession`
   helper + `TestServers` factory + `RecordingDelivery`/`ConfigurableFilter`/`RecordingLogger` fakes;
   xUnit test-class parallelization disabled (`xunit.runner.json`) because the suite binds loopback ports.
+- *Phase 3* (11 tests): `TlsStartTlsTests` — implicit-TLS port flow + `Encryption = Tls`, STARTTLS
+  advertise/upgrade/second-attempt, no-cert 502, Q4 pin (STARTTLS before EHLO accepted), TLS-port-
+  without-cert plaintext fallback pin, dynamic `SetTLSCertificate`, RequireEncryptionForAuth 538→235,
+  and three failed-handshake survival guards. Infrastructure: `TlsTestCerts` helper (§1.3) +
+  `SmtpSession.UpgradeTlsAsync` + `TestServers.BuildTls`.
 
 Bugs found & fixed during implementation (each with a regression test):
 1. ClientProcessor ctor blocked the listener accept thread → one concurrent client at a time on Windows
@@ -27,7 +32,10 @@ Bugs found & fixed during implementation (each with a regression test):
 New quirks pinned during Phase 2: **Q7** (two-arg `WriteCode(code, enhanced)` call sites bind to the
 `(int, string)` sanitizer overload — no implicit int→ushort conversion — so most responses carry no table
 text) and **Q8** (§5 finding that the delivery CancellationToken does **not** fire on client disconnect while
-`DeliverMessage` is in flight — nothing polls the socket). Phases 3–4 remain.
+`DeliverMessage` is in flight — nothing polls the socket). Phase 3 added **Q9** (no per-line responses during
+DATA — clients waiting for a per-line ACK hang; RFC 5321 does not require them) and found & fixed bug
+**B5**: on an implicit-TLS port, any failed/aborted handshake threw inside `async void Init()` and crashed
+the whole process (commit `7cb9fd9`, guarded by three regression tests). Phase 4 remains.
 
 ## 0. Current coverage (do not duplicate)
 
@@ -78,6 +86,8 @@ behavior changed silently.
 | Q6 | `ServerOptions.MessageCharactersLimit` enforcement | Counter counts characters **excluding CRLF**; once exceeded, further lines are silently dropped from `RawBody` (moot — the transaction is rejected with 552 anyway). Boundary: exactly-at-limit is accepted (`>=`). | code read |
 | Q7 | All two-arg `WriteCode(code, enhanced)` call sites in the library | C# has **no implicit int→ushort conversion**, so `WriteCode(250, "2.0.0")` (int literal) can only bind to the `(int, string)` sanitizer overload — the table-text overload `(ushort, string)` is never reached from these call sites. Consequence: NOOP → `250 2.0.0` (no “OK”), HELP → `214 2.0.0`, QUIT → `221 2.0.0`, VRFY → `252 5.5.1`, MAIL FROM success → `250 2.0.0`, RCPT valid → `250 2.1.5`, unknown command → `502 5.5.1` — all without the `SMTPCodes` table text. Only single-arg calls (`WriteCode(354)`) and three-arg calls with explicit text get a message body. RFC-wise legal (text after an enhanced status is optional), but surprising; pinned by exact-wire assertions throughout Phase 2 | ✅ empirical |
 | Q8 | Delivery `CancellationToken` vs client disconnect | While the delivery handler is in flight, nothing polls the client socket (the receive loop is parked inside `DeliverMessage`) — a client RST does **not** fire the token; it only becomes observable after the handler returns, when the response write fails and the connection disposes. If delivery cancellation ever matters, this needs a fix | ✅ empirical (`AckGatingAdditionsTests`) |
+| Q9 | No per-line responses during DATA | After `354`, body lines are acknowledged with **nothing** — only the single final response after `<CRLF>.<CRLF>`. RFC 5321 does not require per-line ACKs, but many real-world servers send them; a client that waits for an ACK on every line will hang. Pinned by the Phase 3 full-flow tests (body lines sent back-to-back) | ✅ empirical (`TlsStartTlsTests`) |
+| Q10 | Windows: SChannel rejects `CertificateRequest`-created certs | A self-signed cert built with `CertificateRequest.CreateSelfSigned()` cannot be used as a server certificate on Windows — the handshake fails with “Authentication failed because the platform does not support ephemeral keys” (SChannel can’t use the embedded CNG key). Re-importing the same cert from PFX (`new X509Certificate2(pfx, pw)`) fixes it. Affects any library user who generates certs in memory on Windows; `TlsTestCerts` does the PFX round-trip | ✅ empirical (scratch repro matrix: legacy/modern API × minimal/full extensions all fail pre-roundtrip) |
 
 ## 3. Pure unit tests — no I/O (P0)
 
@@ -242,14 +252,18 @@ Wire-level matrix (SPF disabled in these tests):
 - **LOGIN inline with decodable-but-empty username** (`AUTH LOGIN ` + base64(`""`)) → falls back to standard two-step prompt flow.
 - Auth state survives a re-EHLO (document current behavior).
 
-### 4.8 TLS / STARTTLS (needs cert helper §1.3)
-- Implicit-TLS port: client must handshake first; then `220` greeting over TLS; delivered transaction has `Encryption = Tls`.
-- STARTTLS on plain port with cert: EHLO advertises it; after `220 Ready for TLS` the upgrade succeeds; subsequent commands work; delivered transaction has `Encryption = StartTls`; second STARTTLS → `503 5.5.1`.
-- STARTTLS without certificate configured → `502 5.5.1`.
-- **Pin Q4**: STARTTLS as the very first command (before EHLO) is accepted today.
-- TLS port constructed **without** a certificate: server falls back to plaintext greeting (`Secure = secure && Certificate != null`) — pin this behavior.
-- `SetTLSCertificate` after construction: new connections' EHLO then advertises STARTTLS (dynamic lookup).
-- `RequireEncryptionForAuth`: AUTH before upgrade → 538; after upgrade → 235 with correct creds.
+### 4.8 TLS / STARTTLS ✅ done (`TlsStartTlsTests`, 11 tests, commit `7cb9fd9`)
+- Implicit-TLS port: client must handshake first; then `220` greeting over TLS; delivered transaction has `Encryption = Tls`. ✅
+- STARTTLS on plain port with cert: EHLO advertises it; after `220 Ready for TLS` the upgrade succeeds; subsequent commands work; delivered transaction has `Encryption = StartTls`; second STARTTLS → `503 5.5.1`. ✅ (exact wire: `220 2.0.0 Ready for TLS`, `503 5.5.1`)
+- STARTTLS without certificate configured → `502 5.5.1`. ✅ (connection survives, NOOP still works)
+- **Pin Q4**: STARTTLS as the very first command (before EHLO) is accepted today. ✅
+- TLS port constructed **without** a certificate: server falls back to plaintext greeting (`Secure = secure && Certificate != null`) — pin this behavior. ✅
+- `SetTLSCertificate` after construction: new connections' EHLO then advertises STARTTLS (dynamic lookup). ✅
+- `RequireEncryptionForAuth`: AUTH before upgrade → 538; after upgrade → 235 with correct creds. ✅ (`538 5.7.11` → `235 2.7.0 Authentication Succeeded`; also pinned: AUTH is advertised in EHLO even *before* the upgrade)
+- **Added during implementation** (bug B5 + robustness): failed handshakes must not take the server down —
+  implicit-TLS silent disconnect / client cert rejection / plaintext probe all used to crash the process
+  (`async void Init()`); now logged + connection dropped, guarded by three regression tests. Also pinned Q9
+  (no per-line DATA ACKs) and Q10 (Windows SChannel vs `CertificateRequest` certs).
 
 ## 5. ACK-gating additions (P1, beyond AckGatingTests)
 
@@ -315,7 +329,7 @@ Wire-level matrix (SPF disabled in these tests):
 |---|---|---|---|
 | 1 ✅ done | §3 (pure) + §9 (meta) | 107 delivered (+1 regression test for the ctor fix, `294adbe`) | IVT, NoopDelivery, LocalHttpServer |
 | 2 ✅ done | §4.1–4.7, §5, §8 (loopback protocol + robustness) | 107 delivered (+ `Listener.ClientProcessors` fix, `b0e241c`) | shared SmtpSession helper, TestServers factory, recording fakes, xunit.runner.json |
-| 3 | §4.8 (TLS) | ~10 | cert helper |
+| 3 ✅ done | §4.8 (TLS) | 11 delivered (+ B5 process-crash fix, `7cb9fd9`) | TlsTestCerts helper (§1.3), SmtpSession.UpgradeTlsAsync |
 | 4 | §6, §7 (SPF/DMARC) | ~30 | suffix-list HTTP helper + DNS stub |
 
 Total ≈ **190 test cases**. Phases 1–2 give the highest value-per-effort and need almost no new infrastructure.
