@@ -188,14 +188,37 @@ is the barrier.
   rejection for MTAs that greet with a literal. **New rejection path:** a null sender from a HELO
   domain that fails SPF now gets `554 5.7.23`, reachable only with `ValidateSPF` on.
 
-  **DMARC alignment is deliberately unchanged.** RFC 7489 §4.1 has DMARC align "the MAIL FROM
-  identity" and defers the null case to RFC 7208 §2.4 without defining a DMARC behaviour of its own;
-  §2.4 substitutes a domain for the SPF *check*, which does not make it a DMARC alignment identity.
-  Aligning it anyway refuses ordinary bounces — a bouncing MTA greets with its own hostname, which
-  routinely differs from the From domain of the notification it carries — so a legitimate DSN would be
-  destroyed under the very policy its own domain published. A spoofed `From:` under `p=reject` with a
-  null sender is therefore still accepted; closing that needs an aligned identity DMARC recognizes,
-  which means DKIM.
+- **A null sender is now DMARC-enforced against its HELO identity.** RFC 7489 §3.1.2 names the HELO
+  identity as the one DMARC aligns *"when required to 'fake' an otherwise null reverse-path"* — the
+  same name RFC 7208 §2.4 has SPF authenticate — so `MAIL FROM:<>` carrying a spoofed
+  `From: ceo@victim.example` under `victim.example`'s `p=reject` is now refused with `554 5.7.1`
+  instead of accepted.
+
+  **Alignment requires an SPF `Pass`.** DMARC is built on the *result* of SPF authentication, not on a
+  name the client asserted; a HELO domain is attacker-controlled text until SPF says the connecting IP
+  may use it. With `ValidateSPF` off, no SPF record, or a DNS temperror there is no authenticated
+  identity, so DMARC returns `None` and the message is **delivered**.
+
+  That gate is what keeps legitimate bounces alive. A bouncing MTA greets with its own hostname, which
+  routinely differs from the From domain of the notification it carries, so unconditional alignment
+  would destroy ordinary DSNs under the very policy their domain published. A spoof is still caught:
+  the attacker either fails SPF on its own HELO domain, or passes for a domain that is not the one it
+  spoofed — which then fails to align.
+
+  **New rejection path**, reachable only with both `ValidateSPF` and `ValidateDMARC` on. DKIM remains
+  unimplemented and is still the only mechanism that could authenticate a null-path message whose HELO
+  identity does not align.
+
+- **A message whose DATA line was truncated is refused rather than delivered.** `BoundedLineReader`
+  truncates a line past its 1 MB cap to bound memory against a client that never sends a terminator,
+  and reported it via `LastLineTruncated` — but nothing consumed that signal. `ProcessData` saw only
+  the retained prefix, so it stored the prefix and counted the prefix against
+  `MessageCharactersLimit`: a 3 MB DATA line was delivered as its first 1 MB with a `250`, and the
+  size limit could not catch it because the discarded bytes were never counted.
+
+  Truncation is now latched for the message and refused at the terminating dot with `552 5.4.3`. For a
+  journaling relay an acknowledged, silently truncated record is worse than a refusal — nothing
+  downstream can tell the message was cut, and it breaks any DKIM signature over that body.
 
 - **Listener shutdown now waits for its accept thread.** `Listener.Dispose()` returned without
   confirming the accept thread had exited, so the thread could still be inside `AcceptTcpClient` when

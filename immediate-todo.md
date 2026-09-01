@@ -13,10 +13,10 @@ that. Every decision below balances those two.
 **State (updated 2026-09-01):** **everything in this document is done.** Items 1, 2a, 3 and 4 landed
 first; item 4's result is a 150 MB message going from ~1900 MB of peak working set to no measurable
 growth. The final pass closed **Q1 (dot-unstuffing) together with byte-exact DATA**, **5b (quoted
-local-parts)** and **5a (the HELO identity)** — with one deliberate deviation from what 5a proposed,
-recorded below.
+local-parts)** and **5a (the HELO identity, both halves)**. A Codex adversarial review then found two
+real defects, both since fixed — see §7.
 
-**442/442 tests green**, plus 66/66 on the heavy load tier
+**445/445 tests green**, plus 68/68 on the heavy load tier
 (`$env:DOTNET_ROLL_FORWARD="Major"; $env:SMTP_LOADTEST="1"; dotnet test
 CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj`). Load/O365 tests live in
 `CSharp-SMTP-Server.Tests/Load/`; the streaming path's own tests are in
@@ -286,9 +286,9 @@ non-vacuous by fault injection), throughput is only reported.
 
 Both found while fixing items 1–3; neither blocked that work, both were real.
 
-> **5a landed with a deliberate deviation.** The SPF half was implemented as specified. The DMARC half
-> — "align that domain in `DmarcValidator`" and invert the pinning test to assert `554` — was **not**,
-> because doing so destroys legitimate bounces. See the verdict at the end of 5a.
+> **5a is complete, as originally specified.** An intermediate commit deviated — declining the DMARC
+> half on the reasoning that no RFC authorized it — and **that reasoning was wrong**; a Codex
+> adversarial review caught it. Both halves are now implemented. See the corrected verdict below.
 
 ### 5a. A null sender is not authenticated in either direction
 
@@ -316,30 +316,45 @@ across `Clone()`, and the `MAIL FROM` branch runs the §2.4 check against it. A 
 per RFC 8601 §2.7.2. A client greeting with an address literal has no checkable identity and stays
 unchecked, so this is not a new rejection for MTAs that greet that way.
 
-**Not done, on purpose: the DMARC half.** Aligning the HELO domain against `RFC5322.From` is *not*
-what DMARC specifies, and doing it destroys ordinary bounces.
+**Also done: the DMARC half — after an initial wrong call.**
 
-- **The spec.** RFC 7489 §4.1: *"DMARC uses the result of SPF authentication of the MAIL FROM
-  identity."* For the null case it defers to RFC 7208 §2.4 rather than defining a DMARC behaviour of
-  its own. §2.4 substitutes `postmaster@<HELO domain>` for the SPF **check** — that does not make it a
-  DMARC **alignment** identity, and nothing in RFC 7489 authorizes treating it as one.
-- **The consequence, measured not predicted.** Implementing it as written turned
-  `NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered` red: a bounce carrying
-  `From: postmaster@example.com` under `example.com`'s own `p=reject` was refused with `554`. A
-  bouncing MTA greets with **its own hostname** (`mail-out-3.provider.example`), which routinely
-  differs from the From domain of the notification it carries, so requiring the two to align refuses
-  legitimate DSNs generally — not a test artifact. That is precisely the permanent, unrecoverable loss
-  this whole document is organized around preventing.
+An intermediate commit declined this half, reasoning that RFC 7489 §4.1 has DMARC align "the MAIL FROM
+identity", which a null path does not have, and that nothing in RFC 7489 authorized substituting the
+HELO domain. **That was wrong**, and a Codex adversarial review caught it. RFC 7489 **§3.1.2** covers
+the case explicitly:
 
-So `NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation` **still asserts `250`** and
-was not inverted. What changed is its cause, and its rationale has been rewritten accordingly: the
-§2.4 check now constrains *who* may send a null path, but it says nothing about the `From:` header.
+> *"Note that the RFC5321.HELO identity is not typically used in the context of DMARC **(except when
+> required to "fake" an otherwise null reverse-path)**, even though a "pure SPF" implementation
+> according to [SPF] would check that identifier."*
 
-**The gap that remains, and what would close it.** An unauthenticated client can still send
-`MAIL FROM:<>` with a spoofed `From:` under a `p=reject` domain and be accepted. Closing it needs an
-aligned identity DMARC actually recognizes — which means **DKIM**, not implemented in this fork (the
-upstream `dkim` branch was deliberately not merged; see `ARCHITECTURE.md` §9). When DKIM lands, that
-test should fail and be inverted to assert `554`. Unreachable for this deployment, where DMARC is off.
+The parenthetical is precisely this case. The earlier conclusion rested on a reading of §4.1 that
+missed §3.1.2, so the spoofing gap was left open on a false premise.
+
+**The empirical objection was real, though, and is what shaped the final design.** Implementing naive
+alignment turned `NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered` red: a bounce carrying
+`From: postmaster@example.com` under `example.com`'s own `p=reject` was refused with `554`. A bouncing
+MTA greets with **its own hostname** (`mail-out-3.provider.example`), which routinely differs from the
+From domain of the notification it carries — so that is a general failure, not a test artifact.
+
+**The resolution was the missing gate, not abandoning the fix.** DMARC is built on the *result of SPF
+authentication* (§4.1), not on a name the client asserted — and a HELO domain is attacker-controlled
+text until SPF says the connecting IP may use it. So:
+
+- Alignment runs against the HELO domain **only when SPF returned `Pass`**.
+- With SPF disabled, no record, or a DNS temperror there is no authenticated identity, so the result is
+  `None` and the message is **delivered**. Every legitimate bounce survives, including the one in that
+  test, which runs with SPF off.
+- A spoof is caught either way: the attacker either fails SPF on its own HELO domain (refused at
+  `MAIL FROM`), or passes SPF for a domain that is **not** the one it spoofed — which then fails to
+  align and is refused under `p=reject`.
+
+`NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation` is therefore **inverted to
+assert `554`** and renamed `..._IsRefused`, as this document originally anticipated. A positive case
+was added for an aligned, SPF-authenticated bounce passing DMARC.
+
+**DKIM is still not implemented** and remains the only mechanism that could authenticate a null-path
+message whose HELO identity does not align. That is a narrower residual gap than before, not the whole
+one.
 
 ### 5b. Quoted local-parts containing angle brackets are rejected
 
@@ -439,6 +454,51 @@ for non-UTF-8 bytes surviving to the delivery handler byte-exact.
 
 ---
 
+---
+
+## 7. Codex adversarial review — **BOTH FINDINGS FIXED 2026-09-01**
+
+Run against `master...HEAD` after items 5a, 5b and 6 landed. Two `[high]` findings, both real. Worth
+recording that the full suite was green at the time — 442/442 plus the heavy tier — so neither would
+have been caught by re-running tests. A suite written against the previous implementation mostly
+proves you did not break what it already covered.
+
+### 7a. Truncated DATA lines were delivered silently
+
+`BoundedLineReader` truncates a line past `MaxLineLength` (1 MB) to bound memory against a client that
+never sends a terminator, and reports it via `LastLineTruncated`. **Nothing consumed that signal** —
+it was set, unit-tested, and ignored by production code.
+
+So `ProcessData` only ever saw the retained prefix: it stored the prefix and counted the prefix against
+`MessageCharactersLimit`. A 3 MB DATA line was delivered as its first 1 MB with a `250`. The size limit
+could not catch it either, because the discarded bytes were never counted — so this happened with the
+configured limit set far *above* the payload.
+
+For a journaling relay this is worse than a refusal: a `552` tells Exchange to stop and surfaces the
+problem, while a `250` archives a corrupted compliance record that nothing downstream can detect as
+incomplete. It also quietly breaks the DKIM verification item 6 exists to enable.
+
+**Fixed:** truncation is latched per message on `ClientProcessor.DataTruncated`, reset when `DATA`
+begins, and refused at the terminating dot with `552 5.4.3`. Both new tests were confirmed to fail
+without the fix. Coverage includes the flag not leaking into the next message on the same connection.
+
+**Pre-existing** — it arrived with the streaming work (item 4), not the byte-path rewrite. But item 6
+rewrote that exact read path and should have caught it.
+
+### 7b. The 5a DMARC deviation was based on a misreading
+
+Covered in full under 5a above. Short version: the claim that "nothing in RFC 7489 authorizes aligning
+the HELO domain" was false — §3.1.2 has an explicit null-path carve-out. The review was right that the
+gap should not have been left open; its own wording ("RFC 7489 explicitly says the HELO identity is
+used") overstates a "not typically used, except…", but the substance held.
+
+**The lesson worth keeping:** the deviation was argued from a *summary* of the RFC rather than the
+section text. The empirical half of the argument — a failing bounce test — was sound and did shape the
+final design (the SPF-`Pass` gate). The specification half was not checked as carefully, and it was
+the half that carried the conclusion.
+
+---
+
 ## Suggested order
 
 1. ~~**Item 3** — configuration only, zero code change, stops the bleeding immediately.~~ **Done.**
@@ -451,17 +511,20 @@ for non-UTF-8 bytes surviving to the delivery handler byte-exact.
 
 6. ~~**Item 6** — byte-exact DATA + dot-unstuffing (Q1), as one change.~~ **Done 2026-09-01.**
 7. ~~**Item 5b** — quoted local-parts.~~ **Done 2026-09-01.**
-8. ~~**Item 5a** — HELO identity retained and SPF-checked per RFC 7208 §2.4.~~ **Done 2026-09-01**,
-   SPF half only — the DMARC half was deliberately not implemented; see the verdict in 5a.
+8. ~~**Item 5a** — HELO identity retained, SPF-checked per RFC 7208 §2.4, and aligned for DMARC per
+   RFC 7489 §3.1.2 gated on an SPF `Pass`.~~ **Done 2026-09-01** — both halves; the initial commit
+   deviated on the DMARC half and was corrected after review. See 5a and §7b.
+9. ~~**Item 7** — the two Codex adversarial-review findings.~~ **Done 2026-09-01.**
 
-**Remaining: nothing in this document.** 442/442 green, plus 66/66 on the heavy load tier.
+**Remaining: nothing in this document.** 445/445 green, plus 68/68 on the heavy load tier.
 
 **Carried forward, out of scope here:**
 
 - **DKIM** is the one open thread with a named consequence. It is what the archive's tamper-evidence
-  rests on, and it is also the only thing that would close 5a's remaining DMARC gap. Not implemented
-  in this fork; the upstream `dkim` branch was deliberately not merged (`ARCHITECTURE.md` §9). Note
-  that this server *verifying* DKIM and the archive *being verifiable* downstream are different jobs —
-  item 6 was needed for the second regardless of whether the first ever lands.
+  rests on, and it is the only mechanism that could authenticate a null-path message whose HELO
+  identity does not align — a narrower residual gap than before 5a, but a real one. Not implemented in
+  this fork; the upstream `dkim` branch was deliberately not merged (`ARCHITECTURE.md` §9). Note that
+  this server *verifying* DKIM and the archive *being verifiable* downstream are different jobs — item
+  6 was needed for the second regardless of whether the first ever lands.
 - The `REVIEW.md` backlog (Q11 split TXT records, Q12(a)/(c), Q13 `redirect=` ordering, Q10 docs) is
   untouched by this document and still open.
