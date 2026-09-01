@@ -4,7 +4,7 @@ All notable changes to this fork are documented here. This fork tracks
 [zabszk/CSharp-SMTP-Server](https://github.com/zabszk/CSharp-SMTP-Server); see `ARCHITECTURE.md` §9 for
 the upstream sync record.
 
-## [1.2.0-krugertech.1]
+## [2.0.0-krugertech.1]
 
 ### Breaking
 
@@ -22,8 +22,27 @@ the upstream sync record.
   directly if you need one. `GetTo()`/`GetCc()`/`GetBcc()` now also flatten group addresses to the
   mailboxes they contain, so a grouped recipient list yields its members rather than the group name.
 
+- **DMARC now refuses a From header carrying more than one mailbox.** The single-identity gate counted
+  top-level address entries, so one *group* address — `From: Team: attacker@evil.com, victim@bank.com;`
+  — counted as one entry while holding two identities, and validation authenticated only the first.
+  The gate counts mailboxes now, so such a message is refused with `554` before any policy is applied.
+  A group containing exactly one mailbox is still a single identity and is accepted.
+
+  **Why this is listed as breaking:** a message shape that was previously delivered is now rejected.
+
+**On the version number.** This release is 2.0.0 rather than 1.2.0 because the getter changes above are
+*silent*: consumers still compile, but filtering, routing, or display logic reading these members
+changes behavior. A minor bump would let that reach users through a routine update, and a changelog is
+not a dependency-resolution barrier. The major bump is the barrier.
+
 ### Fixed
 
+- **SPF: NXDOMAIN in `a`/`mx` is a no-match, not a temperror.** RFC 7208 §5 treats a nonexistent name
+  as a definitive answer, so evaluation must continue to the next mechanism (typically a terminal
+  `-all`). Both the address lookup and the MX lookup previously collapsed every non-`NoError` response
+  into `Temperror`, so `v=spf1 a:missing.test -all` returned `Temperror` instead of `Fail` — and since
+  SMTP rejects only on `Fail`, that accepted mail it should have rejected. Only genuinely transient
+  failures (SERVFAIL, no response, unparseable) are temperrors now.
 - **DMARC is now actually enforced.** Beyond the `GetFrom` change above, the header-From domain is
   extracted with a new internal helper rather than by `ProcessAddress`, which parses SMTP *command*
   arguments and requires the RFC 5321 angle-bracket form. A bare header address routed through it

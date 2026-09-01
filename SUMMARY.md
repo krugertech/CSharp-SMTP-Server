@@ -15,9 +15,10 @@ the SMTP session by design.
 
 ## 2. Current state
 
-- Branch: **`dev`**, pushed. Tier 1 review fixes (B1, B3, B4, Q12(b), R11, R6) are new commits on top; version **1.2.0-krugertech.1**.
+- Branch: **`dev`**, pushed. Tier 1 review fixes (B1, B3, B4, Q12(b), R11, R6) plus a Codex adversarial
+  follow-up (C1, C2 below) are new commits on top; version **2.0.0-krugertech.1**.
 - Build: 0 errors (pre-existing harmless warnings: net7.0 EOL notice, CS8619 in MailTransaction).
-- Tests: **306/306 green**, ~11 s per run, stable across repeated runs. Working tree clean.
+- Tests: **313/313 green**, ~11 s per run, stable across repeated runs. Working tree clean.
 
 ### Commit stack (newest first)
 
@@ -100,8 +101,10 @@ Details + repro evidence in TEST_PLAN.md §2; disposition per bug decided in REV
   envelope parsing still requires `<…>` as the RFC demands. Verified load-bearing: reverting just the
   helper fails 11 DMARC tests.
 
-  Display names remain reachable via the new `GetFromName`. Version bumped to **1.2.0** (this also
-  cleared the pre-existing `VersionString` drift, R5).
+  Display names remain reachable via the new `GetFromName`. Version bumped to **2.0.0** — major, not
+  minor, because the change is *silent*: consumers still compile but behave differently, so a minor
+  bump would carry it through a routine update. This also cleared the pre-existing `VersionString`
+  drift (R5). The single-identity gate that protects DMARC is C2 in §8.
 
 ### Not yet fixed (decision pending)
 
@@ -127,7 +130,7 @@ Pinned by `MailTransactionTests`. Fixing this changes observable behavior.
 | Q12 | SPF DNS error handling deviates from RFC 7208. **(b) FIXED**: a failed `a`/`mx` address lookup now returns Temperror instead of the mechanism's qualifier — it previously failed *open* (a bare `a` returned **Pass** on DNS failure). Still open: (a) top-level NXDOMAIN → Temperror (should be none); (c) redirect to nonexistent domain → Temperror (should be permerror) |
 | Q13 | SPF `redirect=` is evaluated positionally and short-circuits later mechanisms; RFC 7208 §6.1/§4.7 only consults it after all mechanisms have failed |
 
-## 7. Test suite layout (306 tests)
+## 7. Test suite layout (313 tests)
 
 - **Phase 1 — pure unit** (107): `SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9),
   `MailTransactionTests` (19, pins B1–B4), `CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7,
@@ -154,17 +157,48 @@ Shared infrastructure: `SmtpSession` (raw-TCP client with timeouts, multi-line r
 
 ## 8. Remaining work
 
-All four test-plan phases are complete. **306 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
-Q12(b), R11, R6 — see `CHANGELOG.md` for the 1.2.0 release notes). Left:
+All four test-plan phases are complete. **313 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
+Q12(b), R11, R6) and the Codex adversarial follow-up — see `CHANGELOG.md` for the 2.0.0 release notes.
+Left:
 
 1. **Remaining REVIEW.md items**, none started: **B2** (`AddHeader` duplicates the header before first
    parse), **R1** (the `WriteCode(int,string)` overload accident — ~53 assertions across 10 files),
    **Q1** (no dot-stuffing in DATA — data-integrity, arguably P1), **Q3**, **Q8**, **Q11** (multi-string
-   TXT records, needs a dependency decision), **Q12(a)/(c)**, **Q13**, plus R2/R4/R7/R8/R9.
-2. **R7 is now more visible**: `Listener._dispose` is a plain non-volatile `bool`. The R11 fix relies on
-   the flag-set and the snapshot sharing one `_processorsLock` critical section, which is correct as
-   written, but the *other* read (`while (!_dispose)` in the accept loop) is still unsynchronised.
+   TXT records, needs a dependency decision), **Q12(a)/(c)**, **Q13**, plus R2/R4/R8/R9.
+2. **R7 / listener shutdown lifecycle — the recommended next item.** `Listener._dispose` is a plain
+   non-volatile `bool`. The R11 fix is sound on its own terms (flag-set and snapshot share one
+   `_processorsLock` section), but the accept loop's `while (!_dispose)` and its exception filter read
+   the field unsynchronised, and `Dispose()` never joins the listener thread. After `Stop()` a stale
+   read can keep the thread retrying `AcceptTcpClient` on a stopped listener and logging each failure.
+   Suggested shape: replace the field with a `CancellationTokenSource` (or `Volatile.Read/Write`) for
+   loop termination, and have `Dispose()` join the thread with a bounded timeout. Test that the thread
+   exits and logging stops after a concurrent shutdown. Doing this well supersedes R7 as written.
 3. Anything from the upstream re-audit.
+
+### Codex adversarial review — dispositions
+
+A Codex adversarial pass over the Tier 1 commits returned five findings. Two were fixed (below), one is
+item 2 above, one is a version decision now taken (2.0.0), and one **could not be reproduced**:
+
+- **C1 (fixed)** — SPF NXDOMAIN in `a`/`mx` returned `Temperror` instead of falling through to a
+  terminal `-all`. Introduced by the Q12(b) fix: the pre-existing `CheckAddressMatch` collapses every
+  non-`NoError` RCODE into `Temperror`, and Q12(b) began propagating that faithfully. Pre-Q12(b) this
+  case returned `Fail` by accident (the bogus "match" carried the `-` qualifier). Now `NameError`
+  (NXDOMAIN) is a no-match on both the address lookup and the MX lookup. 4 regression tests.
+- **C2 (fixed)** — a single group From header held multiple identities while passing the
+  `From.Count > 1` gate; DMARC authenticated only the first. Gate now counts `.Mailboxes`. Note the
+  pre-B1 code had the same hole, but the B1 work added a test that *blessed* it — that test now
+  documents why `GetFrom` alone must not be the authentication seam.
+- **NOT REPRODUCED — processor registered after disposal.** Codex argued that `ClientProcessor` starts
+  `Init()` from its constructor, so a fast-failing filter could `Dispose()` (→ `RemoveProcessor`, a
+  no-op while unregistered) before `Listener.AddProcessor` runs, permanently inserting a dead object
+  and growing the list without bound. The ordering claim is accurate. The consequence was not
+  observable: **5000 connections** against instantly-rejecting and synchronously-throwing filters, with
+  the list sampled continuously, gave a final count of **0** every time (peak 100 = genuine in-flight
+  connections). The `Task.Run(Init)` thread-pool hop reliably loses the race to the immediately
+  following `AddProcessor`. Recorded as a latent ordering smell, not a demonstrated leak — if the
+  constructor ever starts work inline again, re-test this first. The clean fix if it ever bites:
+  two-phase init (construct, register, *then* start `Init`), which also subsumes the R11 ordering.
 
 ## 9. Working conventions used throughout (keep them)
 
@@ -182,7 +216,7 @@ Q12(b), R11, R6 — see `CHANGELOG.md` for the 1.2.0 release notes). Left:
 git log --oneline -15          # commit stack (see §2)
 cat ARCHITECTURE.md            # how the code works + upstream sync record
 cat TEST_PLAN.md               # what's tested, what's pinned, what's left (§11 build order)
-$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 306/306 in ~11 s
+$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 313/313 in ~11 s
 ```
 
 Key source files: `CSharp-SMTP-Server/Networking/{ClientProcessor,Listener}.cs` (connection lifecycle —
