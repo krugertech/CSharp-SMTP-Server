@@ -9,6 +9,34 @@ skip decisions are retained in the architecture's
 
 ## [2.0.0-krugertech.1]
 
+### Build
+
+- **Retargeted to .NET 10.** The library now targets `netstandard2.1;net10.0`, replacing
+  `netstandard2.1;net6.0;net7.0`. Both `net6.0` and `net7.0` are out of support (May 2024 and
+  November 2024 respectively) and neither carried any conditional compilation — the source was
+  identical across all three targets, so the extra targets only selected which asset a consumer
+  resolved. `netstandard2.1` is retained so the package stays consumable from Mono and Unity, and by
+  any future `net5.0`+ consumer, without an explicit asset for each. It does **not** reach .NET
+  Framework 4.8, which implements .NET Standard 2.0 and never 2.1; that would need a `netstandard2.0`
+  or `net48` target, which `zabszk.DnsClient` 1.0.1 cannot satisfy as it ships no such asset.
+
+
+- **The test project is single-targeted again, and the DKIM guards are gone.** It targets `net10.0`
+  in place of `net7.0;net8.0`, and the `#if NET8_0_OR_GREATER` guards in `Integrity/DkimSurvivalTests.cs`
+  and `Integrity/DkimTestKey.cs` were removed. That split existed solely because MimeKit 4.17 ships
+  no `net7.0` build, so a `net7.0` consumer fell back to its `netstandard2.1` build, whose
+  `Ed25519DigestSigner` is incompatible with the BouncyCastle 2.6.2 MimeKit itself requires —
+  `DkimSigner` threw `TypeLoadException` before signing anything. MimeKit ships a native `net10.0`
+  build, so the fallback no longer occurs and the whole suite, DKIM included, runs on one framework.
+  All 487 tests pass with no skips.
+
+  This also removes the load-test caveat that required `-f` to pin a framework: with one target
+  there are no longer two concurrent runs competing for the same cores.
+
+- **`zabszk.DnsClient` 1.0.1 has no `net10.0` asset** and resolves its `net7.0` build by roll-forward.
+  This works and is verified by the suite, but the package was last published for `net7.0` — worth
+  tracking as dependency staleness rather than a blocker.
+
 ### Breaking
 
 - **A bare LF in DATA is now refused with `554 5.6.0` instead of being silently rewritten to CRLF.**

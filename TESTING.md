@@ -1,6 +1,6 @@
 # Testing
 
-The test project targets .NET 7 and uses xUnit. Most protocol tests start a real SMTP listener on
+The test project targets .NET 10 and uses xUnit. Most protocol tests start a real SMTP listener on
 loopback and communicate with it using raw SMTP commands.
 
 ## Run the suite
@@ -10,8 +10,8 @@ $env:DOTNET_ROLL_FORWARD = "Major"
 dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj
 ```
 
-`DOTNET_ROLL_FORWARD` is needed when the machine has a newer SDK/runtime but not the .NET 7 runtime.
-It can be omitted when .NET 7 is installed.
+`DOTNET_ROLL_FORWARD` is needed when the machine has a newer SDK/runtime but not the .NET 10
+runtime. It can be omitted when .NET 10 is installed.
 
 Test collections intentionally run serially. Integration tests allocate loopback ports by briefly
 binding port zero and then reopening the assigned port; parallel collections would increase the
@@ -99,12 +99,15 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "C
   as UTF-8 and `SendRaw` applies no dot-stuffing, so neither can carry these payloads on its own;
   `RawMessage.SendDataAsync` stuffs at byte-defined line starts and appends the terminator.
 
-**Why the test project multi-targets.** MimeKit 4.17 ships no `net7.0` build, so a `net7.0` consumer
-resolves its `netstandard2.1` build, whose `Ed25519DigestSigner` is incompatible with the
-BouncyCastle 2.6.2 MimeKit itself requires — `DkimSigner` throws `TypeLoadException` before signing
-anything. The DKIM suite is therefore `#if NET8_0_OR_GREATER`, and the project targets
-`net7.0;net8.0` so the rest of the suite keeps proving the library works on the framework it ships
-for. The shipped library only calls `MimeMessage.Load` and never touches that code path.
+**Why the test project targets a single framework.** MimeKit 4.17 ships a `net10.0` build, so the
+test project resolves a native MimeKit asset and the DKIM suite runs unguarded. This previously
+required multi-targeting: MimeKit ships no `net7.0` build, so a `net7.0` consumer fell back to its
+`netstandard2.1` build, whose `Ed25519DigestSigner` is incompatible with the BouncyCastle 2.6.2
+MimeKit itself requires — `DkimSigner` threw `TypeLoadException` before signing anything. The DKIM
+suite was therefore `#if NET8_0_OR_GREATER` behind a `net7.0;net8.0` split. Retargeting to `net10.0`
+removed both the fallback and the guards. The shipped library only calls `MimeMessage.Load` and
+never touches that code path.
+
 
 ## Load and integrity tests
 
@@ -116,18 +119,19 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "C
 ```
 
 The heavy tier is opt-in because it includes high concurrency, sustained traffic, a 150 MB message,
-and concurrent large messages. **Pass `-f` to run one target framework at a time:**
+and concurrent large messages:
 
 ```powershell
 $env:DOTNET_ROLL_FORWARD = "Major"
 $env:SMTP_LOADTEST = "1"
-dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Category=Load" -f net7.0
+dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Category=Load"
 ```
 
-Without `-f`, the `net7.0` and `net8.0` runs execute concurrently and compete for the same cores.
 `SlowHandler_SessionsOverlap_ThroughputScalesWithConcurrency` asserts that sessions overlap rather
-than serialize, and that assertion is timing-based, so it can fail under that contention while
-passing for either framework alone — a false negative about the harness, not the server. The fast
+than serialize, and that assertion is timing-based, so it needs the machine to itself. Avoid running
+it alongside other CPU-heavy work, which can fail it — a false negative about the harness, not the
+server. The fast
+
 tier is short enough not to be affected.
 
 Load metrics are written to `load-metrics.json` beside the test assembly. Set

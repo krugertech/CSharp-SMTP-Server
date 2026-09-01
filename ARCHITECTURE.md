@@ -12,7 +12,7 @@ behavior is ACK-gated delivery: the server awaits the application delivery handl
 only after that handler confirms durable acceptance.
 
 The NuGet package is `Krugertech.CSharp-SMTP-Server`, currently version
-`2.0.0-krugertech.1`. The library targets `netstandard2.1`, `net6.0`, and `net7.0`.
+`2.0.0-krugertech.1`. The library targets `netstandard2.1` and `net10.0`.
 
 ## Solution layout
 

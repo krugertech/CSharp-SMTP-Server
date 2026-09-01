@@ -72,6 +72,44 @@ expected DMARC policy lookup.
 This is the highest-priority validation issue. Fixing it requires replacing or patching the DNS
 dependency and retaining the regression coverage in `SpfValidatorTests`.
 
+### The DNS dependency is unmaintained and cannot honor record TTLs
+
+`zabszk.DnsClient` 1.0.1 is the single DNS dependency for SPF and DMARC. Three separate problems
+point at the same fix, so they should be resolved together rather than patched individually:
+
+- It does not concatenate multi-string TXT records (Q11 above), silently hiding long SPF and DMARC
+  records.
+- It has no cache. `DnsClientOptions` exposes only `Timeout`, `MaxAttempts`, `TimeoutInnerDelay`,
+  `UseTCPForTruncated`, `TCPEndpointOverride`, and `ErrorLogging` — there is no cache or TTL setting
+  to configure. Every lookup is a fresh blocking query, which is why `SpfResultsCache` exists as a
+  connection-scoped workaround and why that cache has no TTL of its own.
+- Its last published target is `net7.0`. Since the retarget to `net10.0` the package resolves that
+  `net7.0` asset by roll-forward. That works today and the suite passes against it, but it is an
+  unmaintained dependency on the critical path of two authentication mechanisms.
+
+Note that TTL data is available and simply discarded: the package does expose `DNSRecord.TTL` on
+every record. Nothing in `CSharp-SMTP-Server` reads it — the only `ttl` matches in the library are
+`StartTLS` identifiers. So a replacement is not strictly required to honor TTLs; a caching layer over
+the existing client could read the TTL that is already returned. A replacement is preferred because
+it also addresses the split-TXT defect and the maintenance risk in one move.
+
+Pending work: select a maintained DNS client that concatenates multi-string TXT records and honors
+record TTLs in its cache. Requirements for the replacement:
+
+- Correct multi-string TXT concatenation, keeping the regression coverage in `SpfValidatorTests`.
+- A TTL-respecting cache, so SPF include chains do not re-query on every message. This is also the
+  preferred fix for the stale-`Pass` window in "SPF results can remain stale for a connection"
+  below, which should be revisited once the client itself can cache.
+- Support for `netstandard2.1` while that target is retained, otherwise the shipped netstandard
+  build loses SPF and DMARC. Note this dependency is also what blocks adding a `netstandard2.0` or
+  `net48` target: it ships no such asset, so .NET Framework consumers are unreachable until it is
+  replaced.
+- An async query API and configurable timeouts, since `SpfValidator` and `DmarcValidator` query on
+  the connection path.
+
+This is not urgent for the current journaling deployment, which disables SPF and DMARC, but it
+blocks enabling either with confidence.
+
 ### Remaining SPF result deviations (Q12a/Q12c)
 
 - A top-level TXT lookup returning NXDOMAIN produces `Temperror`; RFC 7208 requires `None`.
@@ -155,6 +193,16 @@ address for forensic traceability regardless of authentication state.
   those tests are next changed.
 - Pin identifiers are represented inconsistently in names, comments, and traits (R10). Standardize
   them only if it improves discoverability; the behavior is already covered.
+- The shipped `netstandard2.1` library asset is not exercised by the test suite. The tests target
+  `net10.0` and so always resolve the `net10.0` build; the two assets do not share a dependency
+  graph, since `netstandard2.1` resolves MimeKit and `zabszk.DnsClient` netstandard builds rather
+  than their `net10.0`/`net7.0` ones. This predates the .NET 10 retarget — the previous
+  `net7.0;net8.0` test matrix never covered `netstandard2.1` either — so it is a long-standing gap
+  rather than a new one. A manual consumer probe on 2026-09-01 confirmed the packed asset restores,
+  loads, and resolves its MimeKit- and DnsClient-dependent types on a `netcoreapp3.1` consumer, so
+  the artifact is not broken; it is simply unverified by CI. Closing this properly means a
+  package-consumer test lane that references the built `.nupkg` from a framework that selects
+  `lib/netstandard2.1` and runs the protocol, integrity, SPF, and DMARC suites against it.
 
 ### Latent processor-registration ordering smell (not reproduced)
 

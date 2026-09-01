@@ -1,9 +1,3 @@
-// The DKIM suite requires MimeKit's crypto path, which is unusable on net7.0: MimeKit 4.17 has no
-// net7.0 build, so a net7.0 consumer resolves its netstandard2.1 build, whose Ed25519DigestSigner
-// is incompatible with the BouncyCastle 2.6.2 MimeKit itself depends on, and DkimSigner throws
-// TypeLoadException before signing anything. The shipped library never touches that code path — it
-// only calls MimeMessage.Load — so this constrains the test fixture, not the server.
-#if NET8_0_OR_GREATER
 using MimeKit.Cryptography;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Generators;
@@ -83,4 +77,3 @@ internal static class DkimTestKey
             Task.FromResult(_publicKey);
     }
 }
-#endif
