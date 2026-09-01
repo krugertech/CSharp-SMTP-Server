@@ -207,6 +207,12 @@ public class SpfValidator
 
 						var mxQuery = await DnsClient.Query(args ?? domain, QType.MX);
 
+						// NXDOMAIN: the name does not exist, so there are no MX hosts to match against.
+						// That is a definitive no-match, not a transient failure — fall through to the
+						// next mechanism (see the note in CheckAddressMatch).
+						if (mxQuery.ErrorCode == DnsErrorCode.NameError)
+							break;
+
 						if (mxQuery.ErrorCode != DnsErrorCode.NoError || mxQuery.Records == null)
 							return ValidationResult.Temperror;
 
@@ -329,6 +335,14 @@ public class SpfValidator
 	private async Task<ValidationResult> CheckAddressMatch(IPAddress ipAddress, string domain, string? args, int? cidr, ValidationResult qualifier)
 	{
 		var aQuery = await DnsClient.Query(args ?? domain, ipAddress.AddressFamily == AddressFamily.InterNetwork ? QType.A : QType.AAAA);
+
+		// RFC 7208 §5: NXDOMAIN ("NameError") is a definitive answer — the name simply does not exist,
+		// so the mechanism does NOT match and evaluation continues to the next one (typically reaching
+		// a terminal "-all"). Only a genuinely transient failure (SERVFAIL, no response, unparseable)
+		// is a temperror. Collapsing the two would make "v=spf1 a:missing.test -all" return Temperror
+		// instead of Fail, and since SMTP rejects only on Fail, that accepts mail it should reject.
+		if (aQuery.ErrorCode == DnsErrorCode.NameError)
+			return ValidationResult.None;
 
 		if (aQuery.ErrorCode != DnsErrorCode.NoError || aQuery.Records == null)
 			return ValidationResult.Temperror;

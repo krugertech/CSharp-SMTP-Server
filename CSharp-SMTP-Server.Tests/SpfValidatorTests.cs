@@ -245,6 +245,56 @@ public sealed class SpfValidatorTests
         Assert.Equal(ValidationResult.Temperror, await Check(stub, "v=spf1 mx", ClientV4));
     }
 
+    // ─── NXDOMAIN is a definitive no-match, NOT a transient failure ──────────
+    //
+    // RFC 7208 §5: a nonexistent name means the mechanism does not match and evaluation continues to
+    // the next one. Treating it as temperror short-circuits a terminal "-all", and since SMTP rejects
+    // only on Fail, that ACCEPTS mail that should be rejected. The Q12(b) fix originally collapsed
+    // NXDOMAIN into temperror along with SERVFAIL; these pin the two apart.
+
+    [Fact]
+    public async Task AMechanism_Nxdomain_DoesNotMatch_AndReachesTerminalAll()
+    {
+        using var stub = new DnsStub();
+        stub.SetNxDomain("missing.test");
+
+        // "a:missing.test" must not match, so evaluation reaches "-all" → Fail.
+        Assert.Equal(ValidationResult.Fail, await Check(stub, "v=spf1 a:missing.test -all", ClientV4));
+    }
+
+    [Fact]
+    public async Task AMechanism_Nxdomain_ContinuesToLaterMatchingMechanism()
+    {
+        // The nonexistent name is skipped rather than aborting evaluation, so a later mechanism that
+        // does match still decides the result.
+        using var stub = new DnsStub();
+        stub.SetNxDomain("missing.test");
+        stub.AddA("real.test", ClientV4);
+
+        Assert.Equal(ValidationResult.Pass, await Check(stub, "v=spf1 a:missing.test a:real.test -all", ClientV4));
+    }
+
+    [Fact]
+    public async Task MxMechanism_NxdomainOnMxQuery_DoesNotMatch_AndReachesTerminalAll()
+    {
+        using var stub = new DnsStub();
+        stub.SetNxDomain("missing.test");
+
+        Assert.Equal(ValidationResult.Fail, await Check(stub, "v=spf1 mx:missing.test -all", ClientV4));
+    }
+
+    [Fact]
+    public async Task MxMechanism_NxdomainOnMxHostAddress_DoesNotMatch_AndReachesTerminalAll()
+    {
+        // The MX query succeeds; the MX host's own A lookup is NXDOMAIN. Still a no-match, not a
+        // temperror — this is the inner CheckAddressMatch path rather than the outer MX query.
+        using var stub = new DnsStub();
+        stub.AddMx(Domain, (10, "missing.test"));
+        stub.SetNxDomain("missing.test");
+
+        Assert.Equal(ValidationResult.Fail, await Check(stub, "v=spf1 mx -all", ClientV4));
+    }
+
     [Fact]
     public async Task MxMechanism_MxChainMatches_ReturnsPass()
     {
