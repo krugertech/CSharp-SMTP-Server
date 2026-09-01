@@ -17,7 +17,7 @@ namespace CSharp_SMTP_Server.Tests;
 public sealed class SpfDmarcIntegrationTests
 {
     private static async Task<(SmtpSession S, SMTPServer Server, RecordingDelivery Delivery)> ConnectReadyAsync(
-        DnsStub stub, string suffixListUrl, bool validateSpf, bool validateDmarc)
+        DnsStub stub, string suffixListUrl, bool validateSpf, bool validateDmarc, string helo = "test.client")
     {
         var options = new ServerOptions(validateSpf, validateDmarc, new IPEndPoint(IPAddress.Loopback, (ushort)stub.Port))
         {
@@ -32,7 +32,7 @@ public sealed class SpfDmarcIntegrationTests
 
         var s = await SmtpSession.ConnectAsync(port);
         Assert.StartsWith("220 ", await s.ReadLineAsync());
-        await s.Send("EHLO test.client");
+        await s.Send($"EHLO {helo}");
         await s.ReadResponseAsync();
         return (s, server, delivery);
     }
@@ -89,21 +89,25 @@ public sealed class SpfDmarcIntegrationTests
     }
 
     /// <summary>
-    /// The null reverse-path is accepted with SPF and DMARC <b>enabled</b>, and delivers without an
-    /// SPF Authentication-Results header.
+    /// The null reverse-path is accepted with SPF and DMARC <b>enabled</b>, and the SPF check runs
+    /// against the HELO identity per RFC 7208 §2.4.
     /// </summary>
     /// <remarks>
-    /// The null path has no envelope domain, so there is nothing for SPF to check — RFC 7208 §2.4 has
-    /// the HELO identity checked instead. The MAIL FROM branch therefore skips SPF and leaves the
-    /// result <see cref="ValidationResult.CheckDisabled"/>, which in turn suppresses the SPF
-    /// Authentication-Results header rather than emitting an empty <c>smtp.mailfrom=</c>.
+    /// The null path has no envelope domain, so §2.4 substitutes <c>postmaster@&lt;HELO domain&gt;</c>
+    /// as the MAIL FROM identity. The harness's EHLO domain (<c>test.client</c>) publishes no SPF
+    /// record, so the result is <see cref="ValidationResult.None"/> — a real check that found no
+    /// policy, not the <see cref="ValidationResult.CheckDisabled"/> that the old skip produced.
+    ///
+    /// The reported identity is <c>smtp.helo=</c>, not <c>smtp.mailfrom=</c>: RFC 8601 §2.7.2 names
+    /// the identity actually checked, and claiming to have checked an envelope sender that does not
+    /// exist would be false. An empty <c>smtp.mailfrom=</c> must never be emitted.
     ///
     /// This matters beyond the journaling deployment, where both checks are off: the library ships to
     /// consumers who leave them on, and an empty FromDomain must not fault the DNS lookup or the
     /// header-generation path.
     /// </remarks>
     [Fact]
-    public async Task NullSender_WithSpfAndDmarcEnabled_Delivers_WithoutSpfArHeader()
+    public async Task NullSender_WithSpfAndDmarcEnabled_ChecksHeloIdentity()
     {
         using var stub = new DnsStub();
         using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
@@ -127,11 +131,79 @@ public sealed class SpfDmarcIntegrationTests
             var tx = delivery.Delivered.Single();
             Assert.Equal(string.Empty, tx.From);
             Assert.Equal(string.Empty, tx.FromDomain);
+            Assert.Equal("test.client", tx.HeloDomain);
 
-            // No envelope domain was checked, so no SPF stanza — in particular not an empty one.
-            Assert.Equal(ValidationResult.CheckDisabled, tx.SPFValidationResult);
-            Assert.DoesNotContain("spf=", tx.RawBody);
+            // The HELO identity was checked and no record was found.
+            Assert.Equal(ValidationResult.None, tx.SPFValidationResult);
+            Assert.Contains("spf=none smtp.helo=test.client", tx.RawBody);
             Assert.DoesNotContain("smtp.mailfrom=", tx.RawBody);
+        }
+    }
+
+    /// <summary>
+    /// A null sender from a HELO domain publishing <c>-all</c> is refused with 554 5.7.23.
+    /// </summary>
+    /// <remarks>
+    /// The substantive effect of RFC 7208 §2.4: before the HELO identity was retained, a null-path
+    /// sender was not SPF-checked at all, so a domain publishing <c>-all</c> was not enforced against
+    /// one. This is a new rejection path and only reachable with <c>ValidateSPF</c> on.
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_HeloDomainFailsSpf_IsRefused()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        // The connection comes from loopback, which this record does not authorize.
+        stub.AddTxt("bad.helo.test", "v=spf1 ip4:198.51.100.7 -all");
+
+        var (s, server, delivery) = await ConnectReadyAsync(
+            stub, http.Url, validateSpf: true, validateDmarc: false, helo: "bad.helo.test");
+
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("554 5.7.23 Delivery not authorized by SPF, message refused", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
+        }
+    }
+
+    /// <summary>
+    /// A null sender whose HELO is an address literal has no checkable identity and is still accepted.
+    /// </summary>
+    /// <remarks>
+    /// RFC 5321 §4.1.3 permits an address literal in place of a domain, and it cannot carry an SPF
+    /// record. Refusing on "no identity" would destroy bounces from any MTA that greets with one, so
+    /// the check is skipped exactly as it was before the §2.4 work — the gap narrows for clients that
+    /// present a domain, and does not become a new rejection for clients that cannot.
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_HeloIsAddressLiteral_IsAcceptedUnchecked()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+
+        var (s, server, delivery) = await ConnectReadyAsync(
+            stub, http.Url, validateSpf: true, validateDmarc: false, helo: "[192.0.2.1]");
+
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("Subject: bounce");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+
+            var tx = delivery.Delivered.Single();
+            Assert.Null(tx.HeloDomain);
+            Assert.Equal(ValidationResult.CheckDisabled, tx.SPFValidationResult);
         }
     }
 
@@ -183,16 +255,20 @@ public sealed class SpfDmarcIntegrationTests
     /// <remarks>
     /// <para>
     /// This is the cost of the fix pinned by
-    /// <see cref="NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered"/>. The server has no
-    /// authenticated identity for a null path in either direction: RFC 7208 §2.4 would check
-    /// <c>postmaster@&lt;HELO domain&gt;</c>, but the EHLO/HELO argument is discarded, and DKIM is not
-    /// implemented. It therefore cannot distinguish this spoof from a genuine bounce.
+    /// <see cref="NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered"/>, and it survives
+    /// the RFC 7208 §2.4 work. That work retained the HELO identity and made SPF check it — see
+    /// <see cref="NullSender_HeloDomainFailsSpf_IsRefused"/> — which constrains WHO may send a null
+    /// path, but it does not close this: the §2.4 identity is an <i>SPF</i> identity, and RFC 7489
+    /// §4.1 has DMARC align "the MAIL FROM identity", which a null path does not have. Aligning the
+    /// HELO domain against RFC5322.From anyway would refuse ordinary bounces, whose sending MTA
+    /// greets with its own hostname rather than the From domain of the notification it carries.
     /// </para>
     /// <para>
-    /// Delivering is the correct side to err on here — for a journaling relay a wrongly rejected
-    /// report is an unrecoverable compliance record, while DMARC is off entirely. This test exists so
-    /// the gap stays visible: if the HELO identity is ever retained and the §2.4 check implemented,
-    /// this test <b>should fail</b> and be inverted to assert 554.
+    /// Closing it properly therefore needs DKIM — an aligned identity DMARC recognizes — which is not
+    /// implemented here. Delivering remains the correct side to err on: for a journaling relay a
+    /// wrongly rejected report is an unrecoverable compliance record, while DMARC is off entirely.
+    /// This test exists so the gap stays visible; when DKIM lands it <b>should fail</b> and be
+    /// inverted to assert 554.
     /// </para>
     /// </remarks>
     [Fact]

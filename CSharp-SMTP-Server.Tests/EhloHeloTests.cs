@@ -195,6 +195,71 @@ public sealed class EhloHeloTests
         Assert.StartsWith("250", await s.ReadLineAsync());
     }
 
+    /// <summary>
+    /// The EHLO/HELO argument is retained as a checkable domain, or as null when it is not one.
+    /// </summary>
+    /// <remarks>
+    /// Retained for the RFC 7208 §2.4 SPF check, which is the identity for a null reverse-path. Only a
+    /// plausible DNS name is kept: an address literal (RFC 5321 §4.1.3) and a bare label cannot carry
+    /// an SPF record, and storing null for those makes "no checkable identity" explicit at the point
+    /// of capture rather than something each consumer re-derives.
+    /// </remarks>
+    [Theory]
+    [InlineData("mail.example.com", "mail.example.com")]
+    [InlineData("  mail.example.com  ", "mail.example.com")]   // surrounding whitespace
+    [InlineData("mail.example.com.", "mail.example.com")]      // absolute form, trailing dot stripped
+    [InlineData("MAIL.Example.COM", "MAIL.Example.COM")]       // case preserved; comparisons are ordinal-ignore-case
+    [InlineData("a-b.example.com", "a-b.example.com")]         // hyphens are legal in a label
+    // Not checkable identities:
+    [InlineData(null, null)]
+    [InlineData("", null)]
+    [InlineData("   ", null)]
+    [InlineData("[192.0.2.1]", null)]                          // address literal
+    [InlineData("[IPv6:fe80::1]", null)]                       // IPv6 literal
+    [InlineData("localhost", null)]                            // bare label: no dot, no SPF record
+    [InlineData("mail example com", null)]                     // spaces are not DNS syntax
+    [InlineData("mail.example.com extra", null)]
+    [InlineData("mail_host.example.com", null)]                // underscore is not a hostname character
+    public void ParseHeloDomain_KeepsOnlyCheckableDomains(string? argument, string? expected) =>
+        Assert.Equal(expected, ClientProcessor.ParseHeloDomain(argument));
+
+    /// <summary>
+    /// A second EHLO replaces the retained identity rather than leaving the first in place.
+    /// </summary>
+    /// <remarks>
+    /// EHLO resets the session (RFC 5321 §4.1.4), so a client that re-greets with a different name
+    /// must be checked against the new one — otherwise a client could present a domain that passes
+    /// SPF, then re-greet as something else and keep the first result.
+    /// </remarks>
+    [Fact]
+    public async Task Ehlo_Reissued_ReplacesRetainedHeloDomain()
+    {
+        var port = TestPorts.Allocate();
+        var delivery = new RecordingDelivery();
+        using var server = TestServers.Build(port, delivery: delivery);
+        server.Start();
+
+        await using var s = await ConnectGreetedAsync(port);
+        await s.Send("EHLO first.example.com");
+        await s.ReadResponseAsync();
+        await s.Send("EHLO second.example.com");
+        await s.ReadResponseAsync();
+
+        await s.Send("MAIL FROM:<a@b.com>");
+        Assert.StartsWith("250", await s.ReadLineAsync());
+        await s.Send("RCPT TO:<r@example.com>");
+        Assert.StartsWith("250", await s.ReadLineAsync());
+        await s.Send("DATA");
+        Assert.StartsWith("354", await s.ReadLineAsync());
+        await s.Send("Subject: t");
+        await s.Send("");
+        await s.Send("body");
+        await s.Send(".");
+        Assert.StartsWith("250", await s.ReadLineAsync());
+
+        Assert.Equal("second.example.com", delivery.Delivered.Single().HeloDomain);
+    }
+
     private sealed class StaticAuth : IAuthLogin
     {
         public Task<bool> AuthPlain(string authorizationIdentity, string authenticationIdentity,

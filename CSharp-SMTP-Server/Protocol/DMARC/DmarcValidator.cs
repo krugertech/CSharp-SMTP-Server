@@ -184,30 +184,29 @@ public class DmarcValidator
 			else if (record.Contains(";p=quarantine", StringComparison.OrdinalIgnoreCase)) action = DmarcResult.Quarantine;
 		}
 
-		// A null reverse-path (every DSN/bounce) has no envelope identity to align against, and this
-		// server does not implement DKIM, so DMARC has no authenticated identity at all here. RFC 7489
-		// §3.1 builds alignment on SPF or DKIM; with neither available the result is "no determination",
-		// not a failure. Returning Fail would let a p=reject policy permanently destroy a legitimate
-		// bounce sent by the very domain that published the policy — the exact data-loss failure this
-		// deployment exists to prevent.
+		// A null reverse-path (every DSN/bounce) has no MAIL FROM identity, and DMARC aligns the MAIL
+		// FROM identity specifically: RFC 7489 §4.1 says "DMARC uses the result of SPF authentication
+		// of the MAIL FROM identity", and for the null case defers to RFC 7208 §2.4 rather than
+		// defining a DMARC behaviour of its own. §2.4 substitutes postmaster@<HELO domain> for the
+		// SPF CHECK — which this server now performs, see TransactionCommands — but that is an SPF
+		// identity, not a DMARC one, and nothing in RFC 7489 authorizes aligning it against
+		// RFC5322.From.
+		//
+		// Aligning it anyway would destroy ordinary bounces. A bouncing MTA's HELO name is its own
+		// hostname (mail-out-3.provider.example) and routinely differs from the From domain of the
+		// notification it carries; requiring the two to align refuses a legitimate DSN from the very
+		// domain that published p=reject. That is the permanent, unrecoverable loss this deployment
+		// exists to prevent, and it is pinned by
+		// NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered.
 		//
 		// ── KNOWN LIMITATION, deliberate ─────────────────────────────────────────────────────────
-		// This means a null-sender message is NOT DMARC-enforced: an unauthenticated client can send
+		// So a null-sender message is still not DMARC-enforced: an unauthenticated client can send
 		// MAIL FROM:<> with a spoofed "From: ceo@victim.example" under victim.example's p=reject and
-		// be accepted. The server cannot currently tell that apart from a genuine bounce, because it
-		// has no authenticated identity for a null path in either direction:
-		//
-		//   * RFC 7208 §2.4 defines the null-path MAIL FROM identity as postmaster@<HELO domain>, but
-		//     the EHLO/HELO argument is discarded (ClientProcessor keeps only _protocolVersion), so
-		//     that check cannot be run.
-		//   * DKIM is not implemented, so there is no second aligned mechanism to fall back on.
-		//
-		// Closing this properly means retaining the HELO identity and running the §2.4 check, then
-		// aligning THAT domain against RFC5322.From. Until then the choice is between delivering
-		// unauthenticated bounces and destroying legitimate ones, and for a journaling relay —
-		// where DMARC is off entirely and a rejected report is an unrecoverable compliance record —
-		// delivering is the correct side to err on. Anyone enabling ValidateDMARC should know that
-		// null senders pass unauthenticated.
+		// be accepted. Closing that needs an aligned identity DMARC actually recognizes, which means
+		// DKIM — not implemented here. The SPF §2.4 check now constrains WHO may send a null path
+		// (a HELO domain publishing -all is enforced), but it cannot say anything about the From
+		// header, so it narrows the gap without closing it. Anyone enabling ValidateDMARC should know
+		// that null senders remain unauthenticated in the DMARC sense.
 		if (transaction.IsNullReversePath)
 			return ValidationResult.None;
 

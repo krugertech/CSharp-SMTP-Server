@@ -15,11 +15,12 @@ namespace CSharp_SMTP_Server
 	/// </summary>
 	public class MailTransaction : ICloneable
 	{
-		internal MailTransaction(string from, string fromDomain, ValidationResult validationResult, bool isNullReversePath = false)
+		internal MailTransaction(string from, string fromDomain, ValidationResult validationResult, bool isNullReversePath = false, string? heloDomain = null)
 		{
 			From = from;
 			FromDomain = fromDomain;
 			IsNullReversePath = isNullReversePath;
+			HeloDomain = heloDomain;
 			SPFValidationResult = validationResult;
 			DeliverTo = new List<string>();
 			AuthenticatedUser = null;
@@ -48,6 +49,18 @@ namespace CSharp_SMTP_Server
 		/// would find nothing to align and reject a legitimate bounce under <c>p=reject</c>.
 		/// </remarks>
 		public readonly bool IsNullReversePath;
+
+		/// <summary>
+		/// The domain the client gave in its EHLO/HELO, or null if it gave none that could be checked.
+		/// </summary>
+		/// <remarks>
+		/// RFC 7208 §2.4 makes this the SPF identity when the reverse-path is null: the check runs
+		/// against <c>postmaster@&lt;HELO domain&gt;</c>, since there is no envelope sender to check
+		/// instead. It is also the domain DMARC aligns for such a message — see
+		/// <see cref="Protocol.DMARC.DmarcValidator"/>. Null when the client sent an address literal or
+		/// a name that is not a DNS domain, neither of which can carry an SPF record.
+		/// </remarks>
+		public readonly string? HeloDomain;
 
 		/// <summary>
 		/// The message body, as a stream-backed store.
@@ -254,7 +267,7 @@ namespace CSharp_SMTP_Server
 		{
 			// The body is SHARED, not copied: duplicating it is a second full copy of the message, which
 			// for a 150 MB journal report was the single largest allocation on the delivery path.
-			var clone = new MailTransaction(From, FromDomain, SPFValidationResult, IsNullReversePath)
+			var clone = new MailTransaction(From, FromDomain, SPFValidationResult, IsNullReversePath, HeloDomain)
 			{
 				AuthenticatedUser = AuthenticatedUser,
 				RemoteEndPoint = RemoteEndPoint,

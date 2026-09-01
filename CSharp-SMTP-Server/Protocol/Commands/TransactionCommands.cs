@@ -60,29 +60,34 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 							if (processor.Username != null)
 								spfValidation = ValidationResult.UserAuthenticated;
-							// A null reverse-path carries no envelope domain to check, and querying DNS for an
-							// empty domain would only yield a spurious Temperror, so SPF is skipped here.
-							//
-							// NOTE: RFC 7208 §2.4 does not say to skip SPF in this case — it defines the MAIL FROM
-							// identity as postmaster@<HELO domain> and has that checked instead. Doing so requires
-							// retaining the EHLO/HELO argument, which this server currently discards (only
-							// _protocolVersion is kept). Until that is threaded through, a null-path sender is not
-							// SPF-checked at all: acceptable while SPF is off (as it is for journaling), but it
-							// means a HELO domain publishing -all is not enforced against a null sender.
-							else if (processor.Server.Options.ValidateSPF && processor.RemoteEndPoint != null && !nullReversePath)
+							else if (processor.Server.Options.ValidateSPF && processor.RemoteEndPoint != null)
 							{
-								if (processor.SpfResultsCache!.TryGetValue(domain!, out var spfRes))
-									spfValidation = spfRes;
-								else
-								{
-									spfValidation = await processor.Server.SpfValidator!.CheckHost(processor.RemoteEndPoint.Address, domain!);
-									processor.SpfResultsCache.Add(domain!, spfValidation);
-								}
+								// RFC 7208 §2.4: when the reverse-path is null there is no envelope sender to
+								// check, and the identity becomes postmaster@<HELO domain> — so the HELO domain
+								// is checked in its place rather than SPF being skipped. Skipping was the old
+								// behaviour and it left a null sender unauthenticated in either direction:
+								// combined with DKIM being unimplemented, DMARC had nothing to align and a
+								// spoofed From under p=reject was accepted.
+								//
+								// A client that sent an address literal or a non-DNS name has no checkable
+								// identity at all; that stays unchecked, because there is nothing to look up.
+								var checkDomain = nullReversePath ? processor.HeloDomain : domain;
 
-								if (spfValidation == ValidationResult.Fail)
+								if (checkDomain != null)
 								{
-									await processor.WriteCode(554, "5.7.23", "Delivery not authorized by SPF, message refused");
-									return;
+									if (processor.SpfResultsCache!.TryGetValue(checkDomain, out var spfRes))
+										spfValidation = spfRes;
+									else
+									{
+										spfValidation = await processor.Server.SpfValidator!.CheckHost(processor.RemoteEndPoint.Address, checkDomain);
+										processor.SpfResultsCache.Add(checkDomain, spfValidation);
+									}
+
+									if (spfValidation == ValidationResult.Fail)
+									{
+										await processor.WriteCode(554, "5.7.23", "Delivery not authorized by SPF, message refused");
+										return;
+									}
 								}
 							}
 
@@ -101,7 +106,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 								}
 							}
 
-							processor.Transaction = new MailTransaction(address, domain!, spfValidation, nullReversePath)
+							processor.Transaction = new MailTransaction(address, domain!, spfValidation, nullReversePath, processor.HeloDomain)
 							{
 								RemoteEndPoint = processor.RemoteEndPoint,
 								Encryption = processor.Encryption
@@ -256,7 +261,17 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					processor.Transaction.AddHeader("Received", received);
 
 					if (processor.Transaction.SPFValidationResult != ValidationResult.UserAuthenticated && processor.Transaction.SPFValidationResult != ValidationResult.CheckDisabled)
-						processor.Transaction.AddHeader("Authentication-Results", $"{processor.Server.Options.ServerName}; spf={processor.Transaction.SPFValidationResult.ToString().ToLowerInvariant()} smtp.mailfrom={processor.Transaction.FromDomain}");
+					{
+						// RFC 8601 §2.7.2: the property names the identity that was actually checked.
+						// For a null reverse-path that is the HELO domain (RFC 7208 §2.4), not the
+						// envelope sender — reporting smtp.mailfrom= with the empty FromDomain would
+						// claim to have checked an identity that does not exist.
+						var identity = processor.Transaction.IsNullReversePath
+							? $"smtp.helo={processor.Transaction.HeloDomain}"
+							: $"smtp.mailfrom={processor.Transaction.FromDomain}";
+
+						processor.Transaction.AddHeader("Authentication-Results", $"{processor.Server.Options.ServerName}; spf={processor.Transaction.SPFValidationResult.ToString().ToLowerInvariant()} {identity}");
+					}
 
 					if (processor.Server.Options.ValidateDMARC)
 					{

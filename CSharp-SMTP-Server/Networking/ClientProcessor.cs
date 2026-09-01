@@ -85,6 +85,60 @@ namespace CSharp_SMTP_Server.Networking
 		private ushort _protocolVersion;
 
 		/// <summary>
+		/// The domain the client gave in its EHLO/HELO, or null if it gave none usable.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Retained because RFC 7208 §2.4 defines the SPF check for a null reverse-path
+		/// (<c>MAIL FROM:&lt;&gt;</c>) against <c>postmaster@&lt;HELO domain&gt;</c> — with the argument
+		/// discarded there was no identity to check in either direction, so a null sender was not
+		/// authenticated at all and a spoofed From under <c>p=reject</c> was accepted.
+		/// </para>
+		/// <para>
+		/// Only a plausible DNS domain is kept. An address literal ("[192.0.2.1]", "[IPv6:fe80::1]") is
+		/// not a domain and cannot be looked up, and a bare label with no dot cannot carry an SPF
+		/// record; storing null for those makes "no checkable identity" explicit at the point of
+		/// capture rather than something every consumer has to re-derive.
+		/// </para>
+		/// </remarks>
+		internal string? HeloDomain { get; private set; }
+
+		/// <summary>
+		/// Extracts a checkable DNS domain from an EHLO/HELO argument.
+		/// </summary>
+		/// <param name="argument">The command argument, as sent.</param>
+		/// <returns>The domain, or null if it is absent, an address literal, or not a DNS name.</returns>
+		internal static string? ParseHeloDomain(string? argument)
+		{
+			if (string.IsNullOrWhiteSpace(argument))
+				return null;
+
+			var domain = argument.Trim();
+
+			// Address literals are the RFC 5321 §4.1.3 alternative to a domain and are not resolvable.
+			if (domain[0] == '[')
+				return null;
+
+			// A trailing '.' is a legal absolute form; strip it so lookups and alignment comparisons
+			// see the same string a MAIL FROM domain would produce.
+			domain = domain.TrimEnd('.');
+
+			// Must look like a DNS name: at least one dot, and nothing that belongs to other grammar.
+			if (!domain.Contains('.', StringComparison.Ordinal))
+				return null;
+
+			foreach (var c in domain)
+			{
+				if (c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '.' or '-')
+					continue;
+
+				return null;
+			}
+
+			return domain;
+		}
+
+		/// <summary>
 		/// Converts <see cref="ServerOptions.MessageCharactersLimit"/> (characters, excluding CRLF) into
 		/// an octet count safe to advertise as RFC 1870 SIZE (octets, including CRLF).
 		/// </summary>
@@ -347,6 +401,7 @@ namespace CSharp_SMTP_Server.Networking
 				case "EHLO":
 					DiscardTransaction();
 					_protocolVersion = 2;
+					HeloDomain = ParseHeloDomain(data);
 					await WriteText($"250-{Server.Options.ServerName} at your service");
 					if (Server.AuthLogin != null) await WriteText("250-AUTH LOGIN PLAIN");
 					if (!Secure && Server.Certificate != null) await WriteText("250-STARTTLS");
@@ -378,6 +433,7 @@ namespace CSharp_SMTP_Server.Networking
 				case "HELO":
 					DiscardTransaction();
 					_protocolVersion = 1;
+					HeloDomain = ParseHeloDomain(data);
 					await WriteText($"250 {Server.Options.ServerName} at your service");
 					break;
 
