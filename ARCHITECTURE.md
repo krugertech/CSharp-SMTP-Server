@@ -84,7 +84,8 @@ SMTPServer (public)
 1. **Init**: if the listener is a TLS port and a certificate exists, wrap in `SslStream` +
    `AuthenticateAsServerAsync`; otherwise send the greeting. Greeting first runs the optional
    `IMailFilter.IsConnectionAllowed(EndPoint)` — non-success → `550 4.7.1/5.7.1` and disconnect.
-2. **Receive loop**: line-based (`StreamReader.ReadLineAsync`). Exceptions are logged; after 3 fails
+2. **Receive loop**: line-based (`BoundedLineReader.ReadLineAsync`, which caps a single line at 1 MB
+   so an unterminated flood cannot grow the buffer without bound). Exceptions are logged; after 3 fails
    the connection is dropped. A per-connection `CancellationTokenSource` (exposed as
    `ConnectionToken`) cancels on dispose — this token is passed into your delivery handler.
 3. **Command dispatch** (`ProcessResponse`):
@@ -121,10 +122,16 @@ SMTPServer (public)
 ### Key objects
 
 - **`MailTransaction`** — what your handler receives: `From`, `FromDomain`, `DeliverTo[]`,
-  `RawBody` (mutable string), lazy `ParsedMessage` (MimeKit, parsed once and cached),
+  `GetBodyStream()` + `BodyLength` (the stream-native way to read the message — prefer these),
+  `RawBody` (compatibility property; materializes the whole message as UTF-16 on every read),
+  lazy `ParsedMessage` (MimeKit, parsed once and cached on the shared body store),
   convenience accessors (`Subject`, `GetFrom/GetTo/GetCc/GetBcc`, `GetMessageBody()` = text or HTML body),
   `RemoteEndPoint`, `AuthenticatedUser`, `Encryption`, `SPFValidationResult`, `DMARCValidationResult`,
-  `AddHeader(name, value)` (prepends to RawBody AND updates the parsed message).
+  `AddHeader(name, value)` (records the header on the body; it is spliced in ahead of the body when read).
+- **`MessageBody`** — the byte-backed store behind a transaction. In memory below ~4 MB, spills to a
+  `DeleteOnClose` temp file above it, so peak memory is O(buffer) rather than O(message). Shared, not
+  copied, by `Clone()`. A **spilled** body is released when the delivery handler returns; an in-memory
+  one is not, so small messages stay readable on a retained transaction.
 - **`ServerOptions`** — `ServerName`, `RequireEncryptionForAuth` (**default true**), TLS 1.2 only by default,
   `MessageCharactersLimit` (0 = off), `RecipientsLimit` (0 = off), SPF/DMARC toggles (both default on;
   enabling either without a DNS endpoint throws in the setter), `DnsServerEndpoint` (defaults to
@@ -294,7 +301,12 @@ silently dropped), Q12 (SPF DNS error handling deviates from RFC 7208 ×3), Q13 
   use (static, cached in-process).
 - `RequireEncryptionForAuth` defaults to **true** — AUTH over plaintext gets `538`. SampleApp sets it false for demo purposes.
 - `DoesUserExist` is called per RCPT TO; recipient limit default 50; message size limit counts characters (not bytes), default ~10 MB.
-- `MailTransaction.RawBody` is mutable and headers are prepended to it — the object handed to your handler is a **clone** of the processor's transaction, so mutating it doesn't affect server state.
+- The object handed to your handler is a **clone** of the processor's transaction, so mutating its
+  metadata doesn't affect server state — but the clone **shares** the body store rather than copying
+  it (copying a 150 MB body was the largest allocation on the old delivery path). Read the body with
+  `GetBodyStream()`; `RawBody` still works but materializes the whole message in UTF-16 each time, and
+  for a message large enough to have spilled to a temp file it is only valid **inside**
+  `EmailReceivedAsync`.
 - Version constants: NuGet/package version lives in the csproj (`PackageVersion 1.1.6-krugertech.3`);
   `SMTPServer.VersionString` still says `-krugertech.1` (informational only — bump both if you release).
 

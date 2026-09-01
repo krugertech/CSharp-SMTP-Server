@@ -53,14 +53,30 @@ namespace CSharp_SMTP_Server.Networking
 		private readonly TcpClient _client;
 		private readonly NetworkStream _innerStream;
 		private Stream _stream;
-		private StreamReader? _reader;
+		private BoundedLineReader? _reader;
 		private readonly Listener _listener;
 		private bool _greetSent;
 		private int _fails;
 
 		internal MailTransaction? Transaction;
-		internal StringBuilder? DataBuilder;
 		internal ulong Counter;
+
+		/// <summary>
+		/// Ends the current transaction, releasing the storage its body holds.
+		/// </summary>
+		/// <remarks>
+		/// Clearing <see cref="Transaction"/> alone is no longer enough: a body past the spill
+		/// threshold owns a temp file, and dropping the reference would leave it open until
+		/// finalization. Every path that abandons a transaction — an over-limit message, a policy
+		/// rejection, RSET, connection teardown — goes through here. The delivery path is the one
+		/// exception: it hands the body to the clone, which disposes it once the handler returns.
+		/// </remarks>
+		internal void DiscardTransaction()
+		{
+			var transaction = Transaction;
+			Transaction = null;
+			transaction?.Body.Dispose();
+		}
 
 		internal bool Secure { get; private set; }
 		internal ConnectionEncryption Encryption { get; private set; }
@@ -131,7 +147,7 @@ namespace CSharp_SMTP_Server.Networking
 					await Greet();
 
 				if (!_dispose)
-					_reader = new StreamReader(_stream);
+					_reader = new BoundedLineReader(_stream);
 
 				_ = Receive();
 			}
@@ -198,7 +214,7 @@ namespace CSharp_SMTP_Server.Networking
 			{
 				try
 				{
-					var read = await _reader.ReadLineAsync();
+					var read = await _reader.ReadLineAsync(_t);
 
 					if (read == null)
 						continue;
@@ -314,7 +330,7 @@ namespace CSharp_SMTP_Server.Networking
 			switch (command.Trim())
 			{
 				case "EHLO":
-					Transaction = null;
+					DiscardTransaction();
 					_protocolVersion = 2;
 					await WriteText($"250-{Server.Options.ServerName} at your service");
 					if (Server.AuthLogin != null) await WriteText("250-AUTH LOGIN PLAIN");
@@ -345,7 +361,7 @@ namespace CSharp_SMTP_Server.Networking
 					break;
 
 				case "HELO":
-					Transaction = null;
+					DiscardTransaction();
 					_protocolVersion = 1;
 					await WriteText($"250 {Server.Options.ServerName} at your service");
 					break;
@@ -369,7 +385,7 @@ namespace CSharp_SMTP_Server.Networking
 					Secure = true;
 					Encryption = ConnectionEncryption.StartTls;
 					await ((SslStream)_stream).AuthenticateAsServerAsync(Server.Certificate, false, Server.Options.Protocols, true);
-					_reader = new StreamReader(_stream);
+					_reader = new BoundedLineReader(_stream);
 					break;
 
 				case "HELP":
@@ -438,10 +454,11 @@ namespace CSharp_SMTP_Server.Networking
 
 			_ts.Cancel();
 
-			Transaction = null;
+			DiscardTransaction();
 
-			_reader?.Close();
-			_reader?.Dispose();
+			// BoundedLineReader owns nothing but its own buffers — it borrows _stream, which is closed
+			// just below — so there is nothing to dispose, unlike the StreamReader it replaced.
+			_reader = null;
 
 			_stream.Close();
 			_stream.Dispose();

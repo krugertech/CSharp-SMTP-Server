@@ -8,6 +8,67 @@ the upstream sync record.
 
 ### Breaking
 
+- **The DATA path streams to a byte-backed store instead of accumulating a string, cutting peak
+  memory for a large message by more than 10×.** A 150 MB message previously drove peak working set
+  to **~1900 MB**; it now grows the working set by **no measurable amount** (whole-process peak in
+  isolation: ~114 MB). Four 50 MB messages arriving concurrently likewise went from ~1900 MB to no
+  measurable growth.
+
+  **Why it cost that much.** The body was accumulated in a `StringBuilder` (which grows by chunked
+  reallocation, carrying slack), materialized with `ToString()`, copied a third time by
+  `MailTransaction.Clone()` before delivery, and re-encoded to a `byte[]` for MimeKit — several full
+  copies coexisting at peak, each doubled because .NET strings are UTF-16 while the message on the
+  wire is bytes. Worse, the cost scaled with *concurrent* large messages rather than with throughput,
+  so a pod on a 2 GB limit taking two 150 MB journal reports at once was OOM-killed mid-transaction
+  and lost both.
+
+  Body bytes are now written as they arrive into a `MessageBody` that keeps small messages in memory
+  and spills past ~4 MB to a temp file, `Clone()` shares that store rather than copying it, and
+  MimeKit parses from the stream directly. Peak memory is now O(buffer) rather than O(message), so
+  pod sizing no longer scales with concurrency.
+
+  **New API.** `MailTransaction.GetBodyStream()` returns a forward-only stream over the raw message —
+  headers included — and `BodyLength` gives its size in bytes without materializing it. A handler
+  that persists mail should copy that stream to its destination; the message then never exists as a
+  .NET string.
+
+  **Migration.** `RawBody` still works and still returns the same text, so most consumers need no
+  change. It is now a property that materializes the whole message in UTF-16 on **every read**, so a
+  handler that reads it repeatedly should read it once — and any handler that may see large messages
+  should move to `GetBodyStream()`.
+
+  **The one behavioral break:** a message large enough to have spilled to a temp file has that file
+  released when the delivery handler returns, so reading its body from a *retained* transaction
+  afterwards throws `ObjectDisposedException`. Messages that never spilled stay readable after
+  delivery exactly as before — the asymmetry is deliberate, so that ordinary mail keeps working and
+  only the case that was never viable to retain is affected. Consume the body inside
+  `EmailReceivedAsync`.
+
+  Line endings in the stored body are now always CRLF. The old path used `StringBuilder.AppendLine`,
+  i.e. `Environment.NewLine`, so the same server produced bare-LF bodies on Linux and CRLF on
+  Windows; SMTP requires CRLF.
+
+- **`MailTransaction.AddHeader` no longer duplicates a header added before the first parse (bug B2).**
+  It used to prepend to `RawBody` *and* explicitly add to `ParsedMessage`; reading `ParsedMessage`
+  inside `AddHeader` forced a parse of the already-modified body, which therefore already carried the
+  header, and the explicit add put in a second copy. `ParsedMessage` ended up with two where
+  `RawBody` had one. The header is now recorded on the body and only an already-parsed message is
+  updated, so either order yields exactly one copy.
+
+- **A transaction rejected at the terminating dot is now reset.** The DMARC multi-mailbox `554`, the
+  DMARC-fail `554`, and the oversize `552` previously left the transaction live on the connection.
+  Besides being wrong (the transaction is over), it held the body's temp file for the remainder of
+  the session. A subsequent `DATA` on the same connection now correctly answers `503 RCPT TO first.`
+
+- **Unterminated lines are now bounded (pre-existing hole, unauthenticated).** `Receive` awaited
+  `StreamReader.ReadLineAsync`, which materializes a complete line before returning, so a client that
+  connected and streamed bytes without ever sending CRLF grew the reader's buffer without limit and
+  never reached `MessageCharactersLimit` — that limit is applied per line, *after* the line exists,
+  so it bounds a message made of terminated lines but not the line itself. Reachable unauthenticated
+  on an internet-facing listener. A new `BoundedLineReader` caps a single line at 1 MB (RFC 5321
+  §4.5.3.1.6 sets the conforming limit at 1000 octets), truncating beyond that and draining to the
+  next terminator so session framing is preserved.
+
 - **`MailTransaction.GetFrom` / `GetTo()` / `GetCc()` / `GetBcc()` now return email addresses, not
   display names.** They previously returned MimeKit's *display name*: `""` for
   `From: user@example.com`, and `"John"` for `From: John <j@e.c>`.
@@ -69,10 +130,13 @@ the upstream sync record.
   **Why this is listed as breaking:** a command shape that was previously refused is now accepted, and
   reaches delivery handlers with an empty sender.
 
-**On the version number.** This release is 2.0.0 rather than 1.2.0 because the getter changes above are
-*silent*: consumers still compile, but filtering, routing, or display logic reading these members
-changes behavior. A minor bump would let that reach users through a routine update, and a changelog is
-not a dependency-resolution barrier. The major bump is the barrier.
+**On the version number.** This release is 2.0.0 rather than 1.2.0 because several of the changes above
+are *silent*: consumers still compile, but behavior changes underneath them. The getter changes alter
+what filtering, routing, or display logic sees; the streaming body changes `RawBody` from a field to a
+property (a recompile for anyone passing it by `ref`, and a per-read cost where there was none) and
+makes a large message's body unreadable once delivery returns. A minor bump would let all of that reach
+users through a routine update, and a changelog is not a dependency-resolution barrier. The major bump
+is the barrier.
 
 ### Fixed
 

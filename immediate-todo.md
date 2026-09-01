@@ -10,9 +10,12 @@ that no longer exists anywhere. For ordinary mail a 5xx is the sender's problem;
 data loss. Simultaneously, the server is internet-adjacent, so it cannot be made unbounded to achieve
 that. Every decision below balances those two.
 
-**State:** 343/343 tests green (`$env:DOTNET_ROLL_FORWARD="Major"; dotnet test
-CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build`). Load/O365 tests live in
-`CSharp-SMTP-Server.Tests/Load/`. Nothing below is committed.
+**State (updated 2026-09-01):** items 1, 2a, 3 and **4 are done**; item 4's result is a 150 MB message
+going from ~1900 MB of peak working set to no measurable working-set growth. **407/407 tests green** with the heavy load tier
+enabled (`$env:DOTNET_ROLL_FORWARD="Major"; $env:SMTP_LOADTEST="1"; dotnet test
+CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj`). Load/O365 tests live in
+`CSharp-SMTP-Server.Tests/Load/`; the streaming path's own tests are in
+`CSharp-SMTP-Server.Tests/StreamingBodyTests.cs`. **Item 5 (5a and 5b) remains open.**
 
 ---
 
@@ -25,14 +28,15 @@ report above it with `552 5.4.3` — a **permanent** failure, so Exchange does n
 is lost.
 
 The fix is **not** `0` (unlimited). That would let one hostile or broken client stream unbounded data
-into a `StringBuilder` until the pod is OOM-killed. Use a finite ceiling above what O365 can send:
+at the server until it exhausts memory or the disk bodies spill to. Use a finite ceiling above what
+O365 can send:
 
 ```csharp
 MessageCharactersLimit = 200u * 1024 * 1024   // 200 MB; O365 max message is 150 MB
 ```
 
-**Verified: a finite limit genuinely bounds memory** — this is what makes it a real DoS defense and
-not just policy. `TransactionCommands.ProcessData` counts every line but appends to `DataBuilder`
+**Verified: a finite limit genuinely bounds storage** — this is what makes it a real DoS defense and
+not just policy. `TransactionCommands.ProcessData` counts every line but writes to the body store
 only while `Counter` is within the limit, so over-limit data is discarded as it arrives.
 
 > Measured: **200 MB sent against a 10 MB limit → peak working set ~126 MB** (not ~2 GB), `552` at the
@@ -100,14 +104,15 @@ fixed it **fails by design** — change it to assert `250` and add a delivery as
 
 **Note this is a public behavior change** for all consumers of the library, not just this deployment.
 
-### 2b. Memory amplification on large messages — **~11× the message size**
+### 2b. Memory amplification on large messages — **~11× the message size** — **FIXED**
 
-A single 150 MB message drives peak working set to **~1.6–1.9 GB**. Reproduced repeatedly; see item 4
-for the cause and the fix. This is the most operationally significant finding in this handover.
+A single 150 MB message drove peak working set to **~1.6–1.9 GB**. Reproduced repeatedly; this was the
+most operationally significant finding in this handover. **Fixed by item 4** — the working set no longer measurably grows for such a message.
 
-Related earlier-known items (unchanged, from `REVIEW.md`): **Q1** no dot-stuffing in DATA
-(data-integrity, arguably P1 — pinned by `DotStuffing_IsNotImplemented_PinsQ1`), and **B2**
-`AddHeader` duplicating a header before first parse.
+Related earlier-known items (from `REVIEW.md`): **Q1** no dot-stuffing in DATA (data-integrity,
+arguably P1 — pinned by `DotStuffing_IsNotImplemented_PinsQ1`) — **still open**; and **B2** `AddHeader`
+duplicating a header before first parse — **fixed as a side effect of item 4**, its pinning test
+inverted to assert one copy.
 
 ---
 
@@ -151,7 +156,15 @@ a regression fails the build rather than losing mail in production.
 
 ---
 
-## 4. Streaming DATA path — the fix for the memory problem
+## 4. Streaming DATA path — the fix for the memory problem — **DONE 2026-09-01**
+
+**Result: a 150 MB message went from ~1900 MB of peak working set to no measurable working-set
+growth; 4 × 50 MB concurrently likewise.**
+Both are now asserted by heavy-tier tests that print the figure on every run
+(`LargeMessage_150MB_IsAcceptedIntact`, `ConcurrentLargeMessages_DoNotMultiplyMemory`). 407/407 tests
+green, including the full heavy load tier. Pod sizing no longer scales with concurrent large messages.
+
+Implementation notes are at the end of this item; the analysis below is kept as the record of why.
 
 ### The problem
 
@@ -214,7 +227,38 @@ is also a public behavior change.
 
 **Interim mitigation until this lands:** keep the finite size limit (item 1a), size pods for
 ≈ 2 GB × expected concurrent large messages, and bound concurrent large transactions ahead of the pod
-if possible.
+if possible. ~~Needed~~ — superseded; the streaming path landed, see below.
+
+### What was actually built
+
+- **`MessageBody`** (new, `CSharp-SMTP-Server/MessageBody.cs`) — byte-backed body store. In memory
+  below 4 MB, spills to a temp file above it, opened `DeleteOnClose` so a pod killed mid-transaction
+  cannot leave the file behind. Prepended headers are *recorded*, not written, and spliced in ahead of
+  the body by the read stream, so `AddHeader` on a 150 MB message costs the header rather than a
+  rewrite.
+- **`MailTransaction`** — `RawBody` is now a lazy property over the store (still works, still returns
+  the same text); `GetBodyStream()` and `BodyLength` are the new stream-native API. `Clone()` shares
+  the store instead of copying it, and the parsed-`MimeMessage` cache moved onto the store so the
+  clone still shares the parse — lazily, without `Clone()` forcing one. `ParsedMessage` now loads from
+  the stream, so MimeKit never sees a re-encoded string.
+- **`BoundedLineReader`** (new, `Networking/BoundedLineReader.cs`) — replaces `StreamReader` in the
+  receive loop and closes the unterminated-line hole described above. 1 MB cap per line, truncate and
+  drain past it, stateful UTF-8 decoder so multi-byte characters survive read boundaries.
+- **Lifetime** — `ClientProcessor.DiscardTransaction()` is the single abandon path (over-limit, policy
+  rejection, RSET, EHLO/HELO reset, connection teardown); the delivery path hands the store to the
+  clone, which disposes it in a `finally` so a throwing handler (the 451/retry path) does not leak a
+  file per message for the length of an outage. Disposal is deliberately a **no-op for a body that
+  never spilled**, so retaining a small transaction past delivery — which consumers and this suite's
+  own fakes do — keeps working.
+
+**Two related defects fixed in passing:** B2 (`AddHeader` duplicating a header before first parse) is
+gone as a structural consequence — its pinning test is inverted to assert one copy. And a transaction
+rejected at the terminating dot is now reset rather than left live on the connection, which was both
+wrong and a temp-file leak.
+
+**Follow-up not taken:** the DATA path still decodes each line to a string before writing it back out
+as UTF-8, so a byte-exact round trip is not guaranteed for malformed input, and dot-unstuffing (Q1) is
+still not implemented. Both are unchanged by this work.
 
 ### Verify with the existing harness
 
@@ -268,9 +312,15 @@ recognises the closing bracket only outside a quoted-string.
 
 ## Suggested order
 
-1. **Item 3** — configuration only, zero code change, stops the bleeding immediately.
-2. **Item 1a** — set the finite limit as part of that same config.
-3. **Item 2a** — null sender; small, well-understood, test already written and waiting to be inverted.
-4. **Item 1b** — advertise SIZE; small and independent.
-5. **Item 4** — streaming DATA path; the largest change, breaking, and best done deliberately with the
-   load harness watching the memory number.
+1. ~~**Item 3** — configuration only, zero code change, stops the bleeding immediately.~~ **Done.**
+2. ~~**Item 1a** — set the finite limit as part of that same config.~~ **Done.**
+3. ~~**Item 2a** — null sender; test inverted to assert `250`.~~ **Done.**
+4. ~~**Item 1b** — advertise SIZE.~~ **Done.**
+5. ~~**Item 4** — streaming DATA path.~~ **Done 2026-09-01** — 150 MB: ~1900 MB → no measurable growth;
+   4 × 50 MB concurrent: likewise. Both pinned by heavy-tier tests that assert growth stays below the
+   message size itself.
+
+**Remaining:** item 5a (null sender unauthenticated in either direction — needs the EHLO/HELO identity
+retained and threaded through for the RFC 7208 §2.4 check) and item 5b (quoted local-parts containing
+angle brackets rejected). Neither blocks the journaling deployment: 5a is unreachable there because
+DMARC is off, and 5b does not arise in O365 journal envelopes.

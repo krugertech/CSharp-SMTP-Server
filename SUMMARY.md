@@ -304,8 +304,10 @@ machine becomes a flaky red build on another, and flaky builds get ignored.
 
 **Integrity is hash-based but not byte-exact on the wire, for two structural reasons.** The server
 prepends a `Received:` header containing `DateTime.UtcNow`, so every delivery differs even for
-identical input; and DATA capture uses `StringBuilder.AppendLine`, i.e. `Environment.NewLine`, so a
-byte-exact digest would pass on Windows and fail on Linux CI. `MessageCorpus.ExtractPayload` strips
+identical input; and DATA capture used `StringBuilder.AppendLine`, i.e. `Environment.NewLine`, so a
+byte-exact digest would pass on Windows and fail on Linux CI. (The streaming path now always writes
+CRLF, so that second reason no longer applies — the canonicalization is kept because the first still
+does.) `MessageCorpus.ExtractPayload` strips
 server-prepended headers (anchoring on `Subject:`) and `Canonicalize` normalizes line endings; the
 SHA-256 is taken over that. Verified non-vacuous by fault injection: flipping **one character** in a
 large body failed the run with per-message diagnostics (re-verified against the current corpus).
@@ -315,7 +317,7 @@ was too small to say anything about byte throughput). Sizes are exact to 0.1 KB 
 under the 10 MB default `MessageCharactersLimit`. The 200 KB sample carries ~72 KB of genuine
 multi-byte UTF-8 (Polish/Greek/CJK/emoji), so it actually exercises the UTF-8 decode path; the
 1000 KB sample is the structurally important one, spanning many socket reads and repeatedly growing
-the DATA `StringBuilder`. Mean message ≈ 433 KB, so a 1000-message run moves ~423 MB.
+the DATA body store. Mean message ≈ 433 KB, so a 1000-message run moves ~423 MB.
 
 **The corpus avoids lines beginning with `.`** because dot-unstuffing is not implemented (Q1). That
 defect is pinned separately by `DotStuffing_IsNotImplemented_PinsQ1` rather than being allowed to
@@ -405,7 +407,7 @@ message that was never stored. Pinned by `DeliveryHandlerThrows_YieldsTemporaryF
 ### Why the limit must be finite — and why that is safe
 
 Setting `MessageCharactersLimit = 0` removes the rejection path but lets one client stream unbounded
-data into a `StringBuilder` until the pod is OOM-killed. A finite ceiling above O365's 150 MB gives
+data at the server until it exhausts memory or the disk bodies spill to. A finite ceiling above O365's 150 MB gives
 the same delivery guarantee while keeping the DoS bound.
 
 **A finite limit genuinely bounds memory** — `ProcessData` counts every line but appends only while
@@ -418,22 +420,36 @@ Two caveats: the limit counts **characters excluding CRLF**, not bytes (1:1 for 
 and the headroom above 150 MB covers base64 expansion plus headers); and it is enforced **late**, at
 the terminating dot, so it bounds memory but not bandwidth or connection time.
 
-### Measured: 150 MB works, but memory is the real constraint
+### Measured: 150 MB works, and memory is no longer the constraint (streaming DATA path, 2026-09-01)
 
-A 150 MB message is accepted and delivered intact in ~2.5 s. **Peak working set for that single
-message: ~1.6–1.9 GB — roughly 11× the message size.** The body is accumulated in a `StringBuilder`,
-materialized by `ToString()`, copied again by `MailTransaction.Clone()`, and .NET strings are UTF-16
-(2 bytes/char), so several full copies coexist.
+A 150 MB message is accepted and delivered intact in ~1.5 s, and the process working set **does not
+measurably grow** while it happens (measured as growth across the scenario, which lands at 0 ± 10 MB —
+inside GC noise). Four 50 MB messages arriving concurrently likewise grow it by ~0 MB. Isolated
+whole-process peak for a single 150 MB message is ~114 MB, against ~1900 MB before.
 
-**Pod sizing must budget ~2 GB per _concurrent_ large message, not per pod.** Concurrency is what
-causes OOM, not total volume: 4 × 50 MB concurrently peaked at ~1.9 GB. A pod accepting several
-150 MB journal reports at once on a 2 GB limit will be OOM-killed mid-transaction.
+**Before the streaming path a single message cost ~1900 MB** — roughly 12× the message size, and
+scaling with *concurrency* rather than throughput, so a pod on a 2 GB limit taking two 150 MB journal
+reports at once was OOM-killed mid-transaction and lost both. The body was accumulated in a
+`StringBuilder`, materialized by `ToString()`, copied again by `MailTransaction.Clone()`, and
+re-encoded to bytes for MimeKit — several full copies coexisting, each doubled by UTF-16.
 
-**This is unacceptable for production and is the top follow-up** — the fix is a streaming DATA path
-(buffer to a `Stream`, spill to disk past a threshold, expose `GetBodyStream()`, stop materializing
-`RawBody`), which would make peak memory *O(buffer)* instead of *O(11 × message)*. Design sketch and
-sequencing in [`immediate-todo.md`](immediate-todo.md) item 4. It is a breaking public API change
-(`RawBody` is public), so it wants a major version.
+**What changed.** Body bytes are written as they arrive into a `MessageBody` that keeps small messages
+in memory and spills past ~4 MB to a temp file (deleted on close, and on every abandon path — reject,
+RSET, disconnect). `Clone()` shares that store instead of copying it, and MimeKit parses from the
+stream. Peak memory is now *O(buffer)* rather than *O(message)*.
+
+**Pod sizing no longer scales with concurrent large messages.** That was the operational reason this
+was the top follow-up; it is retired. Both are asserted by heavy-tier tests
+(`LargeMessage_150MB_IsAcceptedIntact`, `ConcurrentLargeMessages_DoNotMultiplyMemory`), which print
+the figure on every run. The assertions bound growth by the *message size itself* rather than a tuned
+megabyte threshold — a bound no in-memory implementation can meet, and one that does not go flaky
+across machines.
+
+**Consumer-visible.** `MailTransaction.GetBodyStream()` is the allocation-free way to read a message
+and `BodyLength` gives its size without materializing it. `RawBody` still works, but now materializes
+the whole message in UTF-16 on every read — and for a message large enough to have spilled, the body
+is released when the delivery handler returns, so it must be consumed inside `EmailReceivedAsync`.
+Small messages stay readable after delivery, as before.
 
 ### Two gaps found while writing these tests — both now fixed (2026-09-01)
 

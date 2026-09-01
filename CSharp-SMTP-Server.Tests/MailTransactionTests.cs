@@ -185,17 +185,23 @@ public sealed class MailTransactionTests
     // ─── AddHeader (bug B2 pin) ──────────────────────────────────────────────
 
     [Fact]
-    public void AddHeader_BeforeFirstParse_DuplicatesInParsedMessage_BugB2()
+    public void AddHeader_BeforeFirstParse_AddsExactlyOneCopy_B2Fixed()
     {
-        // BUG B2: AddHeader prepends to RawBody AND explicitly adds to ParsedMessage. When called before
-        // the first parse, the explicit add happens on a message that was just parsed from the already-
-        // modified RawBody — so ParsedMessage ends up with two copies while RawBody has one.
+        // B2 (fixed by the streaming body): AddHeader used to prepend to RawBody AND explicitly add to
+        // ParsedMessage. Reading ParsedMessage in AddHeader forced a parse of the ALREADY-modified body,
+        // which therefore already carried the header — and the explicit add then put in a second copy,
+        // leaving ParsedMessage with two where RawBody had one.
+        //
+        // AddHeader now records the header on the body and updates only an already-parsed message. When
+        // the parse happens afterwards it picks the header up from the body on its own, so either order
+        // yields exactly one copy. Contrast AddHeader_AfterParse_AddsExactlyOneCopy, which covers the
+        // other order.
         var t = Tx(SimpleMessage);
 
         t.AddHeader("Received", "from 1.2.3.4 by test; now");
 
         Assert.Equal(1, CountOccurrences(t.RawBody, "Received:"));
-        Assert.Equal(2, t.ParsedMessage.Headers.Count(h => h.Field == "Received"));
+        Assert.Single(t.ParsedMessage.Headers, h => h.Field == "Received");
     }
 
     [Fact]

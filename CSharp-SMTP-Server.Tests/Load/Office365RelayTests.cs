@@ -1,5 +1,6 @@
 using System.Net;
 using CSharp_SMTP_Server.Networking;
+using CSharp_SMTP_Server.Protocol.Responses;
 using CSharp_SMTP_Server.Protocol.Commands;
 using Xunit.Abstractions;
 
@@ -40,16 +41,16 @@ public sealed class Office365RelayTests
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Not 0.</b> Disabling the limit entirely would let one client stream unbounded data into a
-    /// <c>StringBuilder</c> until the pod is OOM-killed — a trivial denial of service. A finite
-    /// ceiling is both the DoS bound and the size contract.
+    /// <b>Not 0.</b> Disabling the limit entirely would let one client stream unbounded data at the
+    /// server until it fills memory or the disk the body spills to — a trivial denial of service. A
+    /// finite ceiling is both the DoS bound and the size contract.
     /// </para>
     /// <para>
-    /// <b>The limit genuinely bounds memory</b>, which is what makes it a real defense rather than
-    /// just a policy: once <c>Counter</c> exceeds the limit, <c>ProcessData</c> stops appending to
-    /// <c>DataBuilder</c> and only counts. Measured: 200 MB sent against a 10 MB limit peaked at
-    /// ~126 MB working set — not the ~2 GB an unbounded 200 MB message would cost — and the
-    /// connection is still usable afterwards (the 552 arrives at the terminating dot).
+    /// <b>The limit genuinely bounds storage</b>, which is what makes it a real defense rather than
+    /// just a policy: once <c>Counter</c> exceeds the limit, <c>ProcessData</c> stops writing to the
+    /// body and only counts. Measured: 200 MB sent against a 10 MB limit peaked at ~126 MB working
+    /// set — not the ~2 GB an unbounded 200 MB message would cost — and the connection is still
+    /// usable afterwards (the 552 arrives at the terminating dot).
     /// </para>
     /// <para>
     /// <b>Units.</b> <c>MessageCharactersLimit</c> counts <i>characters, excluding CRLF</i>, not
@@ -109,6 +110,26 @@ public sealed class Office365RelayTests
         return (server, port);
     }
 
+    /// <summary>
+    /// The process's current working set, after collecting so the figure reflects live data.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately not <c>PeakWorkingSet64</c>: that is a process-lifetime high-water mark, so once
+    /// any earlier test in the run has allocated heavily it reports that instead and a memory
+    /// assertion built on it silently stops testing anything. Growth in the current working set
+    /// across a scenario is what actually attributes memory to that scenario.
+    /// </remarks>
+    private static long CurrentWorkingSet()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        process.Refresh();
+        return process.WorkingSet64;
+    }
+
     /// <summary>Opens a session and completes EHLO, returning the session.</summary>
     private static async Task<SmtpSession> OpenAsync(ushort port, TimeSpan? timeout = null)
     {
@@ -127,26 +148,28 @@ public sealed class Office365RelayTests
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>Memory cost — the operationally important result.</b> Measured on a 16-core Windows box, a
-    /// single 150 MB message drove peak working set to <b>~1.6 GB</b>, roughly 11× the message size.
-    /// The message is accumulated in a <c>StringBuilder</c>, materialized with <c>ToString()</c>, then
-    /// copied again by <c>MailTransaction.Clone()</c>, and .NET strings are UTF-16 (2 bytes/char) —
-    /// so several full copies of the message exist at once, plus <c>StringBuilder</c> growth slack.
+    /// <b>Memory cost — the operationally important result.</b> Before the streaming DATA path, a
+    /// single 150 MB message drove peak working set to <b>~1.9 GB</b>, roughly 12× the message size:
+    /// it was accumulated in a <c>StringBuilder</c>, materialized with <c>ToString()</c>, copied again
+    /// by <c>MailTransaction.Clone()</c>, and re-encoded to bytes for MimeKit — several full copies
+    /// coexisting, each doubled because .NET strings are UTF-16 (2 bytes/char).
     /// </para>
     /// <para>
-    /// <b>Pod sizing must account for this.</b> At 150 MB messages, a pod's memory limit needs roughly
-    /// 2 GB of headroom <i>per concurrent large message</i>, not per pod. Concurrency, not total
-    /// volume, is what causes OOM here: 4 × 50 MB concurrently reached ~1.9 GB peak. The configured
-    /// <see cref="JournalingSizeLimit"/> caps the per-message cost, but N concurrent at-limit messages
-    /// still multiply it — bound concurrency or size the pod for the product.
+    /// The body is now written as bytes into a <c>MessageBody</c> that spills to a temp file past a
+    /// few MB, shared rather than copied by <c>Clone()</c>, and read back as a stream — so peak memory
+    /// is O(buffer) rather than O(message), and pod sizing no longer scales with concurrent large
+    /// messages. The measurement printed below is the number to watch.
     /// </para>
     /// <para>
-    /// This amplification is the strongest argument for a streaming DATA path (see
-    /// <c>immediate-todo.md</c> item 4); it is tracked as the primary follow-up.
+    /// <b>This test consumes the body through <c>GetBodyStream()</c> inside the delivery handler</b>,
+    /// which is the pattern a large-message handler must use: a spilled body's temp file is released
+    /// once the handler returns, so reading <c>RawBody</c> off a retained transaction afterwards
+    /// throws. Small messages, which never spill, stay readable after delivery as they always were —
+    /// see <c>MessageBody.Dispose</c> for why the asymmetry is deliberate.
     /// </para>
     /// <para>
-    /// This test is heavy-tier because it allocates well over a gigabyte; running it on every build
-    /// would risk OOM on a small CI container.
+    /// This test is heavy-tier because it moves 150 MB through a loopback socket; the memory it now
+    /// costs is modest, but the wall clock is not free.
     /// </para>
     /// </remarks>
     [Trait("Load", "heavy")]
@@ -157,6 +180,32 @@ public sealed class Office365RelayTests
 
         var delivery = new RecordingDelivery();
         var logger = new RecordingLogger();
+
+        // Consumed inside the handler, streaming — the whole point of the change. Only what the
+        // assertions need is retained: the byte count, whether the Subject line survived, and the
+        // handler's own peak working set, which is where a regression to buffering would show up.
+        long streamedBytes = 0;
+        var subjectSeen = false;
+
+        delivery.HandlerOverride = (transaction, _) =>
+        {
+            using var body = transaction.GetBodyStream();
+            using var reader = new StreamReader(body);
+
+            // Read a line at a time so the test itself never holds the message either; a
+            // ReadToEnd() here would reintroduce exactly the 300 MB string being removed.
+            string? line;
+            while ((line = reader.ReadLine()) != null)
+            {
+                streamedBytes += line.Length + 2; // + CRLF
+
+                if (line == "Subject: O365 journal report (150 MB)")
+                    subjectSeen = true;
+            }
+
+            return Task.FromResult(SmtpDeliveryResult.Ok());
+        };
+
         var (server, port) = StartJournalingServer(delivery, logger);
 
         using (server)
@@ -180,6 +229,7 @@ public sealed class Office365RelayTests
             var lineBytes = line.Length + 2; // + CRLF
             var lines = (int)(O365MaxMessageBytes / lineBytes);
 
+            var before = CurrentWorkingSet();
             var sw = System.Diagnostics.Stopwatch.StartNew();
             for (var i = 0; i < lines; i++)
                 await session.Send(line);
@@ -190,22 +240,150 @@ public sealed class Office365RelayTests
 
             Assert.StartsWith("250", ack);
 
-            var transaction = Assert.Single(delivery.Delivered);
-            var bodyBytes = (long)transaction.RawBody.Length;
+            Assert.Single(delivery.Delivered);
 
             // The delivered body carries the payload plus the server's prepended Received: header,
             // so it is at least the size sent.
-            Assert.True(bodyBytes >= (long)lines * line.Length,
-                $"delivered body is short: {bodyBytes} bytes for {(long)lines * line.Length} sent");
+            Assert.True(streamedBytes >= (long)lines * line.Length,
+                $"delivered body is short: {streamedBytes} bytes for {(long)lines * line.Length} sent");
 
-            // Content survived: no truncation partway through a 150 MB accumulation.
-            Assert.Contains("Subject: O365 journal report (150 MB)", transaction.RawBody);
+            // Content survived: no truncation partway through a 150 MB accumulation, and the
+            // prepended header is spliced in ahead of the body rather than lost.
+            Assert.True(subjectSeen, "Subject line missing from the streamed body");
             Assert.DoesNotContain(logger.Errors, e => e.Contains("[Client receive loop]"));
 
-            var peakMb = System.Diagnostics.Process.GetCurrentProcess().PeakWorkingSet64 / 1024 / 1024;
+            var growth = CurrentWorkingSet() - before;
+            var growthMb = growth / 1024 / 1024;
+
             _output.WriteLine(
-                $"150 MB accepted in {sw.Elapsed.TotalSeconds:F1}s; delivered body " +
-                $"{bodyBytes / 1024.0 / 1024.0:F1} MB; process peak working set {peakMb} MB");
+                $"150 MB accepted in {sw.Elapsed.TotalSeconds:F1}s; streamed body " +
+                $"{streamedBytes / 1024.0 / 1024.0:F1} MB; working set grew {growthMb} MB " +
+                "(the old string-backed path grew ~1900 MB)");
+
+            // The number this whole change exists to move, so it is asserted rather than merely
+            // reported. The ceiling is the message size itself — a bound that no implementation
+            // holding the body in memory can meet, and that needs no per-machine tuning.
+            Assert.True(growth < O365MaxMessageBytes,
+                $"working set grew {growthMb} MB for a 150 MB message — the body appears to be " +
+                "buffered in memory rather than spilled");
+        }
+    }
+
+    /// <summary>
+    /// Several large messages arriving at once do not multiply memory the way they used to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the scenario that made pod sizing hard. When the body was a string, peak memory scaled
+    /// with the number of <i>concurrent</i> large messages rather than with the pod's throughput —
+    /// 4 × 50 MB at once reached ~1.9 GB, so a pod on a 2 GB limit taking two 150 MB journal reports
+    /// simultaneously was OOM-killed mid-transaction and lost both. Bounding concurrency ahead of the
+    /// pod was the only mitigation.
+    /// </para>
+    /// <para>
+    /// With the body spilled to a temp file, each concurrent transaction costs a buffer rather than a
+    /// multiple of its own size. The assertion is deliberately loose — an absolute megabyte figure
+    /// tuned on one machine is exactly the kind of measurement that turns into a flaky CI failure — so
+    /// it checks only that the total stays far below the old per-message multiple, which is a
+    /// structural property rather than a tuned threshold. The measured number is printed for the
+    /// record.
+    /// </para>
+    /// </remarks>
+    [Trait("Load", "heavy")]
+    [Fact]
+    public async Task ConcurrentLargeMessages_DoNotMultiplyMemory()
+    {
+        if (LoadTestGate.SkipHeavy("o365-concurrent-large")) return;
+
+        const int concurrency = 4;
+        const long bytesEach = 50L * 1024 * 1024;
+
+        var delivery = new RecordingDelivery();
+        var logger = new RecordingLogger();
+        var streamed = new long[concurrency];
+
+        delivery.HandlerOverride = (transaction, _) =>
+        {
+            using var body = transaction.GetBodyStream();
+            var buffer = new byte[81920];
+            long total = 0;
+            int read;
+
+            while ((read = body.Read(buffer, 0, buffer.Length)) > 0)
+                total += read;
+
+            lock (streamed)
+            {
+                for (var i = 0; i < streamed.Length; i++)
+                {
+                    if (streamed[i] != 0) continue;
+                    streamed[i] = total;
+                    break;
+                }
+            }
+
+            return Task.FromResult(SmtpDeliveryResult.Ok());
+        };
+
+        var (server, port) = StartJournalingServer(delivery, logger);
+
+        using (server)
+        {
+            var line = new string('Y', 900);
+            var lineBytes = line.Length + 2;
+            var lines = (int)(bytesEach / lineBytes);
+
+            // Current working set, not PeakWorkingSet64: the peak is a process-lifetime high-water
+            // mark, so in a full-suite run it reports whatever an earlier test happened to allocate
+            // and says nothing about this one. The growth across this test is the measurement.
+            var before = CurrentWorkingSet();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            // All four sessions transmit at once, so their bodies genuinely coexist rather than being
+            // serialized by the harness — which is what makes this a concurrency measurement.
+            var senders = Enumerable.Range(0, concurrency).Select(async _ =>
+            {
+                await using var session = await OpenAsync(port);
+
+                await session.Send("MAIL FROM:<journal@contoso.onmicrosoft.com>");
+                Assert.StartsWith("250", await session.ReadLineAsync());
+                await session.Send("RCPT TO:<archive@journal.local>");
+                Assert.StartsWith("250", await session.ReadLineAsync());
+                await session.Send("DATA");
+                Assert.StartsWith("354", await session.ReadLineAsync());
+
+                await session.Send("Subject: O365 journal report (concurrent)");
+                await session.Send("");
+
+                for (var i = 0; i < lines; i++)
+                    await session.Send(line);
+
+                await session.Send(".");
+                Assert.StartsWith("250", await session.ReadLineAsync());
+            }).ToArray();
+
+            await Task.WhenAll(senders);
+            sw.Stop();
+
+            Assert.Equal(concurrency, delivery.Delivered.Count);
+            Assert.All(streamed, bytes =>
+                Assert.True(bytes >= (long)lines * line.Length, $"a body was short: {bytes} bytes"));
+            Assert.DoesNotContain(logger.Errors, e => e.Contains("[Client receive loop]"));
+
+            var growth = CurrentWorkingSet() - before;
+            var growthMb = growth / 1024 / 1024;
+
+            _output.WriteLine(
+                $"{concurrency} x 50 MB concurrently in {sw.Elapsed.TotalSeconds:F1}s; " +
+                $"working set grew {growthMb} MB (the old string-backed path grew ~1900 MB)");
+
+            // 200 MB of message arrived at once. The old path grew by roughly ten times that; the
+            // streaming path should grow by a small multiple of its buffers. The ceiling is set at
+            // less than the payload itself — a bound no buffering implementation can meet — rather
+            // than at a tuned figure, so this stays meaningful across machines without going flaky.
+            Assert.True(growth < concurrency * bytesEach,
+                $"working set grew {growthMb} MB for {concurrency * bytesEach / 1024 / 1024} MB of " +
+                "concurrent message — bodies appear to be buffered in memory rather than spilled");
         }
     }
 

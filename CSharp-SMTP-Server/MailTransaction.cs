@@ -23,7 +23,7 @@ namespace CSharp_SMTP_Server
 			SPFValidationResult = validationResult;
 			DeliverTo = new List<string>();
 			AuthenticatedUser = null;
-			RawBody = string.Empty;
+			Body = new MessageBody();
 		}
 
 		/// <summary>
@@ -50,9 +50,67 @@ namespace CSharp_SMTP_Server
 		public readonly bool IsNullReversePath;
 
 		/// <summary>
-		/// Raw message body
+		/// The message body, as a stream-backed store.
 		/// </summary>
-		public string RawBody;
+		/// <remarks>
+		/// Owned by the transaction: a clone shares this instance rather than copying the bytes, and
+		/// the server disposes it once delivery has been acknowledged.
+		/// </remarks>
+		internal MessageBody Body;
+
+		/// <summary>
+		/// Opens a forward-only stream over the raw message — the server's prepended headers followed
+		/// by the body as it arrived on the wire.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// This is the allocation-free way to consume a message, and the one a delivery handler should
+		/// prefer: a handler that persists the message to disk or to object storage can copy this
+		/// stream straight to its destination without the message ever existing as a .NET string.
+		/// </para>
+		/// <para>
+		/// The returned stream must be disposed, and is valid only for the duration of the
+		/// <see cref="Interfaces.IMailDelivery.EmailReceivedAsync"/> call — the transaction's storage
+		/// (including its temp file, for a large message) is released once that returns.
+		/// </para>
+		/// </remarks>
+		/// <returns>A readable stream positioned at the start of the message.</returns>
+		public Stream GetBodyStream() => Body.OpenRead();
+
+		/// <summary>
+		/// Length of the raw message in bytes, headers included.
+		/// </summary>
+		/// <remarks>
+		/// Available without materializing the message, unlike <c>RawBody.Length</c> — and a byte
+		/// count rather than a character count.
+		/// </remarks>
+		public long BodyLength => Body.Length;
+
+		/// <summary>
+		/// Raw message body, as text.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Materializes the entire message in memory as UTF-16 — two bytes per character — on every
+		/// read, and is the property that made a 150 MB message cost gigabytes. Kept for compatibility
+		/// and for small messages, where it is harmless; use <see cref="GetBodyStream"/> for anything
+		/// that may be large.
+		/// </para>
+		/// <para>
+		/// Assigning to it replaces the body wholesale, discarding anything accumulated so far.
+		/// </para>
+		/// </remarks>
+		public string RawBody
+		{
+			get => Body.ReadAsString();
+
+			set
+			{
+				Body.Dispose();
+				Body = new MessageBody(value ?? string.Empty);
+				_parsedMessage = null;
+			}
+		}
 
 		/// <summary>
 		/// Subject of the message
@@ -118,12 +176,29 @@ namespace CSharp_SMTP_Server
 			{
 				if (_parsedMessage != null) return _parsedMessage;
 
-				_parsedMessage = MimeMessage.Load(new MemoryStream(Encoding.UTF8.GetBytes(RawBody)));
+				// Loaded from the body stream rather than from RawBody: MimeKit is stream-native, so
+				// this parses without the message first existing as a UTF-16 string and then being
+				// re-encoded back to bytes — two full copies the old path paid on every first access.
+				using (var stream = Body.OpenRead())
+					_parsedMessage = MimeMessage.Load(stream);
+
 				return _parsedMessage;
 			}
 		}
 
-		private MimeMessage? _parsedMessage;
+		/// <summary>
+		/// The parsed message, if one has been produced, held on the body rather than on this instance.
+		/// </summary>
+		/// <remarks>
+		/// A clone shares the body, so putting the cache there is what lets the clone reuse the
+		/// original's parsed instance — the documented <c>Clone()</c> behaviour — without <c>Clone()</c>
+		/// having to force a parse of every message on its way to delivery.
+		/// </remarks>
+		private MimeMessage? _parsedMessage
+		{
+			get => Body.ParsedMessageCache;
+			set => Body.ParsedMessageCache = value;
+		}
 
 		/// <summary>
 		/// Endpoint of the client/server sending the message
@@ -162,23 +237,39 @@ namespace CSharp_SMTP_Server
 		/// <param name="value">Header value</param>
 		public void AddHeader(string name, string value)
 		{
-			RawBody = $"{name}: {value}\r\n{RawBody}";
-			ParsedMessage.Headers.Add(name, value);
+			// Recorded on the body rather than written into it: prepending to a 150 MB message by
+			// rewriting it is exactly the copy the streaming path exists to avoid. The header is
+			// spliced in ahead of the body when the body is read.
+			Body.PrependHeader(name, value);
+
+			// Only an ALREADY-parsed message is updated. Reading ParsedMessage here would parse the
+			// body for the sole purpose of adding a header to it, and when the parse instead happens
+			// after this call it picks the header up from the body on its own — adding it here too is
+			// what made the header appear twice in ParsedMessage while RawBody had one (bug B2).
+			_parsedMessage?.Headers.Add(name, value);
 		}
 
 		/// <inheritdoc />
 		public object Clone()
 		{
-			return new MailTransaction(From, FromDomain, SPFValidationResult, IsNullReversePath)
+			// The body is SHARED, not copied: duplicating it is a second full copy of the message, which
+			// for a 150 MB journal report was the single largest allocation on the delivery path.
+			var clone = new MailTransaction(From, FromDomain, SPFValidationResult, IsNullReversePath)
 			{
 				AuthenticatedUser = AuthenticatedUser,
-				RawBody = RawBody,
-				_parsedMessage = ParsedMessage,
 				RemoteEndPoint = RemoteEndPoint,
 				DeliverTo = new List<string>(DeliverTo),
 				Encryption = Encryption,
 				DMARCValidationResult = DMARCValidationResult
 			};
+
+			// The empty body the constructor made is discarded unread; it never spilled, so there is
+			// nothing to release. Sharing the body also shares the parsed-message cache that lives on
+			// it, which is how the clone reuses the original's MimeMessage instance — lazily, without
+			// either side being forced to parse.
+			clone.Body = Body;
+
+			return clone;
 		}
 	}
 }

@@ -16,7 +16,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			switch (command)
 			{
 				case "RSET":
-					processor.Transaction = null;
+					processor.DiscardTransaction();
 					await processor.WriteCode(250, "2.1.5", "Flushed");
 					break;
 
@@ -184,7 +184,6 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 						return;
 					}
 
-					processor.DataBuilder = new StringBuilder();
 					processor.Counter = 0;
 					processor.CaptureData = 1;
 					await processor.WriteCode(354);
@@ -201,12 +200,14 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 				if (dt == ".")
 				{
 					processor.CaptureData = 0;
-					processor.Transaction!.RawBody = processor.DataBuilder!.ToString();
 
 					if (processor.Server.Options.MessageCharactersLimit != 0 &&
 					    processor.Server.Options.MessageCharactersLimit < processor.Counter)
 					{
-						processor.Transaction = null;
+						// Disposing releases the body's temp file, if it spilled to one. Dropping the
+						// reference alone would leave the file until finalization — and an oversized
+						// message is precisely the case that has one.
+						processor.DiscardTransaction();
 						await processor.WriteCode(552, "5.4.3", "Message size exceeds the administrative limit.");
 						return;
 					}
@@ -240,6 +241,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 						// authenticated only the first member. Count .Mailboxes, which flattens groups.
 						if (processor.Transaction.ParsedMessage.From.Mailboxes.Count() > 1)
 						{
+							processor.DiscardTransaction();
 							await processor.WriteCode(554, "5.7.1", "Message must not contain more than one From header, message refused");
 							return;
 						}
@@ -253,6 +255,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 							if (dmarcValidation == ValidationResult.Fail)
 							{
+								processor.DiscardTransaction();
 								await processor.WriteCode(554, "5.7.1", "Delivery not authorized by DMARC, message refused");
 								return;
 							}
@@ -269,7 +272,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 						if (filterResult.Type != SmtpResultType.Success)
 						{
-							processor.Transaction = null;
+							processor.DiscardTransaction();
 							await processor.WriteCode(554,
 								filterResult.Type == SmtpResultType.PermanentFail ? "5.7.1" : "4.7.1",
 								string.IsNullOrWhiteSpace(filterResult.FailMessage)
@@ -279,6 +282,8 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 						}
 					}
 
+					// Clone() hands the body over rather than copying it, so the clone is now its sole
+					// owner and the processor's reference is cleared without disposing.
 					var delivery = (MailTransaction)processor.Transaction.Clone();
 					processor.Transaction = null;
 
@@ -293,16 +298,33 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 						await processor.WriteCode(451, "4.3.0", "Requested action aborted: local error in processing");
 						return;
 					}
+					finally
+					{
+						// Releases the body's temp file once the handler is done with it. In finally so a
+						// handler that throws — the 451/retry path, which is the one a backend outage
+						// takes — does not leak a file per message for as long as the outage lasts.
+						//
+						// This is why GetBodyStream() is documented as valid only for the duration of the
+						// call: a handler that stashes the transaction for later gets a disposed body.
+						delivery.Body.Dispose();
+					}
 
 					await processor.WriteCode((ushort)deliveryResult.StatusCode, deliveryResult.EnhancedStatus, deliveryResult.Message);
 					return;
 				}
 
 				processor.Counter += (ulong)dt.Length;
+
+				// Over-limit data is counted but not stored, so an oversized message costs the limit in
+				// memory rather than its own size — the property the 552-at-the-dot design relies on.
 				if (processor.Server.Options.MessageCharactersLimit == 0 ||
 				    processor.Server.Options.MessageCharactersLimit >= processor.Counter)
 				{
-					processor.DataBuilder!.AppendLine(dt);
+					// Written as UTF-8 bytes straight into the body store — a file, past the spill
+					// threshold — rather than accumulated in a StringBuilder that then has to be
+					// ToString()'d, cloned and re-encoded. CRLF is explicit: AppendLine emitted
+					// Environment.NewLine, so the stored message had bare LF on Linux.
+					processor.Transaction!.Body.WriteLine(dt);
 				}
 			}
 		}
