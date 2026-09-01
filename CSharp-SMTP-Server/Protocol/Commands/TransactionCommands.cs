@@ -190,6 +190,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					}
 
 					processor.Counter = 0;
+					processor.DataTruncated = false;
 					processor.CaptureData = 1;
 					await processor.WriteCode(354);
 					break;
@@ -240,6 +241,22 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 						// message is precisely the case that has one.
 						processor.DiscardTransaction();
 						await processor.WriteCode(552, "5.4.3", "Message size exceeds the administrative limit.");
+						return;
+					}
+
+					// A line exceeded BoundedLineReader.MaxLineLength and its tail was discarded, so the
+					// stored body is not the message that was sent. Refusing is the only honest answer:
+					// this path only ever saw the retained prefix, so both the stored bytes and the
+					// counted length understate the real message, and acknowledging it with 250 would
+					// deliver a silently truncated record. For a journaling relay that is worse than a
+					// refusal, because nothing downstream can tell the message was cut.
+					//
+					// 552 is the correct code — RFC 5321 §4.5.3.1.6 makes an over-long line a size
+					// condition, and it is the same permanent class as the limit check above.
+					if (processor.DataTruncated)
+					{
+						processor.DiscardTransaction();
+						await processor.WriteCode(552, "5.4.3", "Line length exceeds the administrative limit.");
 						return;
 					}
 

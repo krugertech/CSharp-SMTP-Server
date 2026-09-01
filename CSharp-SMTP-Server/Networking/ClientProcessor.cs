@@ -62,6 +62,26 @@ namespace CSharp_SMTP_Server.Networking
 		internal ulong Counter;
 
 		/// <summary>
+		/// Whether any line of the current message exceeded <see cref="BoundedLineReader.MaxLineLength"/>
+		/// and had its tail discarded.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// The reader truncates an over-long line to bound memory against a client that never sends a
+		/// terminator, and reports it through <see cref="BoundedLineReader.LastLineTruncated"/>. That
+		/// signal has to be acted on: <c>ProcessData</c> only ever sees the retained prefix, so it
+		/// counts the prefix against <see cref="ServerOptions.MessageCharactersLimit"/> and stores the
+		/// prefix. Left unconsumed, a 5 MB DATA line was silently delivered as its first 1 MB with a
+		/// <c>250</c> — an acknowledged, corrupted message, which for a journaling relay is worse than
+		/// a refusal because nothing signals the loss.
+		/// </para>
+		/// <para>
+		/// Reset when DATA capture begins, and cleared with the transaction.
+		/// </para>
+		/// </remarks>
+		internal bool DataTruncated;
+
+		/// <summary>
 		/// Ends the current transaction, releasing the storage its body holds.
 		/// </summary>
 		/// <remarks>
@@ -278,6 +298,12 @@ namespace CSharp_SMTP_Server.Networking
 
 						if (line == null)
 							continue;
+
+						// Latch truncation for the whole message: the tail of an over-long line has been
+						// discarded, so the body can no longer be stored intact and the transaction is
+						// refused at the terminating dot rather than acknowledged as good.
+						if (_reader.LastLineTruncated)
+							DataTruncated = true;
 
 						if (_greetSent)
 							await TransactionCommands.ProcessData(this, line.Value.Buffer, line.Value.Length);

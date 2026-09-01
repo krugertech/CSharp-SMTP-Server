@@ -519,6 +519,114 @@ public sealed class Office365RelayTests
         Assert.StartsWith("250", await session.ReadLineAsync());
     }
 
+    /// <summary>
+    /// A DATA line longer than the reader's line cap is refused with 552, not silently truncated and
+    /// acknowledged.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="BoundedLineReader"/> truncates an over-long line to bound memory against a client
+    /// that never sends a terminator, and reports it via <c>LastLineTruncated</c>. That signal was set
+    /// but never consumed, so <c>ProcessData</c> saw only the retained prefix: it stored the prefix and
+    /// counted the prefix against the size limit. A 3 MB line was therefore delivered as its first
+    /// 1 MB with a <c>250</c> — an acknowledged, silently corrupted record.
+    /// </para>
+    /// <para>
+    /// The message limit here is deliberately set ABOVE the whole payload, so nothing but the line cap
+    /// can produce the refusal. Without the fix this test sees <c>250</c> and a short body.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task OverlongLine_IsRefused_NotSilentlyTruncated()
+    {
+        var delivery = new RecordingDelivery();
+        var port = TestPorts.Allocate();
+
+        var options = TestServers.DefaultOptions();
+        // Far above the payload below, so the size limit cannot be what rejects it.
+        options.MessageCharactersLimit = 64u * 1024 * 1024;
+
+        using var server = new SMTPServer(
+            new[] { new ListeningParameters(IPAddress.Loopback, new[] { port }, null) },
+            options, delivery);
+        server.Start();
+
+        await using var session = await OpenAsync(port, TimeSpan.FromMinutes(2));
+
+        await session.Send("MAIL FROM:<a@example.com>");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+        await session.Send("RCPT TO:<archive@journal.local>");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+        await session.Send("DATA");
+        Assert.StartsWith("354", await session.ReadLineAsync());
+
+        await session.Send("Subject: overlong line");
+        await session.Send("");
+
+        // One line of 3x the cap: truncated to 1 MB by the reader, so 2 MB would vanish silently.
+        await session.Send(new string('X', BoundedLineReader.MaxLineLength * 3));
+        await session.Send(".");
+
+        Assert.Equal("552 5.4.3 Line length exceeds the administrative limit.", await session.ReadLineAsync());
+        Assert.Empty(delivery.Delivered);
+
+        // Refusing the message must not drop the connection.
+        await session.Send("NOOP");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+    }
+
+    /// <summary>
+    /// The truncation flag does not leak from a refused message into the next one on the same
+    /// connection.
+    /// </summary>
+    /// <remarks>
+    /// The flag is latched for a whole message, so it has to be cleared when the next DATA begins —
+    /// otherwise one over-long line would poison every subsequent message on that connection, turning
+    /// a single bad message into a silently broken session.
+    /// </remarks>
+    [Fact]
+    public async Task OverlongLine_DoesNotPoisonTheNextMessage()
+    {
+        var delivery = new RecordingDelivery();
+        var port = TestPorts.Allocate();
+
+        var options = TestServers.DefaultOptions();
+        options.MessageCharactersLimit = 64u * 1024 * 1024;
+
+        using var server = new SMTPServer(
+            new[] { new ListeningParameters(IPAddress.Loopback, new[] { port }, null) },
+            options, delivery);
+        server.Start();
+
+        await using var session = await OpenAsync(port, TimeSpan.FromMinutes(2));
+
+        // First message: refused for an over-long line.
+        await session.Send("MAIL FROM:<a@example.com>");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+        await session.Send("RCPT TO:<archive@journal.local>");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+        await session.Send("DATA");
+        Assert.StartsWith("354", await session.ReadLineAsync());
+        await session.Send(new string('X', BoundedLineReader.MaxLineLength * 2));
+        await session.Send(".");
+        Assert.StartsWith("552", await session.ReadLineAsync());
+
+        // Second message on the same connection: ordinary, and must be accepted.
+        await session.Send("MAIL FROM:<a@example.com>");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+        await session.Send("RCPT TO:<archive@journal.local>");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+        await session.Send("DATA");
+        Assert.StartsWith("354", await session.ReadLineAsync());
+        await session.Send("Subject: ordinary");
+        await session.Send("");
+        await session.Send("body");
+        await session.Send(".");
+        Assert.StartsWith("250", await session.ReadLineAsync());
+
+        Assert.Single(delivery.Delivered);
+    }
+
     // ── envelope shapes Office 365 actually sends ─────────────────────────────────────────────
 
     /// <summary>
