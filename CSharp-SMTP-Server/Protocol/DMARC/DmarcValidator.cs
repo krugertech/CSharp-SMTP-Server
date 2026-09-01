@@ -184,37 +184,49 @@ public class DmarcValidator
 			else if (record.Contains(";p=quarantine", StringComparison.OrdinalIgnoreCase)) action = DmarcResult.Quarantine;
 		}
 
-		// A null reverse-path (every DSN/bounce) has no MAIL FROM identity, and DMARC aligns the MAIL
-		// FROM identity specifically: RFC 7489 §4.1 says "DMARC uses the result of SPF authentication
-		// of the MAIL FROM identity", and for the null case defers to RFC 7208 §2.4 rather than
-		// defining a DMARC behaviour of its own. §2.4 substitutes postmaster@<HELO domain> for the
-		// SPF CHECK — which this server now performs, see TransactionCommands — but that is an SPF
-		// identity, not a DMARC one, and nothing in RFC 7489 authorizes aligning it against
-		// RFC5322.From.
+		// The domain to align against RFC5322.From.
 		//
-		// Aligning it anyway would destroy ordinary bounces. A bouncing MTA's HELO name is its own
-		// hostname (mail-out-3.provider.example) and routinely differs from the From domain of the
-		// notification it carries; requiring the two to align refuses a legitimate DSN from the very
-		// domain that published p=reject. That is the permanent, unrecoverable loss this deployment
-		// exists to prevent, and it is pinned by
-		// NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered.
+		// For an ordinary message that is the envelope sender's domain. For a null reverse-path (every
+		// DSN/bounce) there is no MAIL FROM identity, and RFC 7489 §3.1.2 covers this case explicitly:
 		//
-		// ── KNOWN LIMITATION, deliberate ─────────────────────────────────────────────────────────
-		// So a null-sender message is still not DMARC-enforced: an unauthenticated client can send
-		// MAIL FROM:<> with a spoofed "From: ceo@victim.example" under victim.example's p=reject and
-		// be accepted. Closing that needs an aligned identity DMARC actually recognizes, which means
-		// DKIM — not implemented here. The SPF §2.4 check now constrains WHO may send a null path
-		// (a HELO domain publishing -all is enforced), but it cannot say anything about the From
-		// header, so it narrows the gap without closing it. Anyone enabling ValidateDMARC should know
-		// that null senders remain unauthenticated in the DMARC sense.
-		if (transaction.IsNullReversePath)
+		//     "Note that the RFC5321.HELO identity is not typically used in the context of DMARC
+		//      (except when required to "fake" an otherwise null reverse-path), even though a
+		//      "pure SPF" implementation according to [SPF] would check that identifier."
+		//
+		// The parenthetical IS the null-path case, so the HELO domain is the identity to align — which
+		// is also the identity RFC 7208 §2.4 has SPF check (as postmaster@<HELO domain>), so the two
+		// specifications agree on which name is being authenticated.
+		var envelopeDomain = transaction.IsNullReversePath ? transaction.HeloDomain : transaction.FromDomain;
+
+		// Alignment is only meaningful over an identity SPF actually AUTHENTICATED. DMARC is built on
+		// the *result* of SPF authentication (RFC 7489 §4.1), not on a name the client asserted: a
+		// HELO domain is attacker-controlled text until SPF says the connecting IP may use it.
+		//
+		// This gate is what keeps the fix from destroying ordinary bounces. A bouncing MTA greets with
+		// its own hostname (mail-out-3.provider.example), which routinely differs from the From domain
+		// of the notification it carries, so a bare string comparison refuses legitimate DSNs from the
+		// very domain that published p=reject — the permanent, unrecoverable loss this deployment
+		// exists to prevent. With SPF disabled, no record, or a DNS temperror there is no authenticated
+		// identity at all, so the correct DMARC answer is "no determination" (None) and the message is
+		// delivered.
+		//
+		// The spoofing case is still caught: an attacker sending MAIL FROM:<> with a spoofed
+		// "From: ceo@victim.example" either fails SPF on its own HELO domain (refused at MAIL FROM), or
+		// passes SPF for a domain that is not victim.example — which then fails to align here and is
+		// refused under p=reject.
+		if (transaction.IsNullReversePath && transaction.SPFValidationResult != ValidationResult.Pass)
 			return ValidationResult.None;
 
-		bool isAligned = fromDomain.Equals(transaction.FromDomain, StringComparison.OrdinalIgnoreCase);
+		// No checkable identity — an address literal or a non-DNS HELO name, which cannot carry an SPF
+		// record and therefore cannot have been authenticated.
+		if (string.IsNullOrEmpty(envelopeDomain))
+			return ValidationResult.None;
+
+		bool isAligned = fromDomain.Equals(envelopeDomain, StringComparison.OrdinalIgnoreCase);
 
 		if (!isAligned && aspf == AlignmentMode.Relaxed)
 		{
-			var envelopeFromOrgDomain = GetOrganizationalDomain(transaction.FromDomain);
+			var envelopeFromOrgDomain = GetOrganizationalDomain(envelopeDomain);
 			isAligned = fromOrgDomain.Equals(envelopeFromOrgDomain, StringComparison.OrdinalIgnoreCase);
 		}
 

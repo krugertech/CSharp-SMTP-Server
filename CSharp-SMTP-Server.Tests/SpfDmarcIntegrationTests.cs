@@ -249,36 +249,37 @@ public sealed class SpfDmarcIntegrationTests
     }
 
     /// <summary>
-    /// <b>Known limitation, deliberately pinned:</b> a null reverse-path is not DMARC-enforced, so a
-    /// spoofed From under <c>p=reject</c> is accepted rather than refused.
+    /// A null reverse-path carrying a spoofed From under <c>p=reject</c> is refused with 554.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This is the cost of the fix pinned by
-    /// <see cref="NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered"/>, and it survives
-    /// the RFC 7208 §2.4 work. That work retained the HELO identity and made SPF check it — see
-    /// <see cref="NullSender_HeloDomainFailsSpf_IsRefused"/> — which constrains WHO may send a null
-    /// path, but it does not close this: the §2.4 identity is an <i>SPF</i> identity, and RFC 7489
-    /// §4.1 has DMARC align "the MAIL FROM identity", which a null path does not have. Aligning the
-    /// HELO domain against RFC5322.From anyway would refuse ordinary bounces, whose sending MTA
-    /// greets with its own hostname rather than the From domain of the notification it carries.
+    /// RFC 7489 §3.1.2 names the HELO identity as the one DMARC aligns "when required to 'fake' an
+    /// otherwise null reverse-path", and RFC 7208 §2.4 has SPF authenticate that same name as
+    /// <c>postmaster@&lt;HELO domain&gt;</c> — so the two specifications agree on which identity is
+    /// under test, and this closes the spoofing gap that was previously pinned as a known limitation.
     /// </para>
     /// <para>
-    /// Closing it properly therefore needs DKIM — an aligned identity DMARC recognizes — which is not
-    /// implemented here. Delivering remains the correct side to err on: for a journaling relay a
-    /// wrongly rejected report is an unrecoverable compliance record, while DMARC is off entirely.
-    /// This test exists so the gap stays visible; when DKIM lands it <b>should fail</b> and be
-    /// inverted to assert 554.
+    /// Alignment is gated on an SPF <b>Pass</b>: a HELO domain is attacker-controlled text until SPF
+    /// says the connecting IP may use it, and without an authenticated identity the DMARC answer is
+    /// None rather than Fail. That gate is what keeps legitimate bounces alive — see
+    /// <see cref="NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered"/>, where SPF is off
+    /// and the message is delivered rather than destroyed.
     /// </para>
     /// </remarks>
     [Fact]
-    public async Task NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation()
+    public async Task NullSender_WithSpoofedFrom_UnderDmarcReject_IsRefused()
     {
         using var stub = new DnsStub();
         using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
         stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+        // The attacker's own HELO domain passes SPF — it authorizes the connecting IP. That is the
+        // case that matters: SPF authenticates "attacker.example", which then fails to ALIGN with the
+        // spoofed From domain "victim.example", and p=reject applies.
+        stub.AddTxt("attacker.example", "v=spf1 ip4:127.0.0.1 -all");
 
-        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        var (s, server, delivery) = await ConnectReadyAsync(
+            stub, http.Url, validateSpf: true, validateDmarc: true, helo: "attacker.example");
+
         using (server)
         await using (s)
         {
@@ -294,10 +295,49 @@ public sealed class SpfDmarcIntegrationTests
             await s.Send("Please action immediately.");
             await s.Send(".");
 
-            // Not refused: no authenticated identity exists for a null path, so DMARC returns None.
+            Assert.Equal("554 5.7.1 Delivery not authorized by DMARC, message refused", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
+        }
+    }
+
+    /// <summary>
+    /// A null sender whose HELO identity SPF actually authenticates, and which aligns with the From
+    /// header, passes DMARC.
+    /// </summary>
+    /// <remarks>
+    /// The positive half of the rule above: alignment is evaluated against the HELO domain (RFC 7489
+    /// §3.1.2's "fake" identity for an otherwise null reverse-path), so a bounce genuinely emitted by
+    /// the domain it claims is authenticated rather than merely tolerated.
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_HeloAlignedAndSpfPass_UnderDmarcReject_IsDelivered()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.example.com", "v=DMARC1; p=reject");
+        stub.AddTxt("mail.example.com", "v=spf1 ip4:127.0.0.1 -all");
+
+        var (s, server, delivery) = await ConnectReadyAsync(
+            stub, http.Url, validateSpf: true, validateDmarc: true, helo: "mail.example.com");
+
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("From: postmaster@example.com");
+            await s.Send("Subject: Undeliverable: quarterly report");
+            await s.Send("");
+            await s.Send("Your message could not be delivered.");
+            await s.Send(".");
+
             Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
             var tx = Assert.Single(delivery.Delivered);
-            Assert.Equal(ValidationResult.None, tx.DMARCValidationResult);
+            Assert.Equal(ValidationResult.Pass, tx.DMARCValidationResult);
         }
     }
 
