@@ -7,7 +7,7 @@ using System.Threading;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Shared raw-TCP SMTP client session for integration tests (TEST_PLAN.md §1.2).
+/// Shared raw-TCP SMTP client session for integration tests. See TESTING.md.
 /// Wraps connect / send / read-line / multi-line-response with a default 10 s timeout so a
 /// non-responsive server fails the test instead of hanging the suite.
 /// </summary>

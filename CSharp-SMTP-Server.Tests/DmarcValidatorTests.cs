@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol.DMARC;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Phase 4 (TEST_PLAN.md §7): DmarcValidator.ValidateTransaction against a local UDP DNS stub (§1.5)
+/// DmarcValidator.ValidateTransaction coverage against the local UDP DnsStub; see TESTING.md.
 /// with the Public Suffix List served from loopback HTTP — no internet. A real SMTPServer is used so
 /// the validator's constructor downloads the list exactly like production.
 ///

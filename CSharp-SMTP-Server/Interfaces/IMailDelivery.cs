@@ -15,7 +15,11 @@ namespace CSharp_SMTP_Server.Interfaces
 		/// <see cref="SmtpDeliveryResult.PermanentFailure"/> to reject the message; throw to cause a 451 response.
 		/// </summary>
 		/// <param name="transaction">The completed mail transaction.</param>
-		/// <param name="cancellationToken">Cancellation token tied to the client connection.</param>
+		/// <param name="cancellationToken">
+		/// Cancelled when the server tears down the client connection. A remote disconnect is not
+		/// independently observed while this handler is running, so consumers should also enforce any
+		/// required delivery timeout.
+		/// </param>
 		Task<SmtpDeliveryResult> EmailReceivedAsync(MailTransaction transaction, CancellationToken cancellationToken = default);
 
 		/// <summary>

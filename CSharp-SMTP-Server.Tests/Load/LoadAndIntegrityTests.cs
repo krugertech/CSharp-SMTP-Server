@@ -189,14 +189,11 @@ public sealed class LoadAndIntegrityTests
     }
 
     /// <summary>
-    /// Pins REVIEW.md Q1: the server implements no dot-unstuffing (RFC 5321 §4.5.2), so a body line
-    /// beginning with '.' is altered in transit.
+    /// Guards the Q1 fix: RFC 5321 dot-stuffing is removed before the body reaches delivery.
     /// </summary>
     /// <remarks>
-    /// This is an existing known defect, documented here rather than left to surface as intermittent
-    /// "corruption" in load runs. The load corpus avoids leading-dot lines for exactly this reason.
-    /// When Q1 is fixed, this test's assertion inverts — and that is the point: it will fail loudly
-    /// and mark the behavior change.
+    /// The load corpus still avoids leading-dot lines so this focused test remains the exact regression
+    /// guard for the transport transformation.
     /// </remarks>
     [Fact]
     public async Task DotStuffing_IsUnstuffed_Q1Fixed()

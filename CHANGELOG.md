@@ -1,8 +1,11 @@
 # Changelog
 
-All notable changes to this fork are documented here. This fork tracks
-[zabszk/CSharp-SMTP-Server](https://github.com/zabszk/CSharp-SMTP-Server); see `ARCHITECTURE.md` §9 for
-the upstream sync record.
+All notable changes to this fork are documented here. The current design is described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md), and unresolved work is tracked in
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md). This fork is based on
+[zabszk/CSharp-SMTP-Server](https://github.com/zabszk/CSharp-SMTP-Server) v1.1.6; upstream merge and
+skip decisions are retained in the architecture's
+[sync record](ARCHITECTURE.md#upstream-sync-record).
 
 ## [2.0.0-krugertech.1]
 
@@ -101,24 +104,11 @@ the upstream sync record.
   `From` and `FromDomain` as **empty strings** (not null).
   **Consumers must expect this**: an `IMailFilter` or `IMailDelivery` that assumes a non-empty
   sender — a `.Split('@')[1]`, a domain-allowlist lookup — will now see `""` on these messages.
-  SPF is skipped for the null path (no envelope domain to query), so `SPFValidationResult` is
-  `CheckDisabled` and no `Authentication-Results: ... spf=` header is added. **DMARC returns `None`
-  for a null path** rather than evaluating alignment: with no envelope identity and no DKIM support,
-  RFC 7489 §3.1 has nothing to align, and treating an absent identity as a mismatched one made a
-  `p=reject` policy permanently destroy legitimate bounces from the very domain that published it.
-
-  **Known limitation — a null sender is not authenticated in either direction.** RFC 7208 §2.4
-  defines the null-path MAIL FROM identity as `postmaster@<HELO domain>`, but the EHLO/HELO argument
-  is discarded (only `_protocolVersion` is kept), and DKIM is not implemented. Consequently an
-  unauthenticated client can send `MAIL FROM:<>` with a spoofed `From:` under the victim domain's
-  `p=reject` and be accepted. The server cannot tell that from a genuine bounce.
-
-  This is a deliberate trade, not an oversight: the alternative — applying the policy — destroys
-  legitimate bounces from `p=reject` domains, which for a journaling relay is unrecoverable loss of a
-  compliance record. It is also unreachable in that deployment, where DMARC is off entirely. Closing
-  it properly means retaining the HELO identity and running the §2.4 check. Pinned as a known
-  limitation by `NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation`, which
-  should be inverted to assert `554` when that lands.
+  For validation, RFC 7208 §2.4 makes the DNS-form EHLO/HELO name the SPF identity when the path is
+  null. That identity is retained in the new `MailTransaction.HeloDomain`, SPF-checked, and used for
+  DMARC alignment only after an SPF `Pass`. A spoofed null-path message under an aligned `p=reject`
+  policy is therefore refused, while a message with no authenticated HELO identity yields DMARC
+  `None`. The full validation behavior and new rejection paths are described under **Fixed** below.
 
   The reverse-path parser is now **anchored**: the path is the first bracket pair, and an argument
   that hides a real address behind an empty pair — `MAIL FROM:AUTH=<> <ceo@victim.example>`,
@@ -265,10 +255,11 @@ is the barrier.
   than discovering it only after transmitting a whole message.
 
   The advertised value is `MessageCharactersLimit` unchanged, which is already a safe understatement:
-  the DATA counter adds each line's characters *after* CRLF is stripped, so
-  `octets = sum(line bytes) + 2 * lines >= counted characters` for every message. CRLF, UTF-8
-  multibyte and dot-stuffing all push octets up relative to characters, never down, so a message the
-  character limit accepts can never exceed that many octets. A limit of `0` advertises `SIZE 0`,
+  the DATA counter adds each line's stored bytes *after* CRLF is stripped and dot-stuffing is undone,
+  so `wire octets >= counted bytes` for every message. A message whose RFC 1870 wire size is at most
+  the advertised value therefore cannot exceed the stored-byte limit; the server may accept a
+  somewhat larger wire message because CRLF and stuffing bytes are excluded. A limit of `0`
+  advertises `SIZE 0`,
   which RFC 1870 §6 independently defines as "no fixed maximum"; finite limits are never rounded down
   into it.
 
@@ -281,5 +272,5 @@ is the barrier.
   prefix changed from `250 ` to `250-`.
 
 - `SMTPServer.VersionString` and `AssemblyVersionString` had drifted behind the published
-  `PackageVersion` (`1.1.6-krugertech.1` vs `1.1.6-krugertech.3`). All three now move together at
-  `1.2.0`.
+  `PackageVersion` (`1.1.6-krugertech.1` vs `1.1.6-krugertech.3`). They now move together:
+  package/informational version `2.0.0-krugertech.1`, assembly version `2.0.0.0`.

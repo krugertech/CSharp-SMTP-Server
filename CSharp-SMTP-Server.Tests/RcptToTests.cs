@@ -2,7 +2,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.5 — RCPT TO sequencing, UserExistsCodes wire mapping, limits, CanDeliver.</summary>
+/// <summary>RCPT TO sequencing, UserExistsCodes wire mapping, limits, and CanDeliver. See TESTING.md.</summary>
 public sealed class RcptToTests
 {
     private static async Task<(SmtpSession S, SMTPServer Server, RecordingDelivery Delivery)> ConnectWithMailFromAsync(
@@ -41,7 +41,7 @@ public sealed class RcptToTests
     [Fact]
     public async Task RcptTo_InvalidAddress_ReturnsBare501_NoEnhancedStatus()
     {
-        // Pin Q5 (TEST_PLAN.md §2): unlike every other error response, the RCPT syntax error is a
+        // Pin Q5 (KNOWN_ISSUES.md): unlike every other error response, the RCPT syntax error is a
         // bare 501 with table text but NO enhanced status code.
         var (s, server, _) = await ConnectWithMailFromAsync();
         using (server)

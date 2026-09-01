@@ -5,9 +5,8 @@ using CSharp_SMTP_Server.Protocol;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Phase 1 (§3.3): unit tests for MailTransaction — MimeKit-backed parsing, AddHeader and Clone semantics.
-/// Includes pins for confirmed upstream bugs B1–B4 (see TEST_PLAN.md §2); those tests document current
-/// behavior on purpose and must be updated together with any fix.
+/// Unit tests for MailTransaction: MimeKit-backed parsing, AddHeader, streaming, and clone semantics.
+/// Historical B1-B4 cases are retained as regression tests; see CHANGELOG.md and TESTING.md.
 /// </summary>
 public sealed class MailTransactionTests
 {

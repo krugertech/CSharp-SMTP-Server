@@ -7,6 +7,13 @@
 
 Simple (receive-only) SMTP server library for C#.
 
+## Documentation
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — current runtime design and ownership model.
+- [`TESTING.md`](TESTING.md) — normal, load, and integrity test commands.
+- [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) — open work, accepted risks, and protocol quirks.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history and compatibility notes.
+
 ---
 
 ## What is ACK gating and why does it matter?
@@ -33,7 +40,9 @@ This makes the SMTP `250 OK` a true durability guarantee: the sending MTA will n
 | Delivery runs in the background | Server blocks the SMTP session until delivery completes |
 | Exception in handler is silently swallowed | Exception produces `451`; sending MTA will retry |
 
-You must rename and update the signature of your `EmailReceived` implementation. No other interface changes are required.
+You must rename and update the signature of your `EmailReceived` implementation. Version 2 also
+changes message-body lifetime and the address getter results; read [`CHANGELOG.md`](CHANGELOG.md)
+before upgrading an existing consumer.
 
 ---
 
@@ -41,10 +50,13 @@ You must rename and update the signature of your `EmailReceived` implementation.
 * TLS and STARTTLS
 * AUTH LOGIN and AUTH PLAIN
 * ACK-gated delivery (this fork)
+* Stream-backed DATA storage with bounded line buffering
+* RFC 1870 `SIZE` advertisement and RFC 5321 dot-unstuffing
 
 ## Compatible with
 * RFC 822 (STANDARD FOR THE FORMAT OF ARPA INTERNET TEXT MESSAGES)
 * RFC 1869 (SMTP Service Extensions)
+* RFC 1870 (SMTP Service Extension for Message Size Declaration)
 * RFC 2554 (SMTP Service Extension for Authentication)
 * RFC 3463 (Enhanced Mail System Status Codes)
 * RFC 4616 (The PLAIN Simple Authentication and Security Layer (SASL) Mechanism)
@@ -133,6 +145,29 @@ class DeliveryInterface : IMailDelivery
 }
 ```
 
+### Reading the message body
+
+Prefer `MailTransaction.GetBodyStream()` when persisting a message:
+
+```cs
+public async Task<SmtpDeliveryResult> EmailReceivedAsync(
+    MailTransaction transaction,
+    CancellationToken cancellationToken = default)
+{
+    await using var source = transaction.GetBodyStream();
+    await using var destination = File.Create(GetArchivePath(transaction));
+    await source.CopyToAsync(destination, cancellationToken);
+    await destination.FlushAsync(cancellationToken);
+
+    return SmtpDeliveryResult.Ok();
+}
+```
+
+`BodyLength` returns the stored byte count without reading the body. `RawBody` remains available for
+compatibility, but it materializes the entire message as a UTF-16 string on every read. Body streams
+and parsed-message access are valid only during `EmailReceivedAsync`; large bodies may live in a
+temporary file that is released when the handler returns.
+
 ### Logger interface
 
 ```cs
@@ -198,7 +233,49 @@ class FilterInterface : IMailFilter
 
 ---
 
-## 3rd party services and libraries
+## Office 365 journaling relay profile
+
+Journal reports are compliance records. A permanent SMTP rejection can destroy the only remaining
+copy, while an unlimited internet-facing receiver is also unsafe. Use a finite limit above the
+largest report Exchange Online can submit and disable sender authentication checks that do not
+describe the original journaled message:
+
+```cs
+var options = new ServerOptions(
+    validateSPF: false,
+    validateDMARC: false,
+    dnsServerEndpoint: null)
+{
+    ServerName = "journal.example.com",
+    MessageCharactersLimit = 200u * 1024 * 1024,
+    RecipientsLimit = 0,
+};
+```
+
+For this deployment:
+
+- Keep `MessageCharactersLimit` finite. `0` is unlimited; `200 MB` provides headroom above Exchange
+  Online's configurable maximum of 150 MB while still bounding storage. Externally routed messages
+  can have a lower effective limit because of transport encoding; see Microsoft's
+  [Exchange Online limits](https://learn.microsoft.com/en-us/office365/servicedescriptions/exchange-online-service-description/exchange-online-limits).
+  Despite the historical property name, the counter measures stored DATA bytes after dot-unstuffing
+  and excludes CRLF, so it is not the exact RFC 1870 wire-octet count.
+- `RecipientsLimit = 0` avoids rejecting a journal report for a large distribution list.
+- Leave SPF and DMARC disabled. The journal envelope identifies the journaling system rather than the
+  original sender, so those checks can reject a valid compliance record.
+- Do not install a rejecting `IMailFilter` on the journaling listener.
+- Return `TemporaryFailure` or throw when archive storage is unavailable. Never return `Ok` until the
+  record is durably stored.
+- Make storage idempotent. Current shutdown stops active sessions rather than draining them, so a
+  commit followed by a lost `250` can cause the sender to retry. See
+  [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#graceful-shutdown-and-duplicate-delivery).
+
+The heavy test tier validates 150 MB delivery, concurrent large messages, bounded memory behavior,
+and the relay-specific defaults; see [`TESTING.md`](TESTING.md#load-and-integrity-tests).
+
+---
+
+## Third-party services and libraries
 
 * By default this library uses Cloudflare Public DNS (1.1.1.1) for SPF and DMARC validation. The DNS endpoint can be changed or both validations disabled via `ServerOptions`.
 * By default this library downloads the Public Suffix List managed by the Mozilla Foundation from GitHub (licensed under MPL v2.0). The URL can be changed in `ServerOptions`. The list is not downloaded when `DnsServerEndpoint` is `null`.
@@ -207,6 +284,10 @@ class FilterInterface : IMailFilter
 ---
 
 ## Generating a PFX from PEM keys
+
+On Windows, a certificate returned directly by `CertificateRequest.CreateSelfSigned()` may use an
+ephemeral private key that SChannel cannot use for server TLS. Export and re-import it as PFX, or
+generate a PFX from PEM keys:
 
 ```
 openssl pkcs12 -export -in public.pem -inkey private.pem -out CertWithKey.pfx

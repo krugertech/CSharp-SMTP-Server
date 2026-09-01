@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.6 — DATA, message processing, size limits, Received header, dot-stuffing.</summary>
+/// <summary>DATA, message processing, size limits, Received header, and dot-stuffing. See TESTING.md.</summary>
 public sealed class DataAndMessageTests
 {
     private static async Task<(SmtpSession S, SMTPServer Server, RecordingDelivery Delivery)> ConnectReadyAsync(
@@ -141,7 +141,7 @@ public sealed class DataAndMessageTests
     [Fact]
     public async Task AuthenticatedReceivedHeader_OmitsFromPart()
     {
-        // Pin Q3 (TEST_PLAN.md §2): for authenticated users the Received header has no "from <ip>"
+        // Pin Q3 (KNOWN_ISSUES.md): for authenticated users the Received header has no "from <ip>"
         // part — just "by <server> with SMTP; …".
         var options = TestServers.DefaultOptions();
         options.RequireEncryptionForAuth = false; // allow AUTH over plaintext for this test

@@ -7,7 +7,7 @@ using Xunit;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.8 — TLS / STARTTLS behavior over loopback (Phase 3).</summary>
+/// <summary>TLS and STARTTLS behavior over loopback. See TESTING.md.</summary>
 public class TlsStartTlsTests
 {
     private static string B64(string value) => Convert.ToBase64String(Encoding.UTF8.GetBytes(value));

@@ -5,7 +5,7 @@ using System.Text;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Minimal UDP DNS stub for SPF/DMARC tests (TEST_PLAN.md §1.5). Answers TXT/A/AAAA/MX/PTR queries
+/// Minimal UDP DNS stub for SPF/DMARC tests (see TESTING.md). Answers TXT/A/AAAA/MX/PTR queries
 /// from in-memory tables on a loopback ephemeral port so SpfValidator / DmarcValidator can be tested
 /// deterministically without internet access. ServerOptions.DnsServerEndpoint points at it.
 ///

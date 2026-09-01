@@ -4,7 +4,7 @@ using CSharp_SMTP_Server.Networking;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.2 — EHLO/HELO responses, transaction reset, command-parsing edge cases.</summary>
+/// <summary>EHLO/HELO responses, transaction reset, and command-parsing edge cases. See TESTING.md.</summary>
 public sealed class EhloHeloTests
 {
     private static async Task<SmtpSession> ConnectGreetedAsync(ushort port)

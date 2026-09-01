@@ -4,7 +4,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §5 — ACK-gating additions beyond the original AckGatingTests.</summary>
+/// <summary>ACK-gating additions beyond the original AckGatingTests. See TESTING.md.</summary>
 public sealed class AckGatingAdditionsTests
 {
     private static async Task<(SmtpSession S, SMTPServer Server, ushort Port)> ConnectReadyAsync(

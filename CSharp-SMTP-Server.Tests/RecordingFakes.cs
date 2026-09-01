@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>IMailDelivery fake that records every delivered transaction (TEST_PLAN.md §4).</summary>
+/// <summary>IMailDelivery fake that records every delivered transaction. See TESTING.md.</summary>
 public sealed class RecordingDelivery : IMailDelivery
 {
     public List<MailTransaction> Delivered { get; } = new();
@@ -82,7 +82,7 @@ public sealed class ConfigurableFilter : IMailFilter
     public Task<SmtpResult> CanProcessTransaction(MailTransaction transaction) => Task.FromResult(ProcessTransaction);
 }
 
-/// <summary>ILogger fake capturing every error line (TEST_PLAN.md §5/§8).</summary>
+/// <summary>ILogger fake capturing every error line. See TESTING.md.</summary>
 public sealed class RecordingLogger : ILogger
 {
     private readonly List<string> _errors = new();

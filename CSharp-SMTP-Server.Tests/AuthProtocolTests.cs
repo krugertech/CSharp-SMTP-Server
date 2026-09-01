@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.7 — AUTH PLAIN / AUTH LOGIN protocol behavior (beyond the initial-response tests).</summary>
+/// <summary>AUTH PLAIN / AUTH LOGIN protocol behavior beyond the initial-response tests. See TESTING.md.</summary>
 public sealed class AuthProtocolTests
 {
     // base64("user") / base64("pass")

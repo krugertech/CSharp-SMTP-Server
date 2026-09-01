@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.1 — greeting format and the IsConnectionAllowed filter.</summary>
+/// <summary>Greeting format and the IsConnectionAllowed filter. See TESTING.md.</summary>
 public sealed class GreetingAndFilterTests
 {
     private sealed class RecordingFilter : IMailFilter

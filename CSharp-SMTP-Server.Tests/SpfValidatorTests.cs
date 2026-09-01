@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol.SPF;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Phase 4 (TEST_PLAN.md §6): SpfValidator.CheckHost against a local UDP DNS stub (§1.5) — no internet.
+/// SpfValidator.CheckHost against the local UDP DnsStub; no internet. See TESTING.md.
 /// The validator is constructed directly with the stub endpoint (no SMTP server needed).
 ///
 /// New quirks pinned here:

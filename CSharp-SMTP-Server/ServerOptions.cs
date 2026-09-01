@@ -29,7 +29,8 @@ namespace CSharp_SMTP_Server
 		public SslProtocols Protocols = SslProtocols.Tls12;
 
 		/// <summary>
-		/// Message characters limit.
+		/// Stored DATA byte limit after dot-unstuffing, excluding CRLF. The property name is retained
+		/// for compatibility.
 		/// Set to 0 to disable the limit.
 		/// Default: 10 485 760
 		/// </summary>

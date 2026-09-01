@@ -5,7 +5,7 @@ using CSharp_SMTP_Server.Protocol;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Phase 4 glue (TEST_PLAN.md §6/§7): SPF and DMARC validation wired through a full SMTP session —
+/// SPF and DMARC validation wired through a full SMTP session; see TESTING.md.
 /// the stub DNS server is pointed at via ServerOptions.DnsServerEndpoint, exactly like production.
 /// Verifies where in the protocol each check fires: SPF at MAIL FROM (554 5.7.23 on Fail), DMARC at
 /// DATA (554 5.7.1 on Fail), and the Authentication-Results headers added to delivered messages.

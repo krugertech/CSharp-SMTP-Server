@@ -5,7 +5,7 @@ using System.Security.Cryptography.X509Certificates;
 namespace CSharp_SMTP_Server.Tests;
 
 /// <summary>
-/// Generates an ephemeral self-signed certificate for TLS tests (TEST_PLAN.md §1.3). No checked-in
+/// Generates an ephemeral self-signed certificate for TLS tests (see TESTING.md). No checked-in
 /// pfx: the key is created in memory and dies with the test process.
 /// </summary>
 public static class TlsTestCerts

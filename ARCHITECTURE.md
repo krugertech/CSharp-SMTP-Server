@@ -1,336 +1,230 @@
-# Repository Understanding — Krugertech CSharp SMTP Server (fork of v1.1.6)
+# Architecture
 
-> Working notes for anyone picking up this repo. Verified against the source on 2026-07; build and tests confirmed passing at time of writing.
+This document describes the current design of the Krugertech CSharp SMTP Server fork. Release history
+and completed fixes are recorded in [`CHANGELOG.md`](CHANGELOG.md); unresolved behavior is tracked in
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
 
-## 1. What this is
+## Purpose
 
-A **receive-only SMTP server library for C#**. It is a fork of
-[zabszk/CSharp-SMTP-Server](https://github.com/zabszk/CSharp-SMTP-Server) v1.1.6 (released 23 Dec 2023),
-rebranded as **Krugertech CSharp SMTP Server** and published to NuGet as
-`Krugertech.CSharp-SMTP-Server` version `1.1.6-krugertech.3`.
+The project is a receive-only SMTP server library forked from
+[`zabszk/CSharp-SMTP-Server`](https://github.com/zabszk/CSharp-SMTP-Server) v1.1.6. Its defining
+behavior is ACK-gated delivery: the server awaits the application delivery handler and sends `250`
+only after that handler confirms durable acceptance.
 
-The fork exists for one reason: **ACK gating on the DATA command**. Upstream fires delivery in a
-background task and immediately returns `250 OK` (fire-and-forget). This fork *awaits* the delivery
-handler before sending any SMTP response, so `250 OK` is a true durability guarantee — the sending
-MTA keeps its copy until your handler says the message was safely accepted.
+The NuGet package is `Krugertech.CSharp-SMTP-Server`, currently version
+`2.0.0-krugertech.1`. The library targets `netstandard2.1`, `net6.0`, and `net7.0`.
 
-Not affiliated with or endorsed by the original author.
+## Solution layout
 
-## 2. Git history (12 commits)
-
-| Commit | Meaning |
-|---|---|
-| `2f7386e` Add project files. | Import of upstream v1.1.6 — **the baseline for all fork diffs** |
-| `50276ad` Implement ACK-gating for reliable SMTP delivery | The core feature |
-| `3a3dd1c` Rebrand to Krugertech CSharp SMTP Server | Package ID, authors, version strings |
-| `516702a` Update project metadata and license details | NuGet/LICENSE metadata |
-| `9dce319` Add support for enhanced SMTP status codes | RFC 3463 codes + `SmtpDeliveryResult.Status(...)` |
-| `221a2b5` Update package version to 1.1.6-krugertech.3 | Version bump |
-| `8fa02c8` Handled unhandled exceptions reported in #16 | **Cherry-pick from upstream** — IOException handling + write cancellation token (see §9) |
-| `7d0d50f` Support AUTH LOGIN initial response (RFC 4954)… | Adapted from upstream PR #17 — IIS SMTP relay compatibility (see §9) |
-| `274069a` Fix EHLO/HELO parsing of bracketed IPv6 literals | Upstream issue #18, fixed here (no upstream fix exists; see §9) |
-| `294adbe` Fix ClientProcessor ctor blocking the listener accept thread | Fork fix found during Phase 1 testing — when the greeting write completes synchronously (typical on Windows), `Init()` ran inline in the ctor and parked inside `Receive()`'s `EndOfStream` check, consuming the accept thread: a second concurrent client never got its 220. `Init` now runs on the thread pool; regression test `ConcurrentGreetingTests` |
-| `e8a241f` Add Phase 1 unit tests (TEST_PLAN.md §3 + §9): 107 new tests | Pure unit suite per `TEST_PLAN.md`; includes pins for confirmed upstream bugs B1–B4 in `MailTransaction` (see TEST_PLAN.md §2) |
-| `994eb07` Extract shared SmtpSession helper for integration tests (§1.2) | Test infrastructure — connect/send/read with 10 s timeouts, raw-byte send, RST abort; existing test files refactored onto it |
-| `4a4cb06` Add Phase 2 protocol matrix tests (TEST_PLAN.md §4.1–4.7): 86 new tests | Exact-wire assertions for every command group; pins quirks Q1/Q2/Q3/Q5/Q6 and the newly found **Q7** (two-arg `WriteCode(code, enhanced)` call sites bind to the `(int,string)` sanitizer overload — no table text on most responses) |
-| `df4636e` Fix Listener.ClientProcessors thread-safety; add §5/§8 tests | The documented TODO race was real: concurrent Add/Remove corrupted the list → NRE in `Dispose()` under load (deterministic repro via new `ConcurrencyStress` test); fixed with lock + snapshot-in-Dispose. Also pins **Q8**: delivery CancellationToken does not fire on client disconnect mid-delivery |
-| `7cb9fd9` Fix implicit-TLS handshake failure crashing the process; add Phase 3 TLS tests (§4.8) | Bug **B5**: on an implicit-TLS port any failed/aborted handshake (silent disconnect, cert rejection, plaintext probe) threw inside `async void Init()` and killed the whole process — now logged + connection dropped, guarded by three regression tests. Also pins Q9 (no per-line DATA ACKs) and Q10 (Windows SChannel rejects `CertificateRequest`-created certs; PFX round-trip required) |
-| `bb880f0` Add DnsStub UDP DNS fixture and Phase 4 SPF/DMARC tests (§6/§7): 56 new | Last plan phase — SpfValidator/DmarcValidator tested deterministically offline via a loopback UDP DNS stub (`DnsStub`). Pins Q11 (multi-string TXT responses silently dropped by zabszk.DnsClient), Q12 (SPF DNS error handling deviates from RFC 7208 in three ways) and Q13 (`redirect=` evaluated positionally); B1 end-to-end pin proves DMARC is inert for normal mail (None with zero DNS queries) |
-
-To see exactly what the fork changed: `git diff 2f7386e..HEAD`.
-
-## 3. Solution layout
-
-```
+```text
 CSharp-SMTP-Server.sln
-├── CSharp-SMTP-Server/            ← THE LIBRARY (NuGet package)
-│   ├── SMTPServer.cs              public entry point
-│   ├── ServerOptions.cs           configuration POCO
-│   ├── MailTransaction.cs         per-message object handed to your handler
-│   ├── Interfaces/                IMailDelivery, IAuthLogin, IMailFilter, ILogger
-│   ├── Networking/                Listener (accept loop), ClientProcessor (per-connection state machine)
-│   ├── Protocol/
-│   │   ├── Commands/              TransactionCommands.cs (MAIL/RCPT/DATA), AuthenticationCommands.cs (AUTH LOGIN/PLAIN)
-│   │   ├── Responses/             SmtpResult, SmtpDeliveryResult, UserExistsCodes
-│   │   ├── SPF/SpfValidator.cs    SPF via DNS TXT lookups
-│   │   ├── DMARC/                 DmarcValidator (+ Public Suffix List download), AlignmentMode, DmarcResult
-│   │   ├── SMTPCodes.cs           static code→text table for built-in responses
-│   │   └── ValidationResult.cs    enum: Pass/Softfail/Fail/UserAuthenticated/CheckDisabled…
-│   ├── Misc/Base64.cs             tiny Base64 helper (AUTH payloads)
-│   └── Properties/VersionInfo.cs  AssemblyVersion attributes (numeric-only "1.1.6.1")
-├── SampleApp/                     demo console app (net7.0, not packable)
-└── CSharp-SMTP-Server.Tests/      xUnit integration tests (net7.0)
+├── CSharp-SMTP-Server/
+│   ├── SMTPServer.cs              public server entry point
+│   ├── ServerOptions.cs           server configuration
+│   ├── MailTransaction.cs         transaction delivered to consumers
+│   ├── MessageBody.cs             stream-backed message storage
+│   ├── Interfaces/                delivery, authentication, filtering, logging
+│   ├── Networking/
+│   │   ├── Listener.cs            listener lifecycle and accept loop
+│   │   ├── ClientProcessor.cs     one SMTP state machine per connection
+│   │   └── BoundedLineReader.cs   bounded command/DATA line reader
+│   └── Protocol/
+│       ├── Commands/              SMTP transaction and authentication commands
+│       ├── Responses/             SMTP result and response types
+│       ├── SPF/                   SPF validation
+│       └── DMARC/                 DMARC and organizational-domain validation
+├── CSharp-SMTP-Server.Tests/      xUnit unit, protocol, load, and integrity tests
+└── SampleApp/                     demonstration console application
 ```
 
-**Library project facts:** multi-targets `netstandard2.1; net6.0; net7.0`, LangVersion 11,
-`Nullable enable`, packs on every build (`GeneratePackageOnBuild=true`). Dependencies:
-- **MimeKit 4.17.0** — MIME parsing of the message body
-- **zabszk.DnsClient 1.0.1** — DNS queries for SPF/DMARC
+The principal dependencies are MimeKit 4.17.0 for MIME parsing and `zabszk.DnsClient` 1.0.1 for
+SPF/DMARC DNS queries.
 
-## 4. Architecture & runtime flow
+## Runtime ownership
 
-```
-SMTPServer (public)
- └── Listener  (one per IP+port; dedicated OS thread runs TcpListener accept loop)
-      └── ClientProcessor  (one per TCP connection; async read loop = the SMTP state machine)
-           ├── ProcessResponse()   command dispatch switch
-           │    ├── TransactionCommands.ProcessCommand / .ProcessData
-           │    └── AuthenticationCommands.ProcessCommand / .ProcessData
-           └── WriteText / WriteCode → wire output (CR/LF-terminated, UTF-8)
+```text
+SMTPServer
+└── Listener                         one per configured IP/port
+    └── ClientProcessor              one per accepted TCP connection
+        ├── BoundedLineReader
+        ├── optional MailTransaction one active SMTP transaction
+        └── connection cancellation and stream state
 ```
 
-### Connection lifecycle (`ClientProcessor`)
+`SMTPServer` owns listeners and the TLS certificate. A `Listener` owns its accepted processors and
+runs a dedicated accept thread. A `ClientProcessor` owns the client socket, protocol state,
+per-connection SPF cache, and any active transaction.
 
-1. **Init**: if the listener is a TLS port and a certificate exists, wrap in `SslStream` +
-   `AuthenticateAsServerAsync`; otherwise send the greeting. Greeting first runs the optional
-   `IMailFilter.IsConnectionAllowed(EndPoint)` — non-success → `550 4.7.1/5.7.1` and disconnect.
-2. **Receive loop**: line-based (`BoundedLineReader.ReadLineAsync`, which caps a single line at 1 MB
-   so an unterminated flood cannot grow the buffer without bound). Exceptions are logged; after 3 fails
-   the connection is dropped. A per-connection `CancellationTokenSource` (exposed as
-   `ConnectionToken`) cancels on dispose — this token is passed into your delivery handler.
-3. **Command dispatch** (`ProcessResponse`):
-   - `EHLO` → protocol v2; multi-line 250 advertising `AUTH LOGIN PLAIN` (if auth set),
-     `STARTTLS` (if cert + not yet secure), `8BITMIME`. Resets any in-flight transaction.
-   - `HELO` → protocol v1, no extensions.
-   - `STARTTLS` → 220, upgrade stream to TLS mid-session (`ConnectionEncryption.StartTls`).
-   - `AUTH` → requires EHLO/HELO first (else 503); LOGIN is a two-step Base64 exchange
-     (`CaptureData` codes 2→3), PLAIN is one step (code 4) or inline credentials.
-   - `MAIL FROM` / `RCPT TO` / `DATA` / `RSET` → require protocol ≥ v1, else `503`.
-   - Unknown command → `502`; VRFY → `252` (stub); NOOP/HELP/QUIT are trivial.
+Disposing the server stops listeners and tears down active processors. Shutdown is safe against
+connections racing with disposal, but it is terminating rather than draining; see the graceful
+shutdown item in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#graceful-shutdown-and-duplicate-delivery).
 
-### Transaction flow (`TransactionCommands`)
+## Connection and command flow
 
-- **MAIL FROM**: parse `<addr>` (must contain exactly one `@`, a dot after it, non-empty).
-  Then in order: `IMailFilter.IsAllowedSender` → SPF check (skipped for authenticated users;
-  results cached per domain in `SpfResultsCache`; hard `Fail` → `554 5.7.23`) →
-  `IsAllowedSenderSpfVerified`. Success creates the `MailTransaction`, replies `250 2.0.0`.
-- **RCPT TO**: needs an open transaction; enforces `RecipientsLimit`; runs `CanDeliver` filter, then
-  `IMailDelivery.DoesUserExist(address)` whose six `UserExistsCodes` map to RFC 3463 codes
-  (5.1.1 bad mailbox, 5.1.2 bad system address, 5.1.4 ambiguous, 5.1.6 moved/no-forwarding,
-  5.1.8 bad sender syntax; default = accept). Accepted recipients accumulate in `DeliverTo`.
-- **DATA**: needs ≥1 recipient → `354`, then line capture until a lone `.`:
-  1. Enforce `MessageCharactersLimit` (default 10,485,760 chars) → else `552 5.4.3`.
-  2. Prepend `Received:` header; add `Authentication-Results:` for SPF when applicable.
-  3. If DMARC enabled: reject >1 From header (`554`), run `DmarcValidator.ValidateTransaction`
-     (hard Fail → `554 5.7.1`), record result in headers. Authenticated users skip the check.
-  4. Run `IMailFilter.CanProcessTransaction(transaction)` — non-success → `554 4.7.1/5.7.1`.
-  5. **Deliver (ACK-gated)**: clone the transaction, null out the processor's copy, then
-     `await Server.DeliverMessage(clone, ConnectionToken)`:
-     - handler returns `SmtpDeliveryResult` → its `(StatusCode, EnhancedStatus, Message)` is written verbatim;
-     - handler throws → logged + `451 4.3.0` (sender retries).
+1. The listener accepts a TCP client and registers its processor.
+2. The processor applies implicit TLS when configured, runs `IsConnectionAllowed`, and writes the
+   greeting.
+3. `BoundedLineReader` reads commands with a 1 MB maximum line length. It truncates and drains an
+   overlong line without allowing unbounded allocation.
+4. `ClientProcessor.ProcessResponse` dispatches commands to the transaction or authentication
+   command handlers.
+5. `EHLO` advertises the configured extensions, including `8BITMIME`, `SIZE`, optional AUTH, and
+   optional STARTTLS. A new EHLO/HELO resets any active transaction.
+6. `QUIT`, connection failure, `RSET`, a new greeting, policy rejection, and server shutdown all
+   release the active transaction through the same discard path.
 
-### Key objects
+The protocol is intentionally session-oriented. While delivery is running, that SMTP session waits;
+other connections continue on their own processors.
 
-- **`MailTransaction`** — what your handler receives: `From`, `FromDomain`, `DeliverTo[]`,
-  `GetBodyStream()` + `BodyLength` (the stream-native way to read the message — prefer these),
-  `RawBody` (compatibility property; materializes the whole message as UTF-16 on every read),
-  lazy `ParsedMessage` (MimeKit, parsed once and cached on the shared body store),
-  convenience accessors (`Subject`, `GetFrom/GetTo/GetCc/GetBcc`, `GetMessageBody()` = text or HTML body),
-  `RemoteEndPoint`, `AuthenticatedUser`, `Encryption`, `SPFValidationResult`, `DMARCValidationResult`,
-  `AddHeader(name, value)` (records the header on the body; it is spliced in ahead of the body when read).
-- **`MessageBody`** — the byte-backed store behind a transaction. In memory below ~4 MB, spills to a
-  `DeleteOnClose` temp file above it, so peak memory is O(buffer) rather than O(message). Shared, not
-  copied, by `Clone()`. A **spilled** body is released when the delivery handler returns; an in-memory
-  one is not, so small messages stay readable on a retained transaction.
-- **`ServerOptions`** — `ServerName`, `RequireEncryptionForAuth` (**default true**), TLS 1.2 only by default,
-  `MessageCharactersLimit` (0 = off), `RecipientsLimit` (0 = off), SPF/DMARC toggles (both default on;
-  enabling either without a DNS endpoint throws in the setter), `DnsServerEndpoint` (defaults to
-  Cloudflare `1.1.1.1:53` when SPF or DMARC is wanted), `PublicSuffixList` URL.
-- **`SmtpDeliveryResult`** — sealed; factories `Ok(msg?)`, `TemporaryFailure(msg?)`, `PermanentFailure(msg?)`,
-  and generic `Status(int code, string enhanced, string message)`. Constructor throws on CR/LF in
-  message or enhanced status (response-splitting guard).
+## SMTP transaction flow
 
-## 5. The fork's changes vs upstream (`git diff 2f7386e..HEAD`)
+### MAIL FROM
 
-1. **ACK gating** (the point of the fork):
-   - `IMailDelivery.EmailReceived(MailTransaction)` →
-     `Task<SmtpDeliveryResult> EmailReceivedAsync(MailTransaction, CancellationToken = default)`.
-     **Breaking change for consumers** — you must rename and re-sign your implementation.
-   - `SMTPServer.DeliverMessage` now returns `Task<SmtpDeliveryResult>` and forwards the connection token.
-   - `ProcessData` awaits delivery before writing any response; exceptions → 451.
-2. **Enhanced SMTP status codes (RFC 3463)**: new `SmtpDeliveryResult` type with explicit enhanced
-   status; built-in responses throughout now carry codes (`5.7.1`, `4.7.1`, `5.7.23`, `5.7.8`, …);
-   new `ClientProcessor.WriteCode(int, string)` overload that sanitizes CR/LF in handler-supplied text.
-3. **Rebrand + hygiene**: package ID `Krugertech.CSharp-SMTP-Server`, authors "Łukasz Jurczyk, Llewellyn Kruger",
-   version constants split into `VersionString` ("1.1.6-krugertech.1") and numeric-only
-   `AssemblyVersionString` ("1.1.6.1"); LICENSE/metadata; a **DualMode fix** in `Listener`
-   (only set when the address is IPv6 — upstream unconditionally set it, which breaks on some platforms);
-   README rewritten around ACK gating incl. migration table.
+The server parses the bracketed reverse-path, including the RFC 5321 null path `<>`. It then applies:
 
-### Migration cheat-sheet (upstream → this fork)
+1. `IMailFilter.IsAllowedSender`, if configured.
+2. SPF for unauthenticated clients, if enabled.
+3. `IMailFilter.IsAllowedSenderSpfVerified`, if configured.
 
-| Upstream | This fork |
-|---|---|
-| `Task EmailReceived(MailTransaction t)` | `Task<SmtpDeliveryResult> EmailReceivedAsync(MailTransaction t, CancellationToken ct = default)` |
-| Return ignored; always 250 OK | Return value determines the SMTP response |
-| Delivery runs in background | Server blocks the session until delivery completes |
-| Handler exception silently swallowed | Exception → 451 (sender retries) |
+For a null reverse-path, RFC 7208 makes the DNS-form EHLO/HELO name the SPF identity. Address literals
+and non-DNS greetings do not supply a checkable SPF identity. SPF results are cached for the
+connection; the accepted staleness risk is documented in `KNOWN_ISSUES.md`.
 
-## 6. Public API surface (what consumers implement/use)
+### RCPT TO
 
-- `SMTPServer(params, options, IMailDelivery, ILogger?, X509Certificate?)`, `.Start()`, `.Dispose()`,
-  `.SetAuthLogin(IAuthLogin?)`, `.SetFilter(IMailFilter?)`, `.SetTLSCertificate(cert)`,
-  `.AddListener(ip, port, tls, dualMode)` (can add listeners after Start).
-- `ListeningParameters(IPAddress, ushort[] regularPorts, ushort[] tlsPorts, bool dualMode)` —
-  TLS ports get implicit TLS; `dualMode` only works with `IPAddress.IPv6Any`.
-- **IMailDelivery**: `EmailReceivedAsync`, `DoesUserExist`.
-- **IAuthLogin**: `AuthPlain(authzId, authnId, password, ep, secure)`, `AuthLogin(login, password, ep, secure)` → bool.
-- **IMailFilter** (all optional hooks): `IsConnectionAllowed(ep)`, `IsAllowedSender(source, ep, username?)`,
-  `IsAllowedSenderSpfVerified(source, ep?, username?, spfResult)`, `CanDeliver(source, dest, authenticated, username?, ep?)`,
-  `CanProcessTransaction(transaction)` — all return `SmtpResult` (Success / TemporaryFail / PermanentFail + optional FailMessage).
-- **ILogger**: single `LogError(string)`.
+RCPT requires an active transaction. The server enforces `RecipientsLimit`, applies
+`IMailFilter.CanDeliver`, and calls `IMailDelivery.DoesUserExist`. Accepted recipients are stored in
+`MailTransaction.DeliverTo`.
 
-## 7. Build & test
+### DATA
 
-```bash
-dotnet build CSharp-SMTP-Server.sln          # OK: 0 errors, 11 warnings (see below)
-dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj
+DATA requires at least one accepted recipient. After `354`, lines are read as raw bytes rather than
+decoded strings:
+
+1. A lone `.` ends DATA; a doubled leading dot is unstuffed per RFC 5321.
+2. Lines are stored with CRLF endings in `MessageBody`.
+3. Despite its historical name, `MessageCharactersLimit` counts stored DATA bytes after
+   dot-unstuffing and excludes CRLF. Once over the limit, input is drained but no longer stored; the
+   completed transaction receives `552`.
+4. A DATA line exceeding the 1 MB line cap latches a truncation flag. The server drains the line and
+   rejects the transaction with `552` at the terminator rather than delivering incomplete bytes.
+5. The server prepends `Received:` and applicable `Authentication-Results:` headers.
+6. DMARC, if enabled, validates a single header-From mailbox. Authenticated clients bypass SPF and
+   DMARC. Null reverse-path DMARC alignment uses the HELO identity only when SPF authenticated it.
+7. `IMailFilter.CanProcessTransaction` gets the completed transaction.
+8. The transaction is handed to the delivery path and the processor releases its reference.
+
+The body path preserves the DATA octets and is suitable for downstream integrity verification. The
+server does not itself implement DKIM verification.
+
+## Message storage and lifetime
+
+`MessageBody` keeps messages in memory up to 4 MB and spills larger messages to a temporary file
+opened with delete-on-close behavior. This keeps memory proportional to buffers rather than message
+size. `MailTransaction.Clone()` shares the body store instead of copying it.
+
+Delivery handlers should use:
+
+- `GetBodyStream()` for a forward-only stream containing server-prepended headers and raw message
+  bytes.
+- `BodyLength` for the stored byte length without materialization.
+- `ParsedMessage` when MimeKit parsing is required.
+
+`RawBody` remains for compatibility but creates a complete UTF-16 string on every read. It should be
+avoided for messages that may be large.
+
+The server releases spilled storage when `EmailReceivedAsync` returns, including when it throws.
+Consumers must therefore finish reading or copying the body during the handler call and dispose
+streams they open. Retaining a transaction for deferred body access is unsupported.
+
+Headers added through `MailTransaction.AddHeader` are recorded separately and spliced ahead of the
+stored body when read. This avoids rewriting a large message merely to prepend metadata.
+
+## ACK-gated delivery
+
+The completed transaction is passed to:
+
+```cs
+Task<SmtpDeliveryResult> EmailReceivedAsync(
+    MailTransaction transaction,
+    CancellationToken cancellationToken = default)
 ```
 
-**Environment gotcha:** the test project targets **net7.0**. If only a newer runtime is installed
-(e.g. .NET 9 SDK on this machine), tests abort with "framework not found". Fix without touching the
-csproj: `DOTNET_ROLL_FORWARD=Major dotnet test …` → all 294 tests pass (~9 s).
+The result maps directly to the SMTP response:
 
-Test classes run **serially** (`xunit.runner.json`, `parallelizeTestCollections: false`) — the suite
-binds loopback ports, and concurrently running classes race on port allocation.
+- `Ok` produces `250`; the sender may discard its copy.
+- `TemporaryFailure` produces `451`; the sender should retry.
+- `PermanentFailure` produces `554`; the sender should not retry.
+- An unhandled handler exception is logged and produces `451`.
 
-Known build warnings (pre-existing, harmless): net7.0 EOL notice; CS8619 nullability mismatches in
-`MailTransaction.GetTo/GetCc/GetBcc` (`IEnumerable<string?>` vs `IEnumerable<string>` — MimeKit's
-`Name` is nullable).
+The handler is therefore the durability boundary. It must return `Ok` only after storage is durable.
+Delivery runs concurrently across connections but serially within a single SMTP session.
 
-### Tests
+The cancellation token represents server-side connection teardown. A peer disconnect is not
+independently observed while the handler is in flight, so handlers should not rely on this token as
+their only timeout.
 
-Integration-style test files share one pattern: allocate a free loopback port, start an actual
-`SMTPServer`, speak raw SMTP over TCP with 10 s read timeouts — all through the shared
-`SmtpSession` helper (connect/send/read-line/multi-line-response/RST-abort). Phase 1 (per
-`TEST_PLAN.md`) adds pure unit tests (no I/O) plus one socket-pair harness for the wire-output
-helpers; the test project gains `InternalsVisibleTo` access to internal helpers (`ProcessAddress`,
-`Base64`, `WriteCode`).
+## SPF and DMARC
 
-**`AckGatingTests.cs`** (6 facts):
-1. DATA → 250 only after handler completes; handler called exactly once.
-2. With a gated `SlowDelivery` (TCS pause), **no** response arrives while the handler is running —
-   proves no fire-and-forget.
-3. `TemporaryFailure()` → client sees 451.
-4. Handler throws → client sees 451.
-5. Exactly-once delivery per transaction.
-6. Second fire-and-forget race check (300 ms window).
+SPF and DMARC are optional and enabled by default. Their validators use a configured DNS endpoint,
+which defaults to Cloudflare `1.1.1.1:53`. DMARC also loads the Mozilla Public Suffix List and caches
+it in process-wide state.
 
-**`AuthLoginInitialResponseTests.cs`** (4 facts): bare two-step AUTH LOGIN still works; inline
-username (`AUTH LOGIN <b64>`) goes straight to the password prompt and succeeds (IIS scenario);
-wrong password → 535; invalid base64 initial response falls back to the username prompt.
+Authentication results are prepended to delivered messages when validation runs. SPF hard failure is
+rejected during MAIL FROM; DMARC hard failure is rejected after DATA. Authenticated sessions bypass
+both validations.
 
-**`EhloBracketedIpv6Tests.cs`** (3 facts): `EHLO [IPv6:…]` is accepted and the session stays usable;
-plain-hostname EHLO regression guard; `MAIL FROM:<…@[IPv6:…]>` still parses as a MAIL FROM command.
+Known dependency and RFC-result deviations are listed in
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#spf-and-dmarc). Deployments that do not need sender-policy
+enforcement should explicitly disable both validators rather than relying on their defaults.
 
-**Phase 1 unit tests** (107, see `TEST_PLAN.md` §3/§9 for the full case list):
-`SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9), `MailTransactionTests` (19 — pins bugs B1–B4),
-`CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7, suffix list served from a local HTTP
-helper — no internet), `Base64Tests` (10), `ProcessAddressTests` (15), `WireFormattingTests` (6,
-direct `WriteCode` tests on a socket pair incl. CR/LF sanitization), `ValueTypesTests` (6),
-`VersionConsistencyTests` (2).
+## Public extension points
 
-**`ConcurrentGreetingTests.cs`** (1 fact): two concurrent clients both receive their 220 greeting while
-the first stays idle — regression guard for the accept-thread-blocking fix (`294adbe`).
+- `IMailDelivery`: recipient lookup and ACK-gated durable delivery.
+- `IAuthLogin`: AUTH LOGIN and AUTH PLAIN credential checks.
+- `IMailFilter`: optional connection, sender, recipient, SPF-result, and completed-message policy
+  hooks.
+- `ILogger`: error logging.
+- `ServerOptions`: listener-independent limits, authentication requirements, TLS choices, identity,
+  and SPF/DMARC configuration.
 
-**Phase 2 protocol matrix** (86, see `TEST_PLAN.md` §4 for the full case list) — exact wire assertions:
-`GreetingAndFilterTests` (7), `EhloHeloTests` (9), `CommandSequencingTests` (13), `MailFromTests` (13),
-`RcptToTests` (13), `DataAndMessageTests` (12), `AuthProtocolTests` (19).
+All filter and delivery callbacks run on the connection's asynchronous flow. Slow callbacks hold that
+session open, so consumers should use asynchronous I/O and bounded downstream timeouts.
 
-**Phase 2 robustness & ACK-gating additions** (21): `AckGatingAdditionsTests` (6 — incl. the Q8 pin that
-the delivery token does not fire on client disconnect mid-delivery, and a deterministic parallel-handler
-no-cross-talk check) and `LifecycleAndRobustnessTests` (15 — ctor edge cases, AddListener-after-Start,
-multi-listener, Dispose RST semantics, port-in-use tolerance, dual-mode guards, binary-garbage / 1 MB-line
-survival, abrupt disconnect at four phases, and the `ConcurrencyStress` regression guard for the
-`ClientProcessors` thread-safety fix).
+## Deployment model
 
-**Phase 3 TLS/STARTTLS** (11): `TlsStartTlsTests` — implicit-TLS port flow (`Encryption = Tls`), STARTTLS
-advertise/upgrade/second-attempt (`Encryption = StartTls`), no-cert 502, Q4 pin (STARTTLS before EHLO is
-accepted today), TLS-port-without-cert plaintext fallback pin, dynamic `SetTLSCertificate`,
-RequireEncryptionForAuth 538→235, and three failed-handshake survival guards for the B5 fix. Uses the
-`TlsTestCerts` helper (ephemeral self-signed cert with a PFX round-trip — see Q10) and
-`SmtpSession.UpgradeTlsAsync`.
+The primary deployment runs one `SMTPServer` per Kubernetes pod, with independent pod IPs and
+horizontal scaling. This makes process-wide DMARC suffix state acceptable and avoids hosting multiple
+server configurations inside one process.
 
-**Phase 4 SPF/DMARC** (56): `SpfValidatorTests` (27 — CheckHost matrix against the stub: record-lookup
-errors, all qualifiers + bare `all`, ip4/ip6 exact & CIDR match/mismatch, family-mismatch fall-through,
-IPv4-mapped client unmapping, a/mx lookups, include semantics incl. RFC 7208 §5.2 not-match-resume,
-redirect propagation and the >10-lookup limit in both its permerror and ptr-used-fail forms),
-`DmarcValidatorTests` (13 — strict vs relaxed alignment, p=/sp= policy mapping, org-domain fallback,
-two-records-in-one-response → none, and the B1 end-to-end pin) and `SpfDmarcIntegrationTests` (4 — full
-sessions: SPF Fail 554 5.7.23 at MAIL FROM with no delivery, DMARC Fail 554 5.7.1 at DATA with the handler
-never running, Authentication-Results headers on delivered messages). Infrastructure: `DnsStub` — loopback
-UDP responder for TXT/A/AAAA/MX/PTR with SERVFAIL/NXDOMAIN modes and a query log; wire behavior verified
-against zabszk.DnsClient 1.0.1 by capturing its actual queries. New pins: Q11 (multi-string TXT responses
-silently dropped), Q12 (SPF DNS error handling deviates from RFC 7208 ×3), Q13 (positional `redirect=`).
+For the Office 365 journaling configuration and its durability constraints, see the
+[`README`](README.md#office-365-journaling-relay-profile). For test commands and load coverage, see
+[`TESTING.md`](TESTING.md).
 
-## 8. Known issues & gotchas
+## Upstream sync record
 
-- **Confirmed upstream bugs pinned by tests (B1–B4)** — see `TEST_PLAN.md` §2. Most important:
-  `MailTransaction.GetFrom/GetTo/GetCc/GetBcc` return MimeKit *display names*, not addresses, so DMARC
-  validation is effectively inert for ordinary mail; `AddHeader` before first parse duplicates the header
-  in `ParsedMessage`; `Clone()` drops `DMARCValidationResult` and shares the `DeliverTo` list.
-- **Fixed during Phase 1 testing:** `ClientProcessor` ctor blocked the listener accept thread when the
-  greeting write completed synchronously (one concurrent client at a time on Windows) — see `294adbe`.
-- **Fixed during Phase 2 testing:** the long-documented `Listener.ClientProcessors` race was real —
-  unsynchronised Add/Remove corrupted the list and `Dispose()` threw NullReferenceException under load;
-  fixed with a shared lock + snapshot-in-Dispose, guarded by
-  `ConcurrencyStress_ParallelSessions_AllDeliveriesSucceed` (deterministic repro without the fix) — see `df4636e`.
-- **Q7 — most responses carry no table text:** every two-arg `WriteCode(code, enhanced)` call site binds to
-  the `(int, string)` sanitizer overload (no implicit int→ushort conversion), so NOOP → `250 2.0.0`,
-  HELP → `214 2.0.0`, QUIT → `221 2.0.0` etc. have no message body; only single-arg calls get the
-  `SMTPCodes` table text. RFC-wise legal, but surprising — pinned by exact-wire assertions.
-- **Q8 — delivery token does not fire on client disconnect:** while the handler is in flight nothing polls
-  the socket (the receive loop is parked inside `DeliverMessage`), so a client RST cannot cancel the
-  delivery; the token only fires after the handler returns, when the response write fails. If delivery
-  cancellation ever matters, this needs a fix — pinned by `AckGatingAdditionsTests`.
-- **Fixed during Phase 3 testing (B5):** on an implicit-TLS port, any failed/aborted handshake (client
-  disconnects without handshaking, rejects the certificate, or sends plaintext) threw inside
-  `async void Init()` and crashed the whole process — one scanner touching the TLS port killed the server.
-  Now logged + only that connection dropped; guarded by three regression tests in `TlsStartTlsTests` — see `7cb9fd9`.
-- **Q10 — Windows SChannel rejects `CertificateRequest`-created certs:** a self-signed cert built with
-  `CertificateRequest.CreateSelfSigned()` cannot be used as a server certificate on Windows ("platform does
-  not support ephemeral keys"); re-importing it from PFX fixes the handshake. Library users generating certs
-  in memory on Windows will hit this — pin/round-trip via PFX (as `TlsTestCerts` does).
-- **Known limitation (not fixed):** a throwing `IMailFilter.IsConnectionAllowed` also propagates through
-  `async void Init()` and would crash the process; only the TLS handshake path was hardened in B5.
-- **Delivery runs inside the SMTP session**: a slow handler holds the connection open for as long as it
-  takes — by design, but size your timeouts/worker pools accordingly. The `CancellationToken` is tied to
-  the client connection; if the client disconnects mid-delivery the token fires (handlers should honor it).
-- **SPF/DMARC only apply to unauthenticated senders** and require a DNS endpoint; default resolver is
-  Cloudflare 1.1.1.1:53. DMARC additionally downloads Mozilla's Public Suffix List from GitHub on first
-  use (static, cached in-process).
-- `RequireEncryptionForAuth` defaults to **true** — AUTH over plaintext gets `538`. SampleApp sets it false for demo purposes.
-- `DoesUserExist` is called per RCPT TO; recipient limit default 50; message size limit counts characters (not bytes), default ~10 MB.
-- The object handed to your handler is a **clone** of the processor's transaction, so mutating its
-  metadata doesn't affect server state — but the clone **shares** the body store rather than copying
-  it (copying a 150 MB body was the largest allocation on the old delivery path). Read the body with
-  `GetBodyStream()`; `RawBody` still works but materializes the whole message in UTF-16 each time, and
-  for a message large enough to have spilled to a temp file it is only valid **inside**
-  `EmailReceivedAsync`.
-- Version constants: NuGet/package version lives in the csproj (`PackageVersion 1.1.6-krugertech.3`);
-  `SMTPServer.VersionString` still says `-krugertech.1` (informational only — bump both if you release).
+This is a historical decision record, not a statement about current upstream state. Upstream
+(`https://github.com/zabszk/CSharp-SMTP-Server`, remote `upstream`) was audited in July 2026. The
+audit covered everything after tag `1.1.6`, open PRs #17 and #19, the `dispose-log`, `dkim`, and
+Dependabot branches, and open issues #11, #15, #16, and #18.
 
-## 9. Upstream sync record
-
-Upstream (`https://github.com/zabszk/CSharp-SMTP-Server`, remote `upstream`) was audited on
-2026-07: everything after tag `1.1.6` (master commits, open PRs #17/#19, branches `dispose-log`,
-`dkim`, dependabot) plus all open issues (#11, #15, #16, #18). Verdict per item:
-
-| Upstream change | Verdict | Where it landed here |
+| Upstream change | Decision | Where it landed |
 |---|---|---|
-| `0dadf2d` — handle unhandled exceptions (issue #16): `IOException` on client disconnect breaks the receive loop cleanly instead of counting as a failure; `WriteAsync` now takes the connection cancellation token; better write-error logging | ✅ **Included** — cherry-picked verbatim, original authorship preserved. The write-cancellation matters extra for ACK gating: if the client drops while delivery is in flight, response writes fail fast instead of hanging | commit `8fa02c8` |
-| PR #17 — AUTH LOGIN with initial response (IIS SMTP relay sends `AUTH LOGIN <b64-user>` then only the password; previously the password was misread as a second username → auth always failed) | ✅ **Included, adapted** — implemented per the maintainer's suggested design in the PR discussion: valid inline base64 username ⇒ answer with the *password* prompt (`334 UGFzc3dvcmQ6`) and capture stage 3 directly; invalid/absent initial response keeps the standard two-step flow. **Excluded** from that PR (deliberately): breaking `ILogger` additions (`LogInfo`/`LogVerbose`), verbose logging of auth payloads (security anti-pattern), version bumps, sample-app edits | commit `7d0d50f` + `AuthLoginInitialResponseTests.cs` |
-| Issue #18 — `EHLO [IPv6:fe80::…]` misparsed (parser split at the first `:` inside brackets → 503 "EHLO/HELO first"; reported against Thunderbird) | ✅ **Fixed here** — no fix exists on upstream master. The colon separator is now only recognized outside square brackets (`ClientProcessor.ProcessResponse`); `MAIL FROM:`/`RCPT TO:` parsing (incl. bracketed IP literals in addresses) unchanged | commit `274069a` + `EhloBracketedIpv6Tests.cs` |
-| MimeKit bumps 4.3.0→4.7.1 (`51db717`) and →4.15.1 (PR #19 / dependabot branch) | ⏭️ Skipped — this fork already pins **MimeKit 4.17.0** (newer than both) |
-| `49e6a64` — merge `AuthPlain`+`AuthLogin` into single `CheckAuthCredentials` | ⏭️ Skipped — breaking API redesign, not a bug fix; this fork already carries one breaking change (`EmailReceivedAsync`) and keeps the two-method interface so LOGIN/PLAIN can be handled differently |
-| Branch `dispose-log` (stack-trace logging in Listener dispose paths) | ⏭️ Skipped — debug instrumentation only; would spam logs on every normal shutdown |
-| Branch `dkim` (~1000 lines: DKIM verification + ServerOptions rework into `Config/`) | ⏭️ Skipped — unfinished feature, not a fix (tracks upstream issue #15) |
-| Issue #11 — namespace collision between `zabszk.DnsClient` and Couchbase's `DnsClient` package | ⏭️ Not actionable in this repo — would require forking/renaming the separate DnsClient dependency; noted for future consideration |
+| `0dadf2d`, issue #16: handle disconnect exceptions, pass the connection token to writes, and improve write-error logging | Included verbatim. Fast response-write failure is especially useful with ACK gating after a sender disconnects. | `8fa02c8` |
+| PR #17: support an initial Base64 username in `AUTH LOGIN` for IIS SMTP relay compatibility | Included with the maintainer's state-machine design. Deliberately excluded the breaking `ILogger` expansion, version/sample changes, and verbose logging of authentication payloads because credentials must not enter logs. | `7d0d50f`; `AuthLoginInitialResponseTests` |
+| Issue #18: bracketed IPv6 EHLO names were split at their internal colon | Fixed locally by recognizing the command separator only outside square brackets. No upstream fix existed at audit time. | `274069a`; `EhloBracketedIpv6Tests` |
+| MimeKit 4.3.0→4.7.1 (`51db717`) and 4.15.1 (PR #19/Dependabot) | Skipped because this fork already used MimeKit 4.17.0. | No change required |
+| `49e6a64`: replace separate `AuthPlain`/`AuthLogin` methods with `CheckAuthCredentials` | Skipped as a breaking API redesign rather than a bug fix. Separate hooks also let consumers handle LOGIN and PLAIN differently. | Not merged |
+| `dispose-log` branch | Skipped because it was diagnostic stack-trace logging that would add noise during normal shutdown. | Not merged |
+| `dkim` branch: unfinished DKIM verification plus a `ServerOptions` rework into `Config/` | Skipped because it was an unfinished feature, not a contained fix; it tracked upstream issue #15. | Not merged |
+| Issue #11: namespace collision between `zabszk.DnsClient` and Couchbase's `DnsClient` package | Not actionable without forking or renaming the separate DNS dependency. | Deferred |
 
-Re-audit command: `git fetch upstream && git log --oneline 1.1.6..upstream/master`
-plus a check of open PRs/issues on GitHub.
+To re-audit upstream:
 
-## 10. RFC compliance claims (from README)
+```powershell
+git fetch upstream
+git log --oneline 1.1.6..upstream/master
+```
 
-RFC 822, 1869, 2554, 3463 (enhanced status codes), 4616 (PLAIN SASL), 4954, 5321, 7208 (SPF),
-7372, and **partially** RFC 7489 (DMARC).
+Also review open upstream pull requests, issues, and non-default branches; the commit log alone does
+not include several decisions recorded above.

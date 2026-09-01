@@ -29,7 +29,7 @@ namespace CSharp_SMTP_Server.Tests.Load;
 /// that normalization and <see cref="ExtractPayload"/> strips the prepended headers.
 /// </para>
 /// <para>
-/// No payload line begins with '.'. The server now unstuffs correctly (REVIEW.md Q1, fixed), but a
+/// No payload line begins with '.'. The server now unstuffs correctly (historical Q1, fixed), but a
 /// leading-dot line still has a wire form that differs from its stored form, and these samples are
 /// hashed as written rather than as framed — so keeping them dot-free means a corpus hash needs no
 /// knowledge of transparency encoding. Unstuffing has its own dedicated coverage; see

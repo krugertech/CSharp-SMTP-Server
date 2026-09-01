@@ -7,7 +7,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §8 — lifecycle, listeners & robustness (garbage input, abrupt disconnects, stress).</summary>
+/// <summary>Lifecycle, listener, malformed-input, disconnect, and stress coverage. See TESTING.md.</summary>
 public sealed class LifecycleAndRobustnessTests
 {
     [Fact]

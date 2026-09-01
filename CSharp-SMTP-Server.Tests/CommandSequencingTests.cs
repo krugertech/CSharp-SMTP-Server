@@ -1,6 +1,6 @@
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.3 — command sequencing, misc commands (NOOP/HELP/QUIT/RSET/VRFY).</summary>
+/// <summary>Command sequencing and miscellaneous commands (NOOP/HELP/QUIT/RSET/VRFY). See TESTING.md.</summary>
 public sealed class CommandSequencingTests
 {
     private static async Task<SmtpSession> ConnectGreetedAsync(ushort port)
@@ -42,7 +42,7 @@ public sealed class CommandSequencingTests
 
         // Note: two-arg WriteCode(code, enhanced) call sites bind to the (int, string) sanitizer
         // overload (no implicit int→ushort conversion), so no table text is appended — see Q7 in
-        // TEST_PLAN.md §2. The wire line is just "code enhanced".
+        // KNOWN_ISSUES.md R1/Q7. The wire line is just "code enhanced".
         await s.Send("FOOBAR");
         Assert.Equal("502 5.5.1", await s.ReadLineAsync());
     }
@@ -138,7 +138,7 @@ public sealed class CommandSequencingTests
     [Fact]
     public async Task Vrfy_AfterEhlo_Returns252_WithPermanentEnhancedStatus()
     {
-        // Pin Q2 (TEST_PLAN.md §2): success-class code 252 paired with permanent-failure enhanced
+        // Pin Q2 (KNOWN_ISSUES.md): success-class code 252 paired with permanent-failure enhanced
         // status 5.5.1 — inconsistent per RFC 3463, but this is the current wire behavior.
         // (The "Cannot VRFY user…" table text is not emitted because of Q7.)
         var port = TestPorts.Allocate();

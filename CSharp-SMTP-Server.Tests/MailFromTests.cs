@@ -4,7 +4,7 @@ using CSharp_SMTP_Server.Protocol.Responses;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>TEST_PLAN.md §4.4 — MAIL FROM wire matrix, sender filter, SPF-disabled path.</summary>
+/// <summary>MAIL FROM wire matrix, sender filter, and SPF-disabled behavior. See TESTING.md.</summary>
 public sealed class MailFromTests
 {
     private static async Task<(SmtpSession S, SMTPServer Server, RecordingDelivery Delivery)> ConnectAsync(

@@ -6,7 +6,7 @@ using CSharp_SMTP_Server.Networking;
 
 namespace CSharp_SMTP_Server.Tests;
 
-/// <summary>Shared SMTPServer factory for integration tests (TEST_PLAN.md §4).</summary>
+/// <summary>Shared SMTPServer factory for integration tests. See TESTING.md.</summary>
 public static class TestServers
 {
     /// <summary>Default options used by most protocol tests: no SPF/DMARC, plaintext auth allowed.</summary>

@@ -53,11 +53,10 @@ public sealed class Office365RelayTests
     /// usable afterwards (the 552 arrives at the terminating dot).
     /// </para>
     /// <para>
-    /// <b>Units.</b> <c>MessageCharactersLimit</c> counts <i>characters, excluding CRLF</i>, not
-    /// bytes. For the ASCII/base64 that MIME transport uses, 1 char == 1 byte, so the numbers align;
-    /// headroom above 150 MB covers MIME headers, base64 expansion of the encoded attachment, and the
-    /// server's own prepended <c>Received:</c> header. The field is <c>uint</c> (max ~4.29 GB), so
-    /// this value fits comfortably.
+    /// <b>Units.</b> Despite its historical name, <c>MessageCharactersLimit</c> counts stored DATA
+    /// bytes after dot-unstuffing and excludes CRLF. It is therefore a conservative RFC 1870 SIZE
+    /// advertisement rather than an exact wire-octet ceiling. The field is <c>uint</c> (max ~4.29 GB),
+    /// so this value fits comfortably.
     /// </para>
     /// </remarks>
     private const uint JournalingSizeLimit = 200u * 1024 * 1024;
