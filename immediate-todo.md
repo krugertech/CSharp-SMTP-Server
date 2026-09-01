@@ -497,6 +497,76 @@ section text. The empirical half of the argument — a failing bounce test — w
 final design (the SPF-`Pass` gate). The specification half was not checked as carefully, and it was
 the half that carried the conclusion.
 
+### 7c. Re-review: both findings confirmed fixed, one new one recorded
+
+A second adversarial pass over the fixes confirmed 7a and 7b closed. It raised one new `[high]`:
+**`SpfResultsCache` can serve a stale `Pass` for the life of a connection.**
+
+**Accepted as accurate, deliberately not fixed.** See item 8 — it is upstream code, unreachable in this
+deployment, and the obvious fix costs more than the risk it removes.
+
+Three bypass angles against the new SPF-`Pass` gate were also checked directly and are closed:
+
+| Angle | Why it fails |
+|---|---|
+| SPF cache crediting a `Pass` across domains | Cache is keyed by the domain actually checked, so an envelope-domain `Pass` is never read for a HELO domain |
+| Re-`EHLO` swapping the aligned identity mid-transaction | `EHLO` calls `DiscardTransaction()` *before* updating the retained domain, and `MailTransaction.HeloDomain` is captured by value at `MAIL FROM` — pinned by `NullSender_ReEhloAfterMailFrom_CannotSwapTheAlignedIdentity` |
+| Truncation latch leaking between messages | Reset at `DATA`, the single mandatory entry point for any body line; set only under `CaptureData == 1`, so a truncated *command* line cannot set it |
+
+---
+
+## 8. Known, accepted: `SpfResultsCache` can serve a stale `Pass` — **OPEN, deliberately**
+
+Raised by the second adversarial review. **Real, and deliberately not fixed.** Recorded here so the
+decision is informed rather than rediscovered.
+
+### The issue
+
+`SpfResultsCache` ([`ClientProcessor.cs`](CSharp-SMTP-Server/Networking/ClientProcessor.cs)) memoizes
+SPF results by domain **for the lifetime of the connection**. No TTL, no timestamp, and it is not
+cleared by `RSET` or a re-`EHLO`. A client can therefore hold a connection open across a DNS change and
+keep using an authorization the domain has since revoked.
+
+Since item 5a, this reaches further than before: a stale `Pass` now also satisfies the DMARC alignment
+gate for a null sender, not just SPF. **That widening is the honest reason to record it** — the cache
+itself is untouched upstream code, present on `master` and predating all of this work.
+
+### Why it is not being fixed
+
+**It is not an authorization bypass.** To gain anything, the attacker needs a `Pass` on a domain that
+*aligns with the From header they want to spoof* — which means that domain authorized their IP at
+connection time. This is a revocation-latency window against a formerly-legitimate sender, not a way
+for an unauthorized party to spoof.
+
+**It is unreachable here.** Journaling runs with `ValidateSPF` off, so the cache is never populated.
+
+**The obvious fix costs more than it saves.** Measured rather than assumed:
+
+- `zabszk.DnsClient` 1.0.1 has **no cache** — inspected, and there is no cache type in the assembly.
+  Every `Query()` goes to the wire.
+- It queries a configured resolver **over raw UDP**, defaulting to `1.1.1.1`
+  ([`ServerOptions.cs:118`](CSharp-SMTP-Server/ServerOptions.cs#L118)). This bypasses the OS resolver
+  entirely, so **no local router, `systemd-resolved`, or CoreDNS cache is in the path** unless
+  `DnsServerEndpoint` is explicitly pointed at one.
+- SPF is rarely one lookup: `include:` chains cost several (RFC 7208 caps them at 10), and O365's
+  `spf.protection.outlook.com` expands to multiple.
+- The lookup is **on the session thread**, blocking `MAIL FROM` — which §3 already cites as a reason
+  SPF is off for journaling.
+
+Clearing the cache per transaction therefore means a full SPF resolution chain **per message** rather
+than per connection. On a connection carrying 100 journal reports that is 100× the DNS work, each
+round trip blocking the session, to close a window that requires a formerly-authorized sender.
+
+### If someone enables SPF and wants this closed
+
+Do **not** simply clear the cache. The right fix is to honour each record's DNS TTL — the client
+already parses `MinimumTTL`, so surfacing it may be feasible without replacing the dependency. That
+keeps the caching benefit while bounding staleness to what the domain owner actually published.
+Alternatively, expose per-transaction revalidation as an opt-in `ServerOptions` flag, default off.
+
+Note the review also suggested keying the cache by domain **and client IP**. That is unnecessary in
+this design: the cache is per-connection, so the client IP is invariant for its whole lifetime.
+
 ---
 
 ## Suggested order
@@ -514,9 +584,12 @@ the half that carried the conclusion.
 8. ~~**Item 5a** — HELO identity retained, SPF-checked per RFC 7208 §2.4, and aligned for DMARC per
    RFC 7489 §3.1.2 gated on an SPF `Pass`.~~ **Done 2026-09-01** — both halves; the initial commit
    deviated on the DMARC half and was corrected after review. See 5a and §7b.
-9. ~~**Item 7** — the two Codex adversarial-review findings.~~ **Done 2026-09-01.**
+9. ~~**Item 7** — the two Codex adversarial-review findings.~~ **Done 2026-09-01**; a re-review
+   confirmed both closed and raised item 8.
 
-**Remaining: nothing in this document.** 445/445 green, plus 68/68 on the heavy load tier.
+**Remaining: item 8 only, and it is accepted rather than outstanding** — a stale-`Pass` window in the
+upstream `SpfResultsCache`, unreachable with SPF off, whose obvious fix costs a full SPF resolution
+chain per message. 446/446 green, plus 68/68 on the heavy load tier.
 
 **Carried forward, out of scope here:**
 
