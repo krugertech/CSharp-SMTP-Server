@@ -17,9 +17,49 @@ Test collections intentionally run serially. Integration tests allocate loopback
 binding port zero and then reopening the assigned port; parallel collections would increase the
 chance of another process taking that port between those operations.
 
+## Platform compatibility suites
+
+`Compatibility/` holds per-platform interoperation contracts, one directory per platform, tagged with
+a `Compatibility` trait:
+
+```powershell
+$env:DOTNET_ROLL_FORWARD = "Major"
+dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Compatibility=Office365"
+dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Compatibility=ExchangeOnPrem"
+```
+
+- `Compatibility/Office365/`: the Exchange Online journaling-relay deployment, where rejecting a
+  message loses a compliance record. Encodes the size, recipient, and envelope-parameter settings
+  that deployment requires.
+- `Compatibility/ExchangeOnPrem/`: on-premises Exchange send connectors. Covers proprietary and
+  unadvertised commands (`XEXCH50`, `BDAT`), command-stream alignment across `RSET` and pipelined
+  batches, `X-MS-Exchange-*` header fidelity, STARTTLS state reset, and transient-failure mapping.
+- `Compatibility/PlatformContract.cs`: the trait constants and, more importantly, the **provenance**
+  of every behavioral claim the suites assert.
+
+Two rules keep these suites honest.
+
+**Subject and weight are separate traits.** `Compatibility=<platform>` says what a test is about;
+`Load=heavy` says what it costs. They compose (`--filter "Compatibility=Office365&Load=heavy"`). The
+Office 365 tests previously carried `Category=Load`, which meant any CI job excluding load tests
+silently dropped the entire Office 365 contract — present in the repository, absent from the run.
+Do not reintroduce a weight trait as a test's only classification.
+
+**Every behavioral claim cites a source.** Add a `PlatformContract.Provenance` entry naming the
+Microsoft document, RFC section, or dated production observation behind it, and reference that
+constant from the test's XML docs. These tests drive a loopback listener, not a real platform: a
+green run proves our side of a contract we wrote down, so an unsourced claim is folklore asserted
+with the confidence of fact. Claims not verified against a live platform are marked unverified in
+`Provenance` and pin our own behavior rather than asserting the platform's.
+
+The suites do not certify "100% compatibility" — no loopback suite can. The server advertises only
+`AUTH LOGIN PLAIN`, `STARTTLS`, `8BITMIME`, and `SIZE`; it offers no `PIPELINING`, `CHUNKING`/`BDAT`,
+`ENHANCEDSTATUSCODES`, `SMTPUTF8`, or `DSN`. What they establish is correct interoperation within the
+advertised subset, and safe, non-desyncing refusal of everything outside it.
+
 ## Load and integrity tests
 
-Fast load and Office 365 relay checks run with the normal suite. To run only the load category:
+Fast load checks run with the normal suite. To run only the load category:
 
 ```powershell
 $env:DOTNET_ROLL_FORWARD = "Major"
@@ -103,7 +143,8 @@ that growth remains below the message size rather than asserting a machine-speci
   the loopback `DnsStub`.
 - `LifecycleAndRobustnessTests`: shutdown, listener behavior, malformed input, and concurrency.
 - `StreamingBodyTests`: stream-backed storage, byte preservation, lifetime, and dot-unstuffing.
-- `Load/`: load, message integrity, large-message memory behavior, and Office 365 relay assumptions.
+- `Load/`: load, message integrity, and large-message memory behavior.
+- `Compatibility/`: per-platform interoperation contracts. See "Platform compatibility suites" above.
 
 ## Conventions
 

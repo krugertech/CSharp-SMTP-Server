@@ -3,8 +3,9 @@ using CSharp_SMTP_Server.Networking;
 using CSharp_SMTP_Server.Protocol.Responses;
 using CSharp_SMTP_Server.Protocol.Commands;
 using Xunit.Abstractions;
+using CSharp_SMTP_Server.Tests.Load;
 
-namespace CSharp_SMTP_Server.Tests.Load;
+namespace CSharp_SMTP_Server.Tests.Compatibility.Office365;
 
 /// <summary>
 /// Acceptance tests for the Office 365 journaling-relay deployment: this server receives journaled
@@ -22,7 +23,7 @@ namespace CSharp_SMTP_Server.Tests.Load;
 /// what Exchange Online can send.
 /// </para>
 /// </remarks>
-[Trait("Category", "Load")]
+[Trait(PlatformContract.Name, PlatformContract.Office365)]
 public sealed class Office365RelayTests
 {
     private readonly ITestOutputHelper _output;
