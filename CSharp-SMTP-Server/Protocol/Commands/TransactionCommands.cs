@@ -22,7 +22,22 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 				case "MAIL FROM":
 					{
-						var address = ProcessAddress(data, out var domain);
+						// RFC 5321 §4.5.5 requires the null reverse-path "<>" to be accepted: it is the
+						// reverse-path of every DSN/bounce and of some Exchange system-generated reports,
+						// so rejecting it drops those messages permanently. ProcessAddress cannot parse it
+						// (empty address, no '@'), so it is recognized here, before that call, and yields
+						// an empty sender and an empty FromDomain.
+						string? address;
+						string? domain;
+						var nullReversePath = IsNullReversePath(data);
+
+						if (nullReversePath)
+						{
+							address = string.Empty;
+							domain = string.Empty;
+						}
+						else address = ProcessAddress(data, out domain);
+
 						if (address == null) await processor.WriteCode(501, "5.5.2");
 						else
 						{
@@ -45,7 +60,16 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 							if (processor.Username != null)
 								spfValidation = ValidationResult.UserAuthenticated;
-							else if (processor.Server.Options.ValidateSPF && processor.RemoteEndPoint != null)
+							// A null reverse-path carries no envelope domain to check, and querying DNS for an
+							// empty domain would only yield a spurious Temperror, so SPF is skipped here.
+							//
+							// NOTE: RFC 7208 §2.4 does not say to skip SPF in this case — it defines the MAIL FROM
+							// identity as postmaster@<HELO domain> and has that checked instead. Doing so requires
+							// retaining the EHLO/HELO argument, which this server currently discards (only
+							// _protocolVersion is kept). Until that is threaded through, a null-path sender is not
+							// SPF-checked at all: acceptable while SPF is off (as it is for journaling), but it
+							// means a HELO domain publishing -all is not enforced against a null sender.
+							else if (processor.Server.Options.ValidateSPF && processor.RemoteEndPoint != null && !nullReversePath)
 							{
 								if (processor.SpfResultsCache!.TryGetValue(domain!, out var spfRes))
 									spfValidation = spfRes;
@@ -77,7 +101,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 								}
 							}
 
-							processor.Transaction = new MailTransaction(address, domain!, spfValidation)
+							processor.Transaction = new MailTransaction(address, domain!, spfValidation, nullReversePath)
 							{
 								RemoteEndPoint = processor.RemoteEndPoint,
 								Encryption = processor.Encryption
@@ -315,16 +339,216 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			return domain.Contains('.') ? domain : null;
 		}
 
+		/// <summary>
+		/// Determines whether the text preceding a bracketed path is one of the two prefixes that may
+		/// legitimately appear there.
+		/// </summary>
+		/// <remarks>
+		/// Those are the ':' left by command parsing (<c>ProcessAddress</c> is called with arguments
+		/// like ":&lt;a@b.c&gt;") with optional whitespace, and a quoted display name such as
+		/// "John Doe" &lt;john@example.com&gt;. Allowing arbitrary text here is what let
+		/// "ceo@victim.example &lt;&gt;" read as a null reverse-path.
+		/// </remarks>
+		/// <param name="prefix">Everything before the path's opening '&lt;'.</param>
+		/// <returns>True if the prefix is permitted.</returns>
+		private static bool IsAllowedPathPrefix(string prefix)
+		{
+			var trimmed = prefix.Trim();
+
+			if (trimmed.Length == 0 || trimmed == ":")
+				return true;
+
+			if (trimmed[0] == ':')
+				trimmed = trimmed[1..].TrimStart();
+
+			if (trimmed.Length == 0)
+				return true;
+
+			// What remains must be exactly ONE quoted display name. Checking only the first and last
+			// character is not enough: "\"x\" ceo@victim.example \"" starts and ends with a quote while
+			// carrying a bare address between them, which would let the following <> pass as a null
+			// reverse-path. Walk the quoted-string to its first unescaped closing quote and require
+			// nothing but whitespace after it.
+			if (trimmed[0] != '"')
+				return false;
+
+			var i = 1;
+
+			while (i < trimmed.Length && trimmed[i] != '"')
+			{
+				// RFC 5321 quoted-pair: a backslash escapes the next character, quote included.
+				if (trimmed[i] == '\\')
+					i++;
+
+				i++;
+			}
+
+			// Unterminated quoted-string.
+			if (i >= trimmed.Length)
+				return false;
+
+			return trimmed[(i + 1)..].Trim().Length == 0;
+		}
+
+		/// <summary>
+		/// Determines whether the text following a null reverse-path is entirely well-formed ESMTP
+		/// parameters, rather than a bare address masquerading as one.
+		/// </summary>
+		/// <remarks>
+		/// RFC 5321 §4.1.2 gives esmtp-param = esmtp-keyword ["=" esmtp-value], with parameters
+		/// separated by spaces and neither keyword nor value containing a space. This checks the shape
+		/// only — unknown keywords are still ignored elsewhere, matching the server's
+		/// parse-but-do-not-act stance on SIZE= and BODY=. What it refuses is a token that is not a
+		/// keyword/value pair at all, which is what a smuggled "&lt;ceo@victim.example&gt;" is.
+		/// </remarks>
+		/// <param name="suffix">Everything after the closing '&gt;' of an empty reverse-path.</param>
+		/// <returns>True if every whitespace-separated token is a valid ESMTP parameter.</returns>
+		private static bool IsEsmtpParameterSuffix(string suffix)
+		{
+			if (suffix.Length == 0)
+				return true;
+
+			// Parameters are separated from the path, and from each other, by a space.
+			if (suffix[0] != ' ')
+				return false;
+
+			foreach (var token in suffix.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+			{
+				var eq = token.IndexOf('=', StringComparison.Ordinal);
+				var keyword = eq == -1 ? token : token[..eq];
+
+				// esmtp-keyword = (ALPHA / DIGIT) *(ALPHA / DIGIT / "-"). Checking this is what stops a
+				// bare address being taken for a valueless keyword: "ceo@victim.example" fails on '@'.
+				// ASCII-only on purpose — char.IsLetterOrDigit would admit non-ASCII keywords.
+				if (keyword.Length == 0 || !IsAsciiLetterOrDigit(keyword[0]))
+					return false;
+
+				foreach (var c in keyword)
+				{
+					if (!IsAsciiLetterOrDigit(c) && c != '-')
+						return false;
+				}
+
+				if (eq == -1)
+					continue;
+
+				// Only one '=' separates keyword from value, so "X=foo=<addr>" is refused.
+				if (token.IndexOf('=', eq + 1) != -1)
+					return false;
+
+				// esmtp-value = 1*(%d33-60 / %d62-126): printable ASCII except '=' (61). Validating this
+				// is what stops "SIZE=1234	<ceo@victim.example>" being one token that smuggles an
+				// address — HTAB is not a value character, but splitting on spaces alone kept it inside
+				// the token. Also excludes controls and non-ASCII.
+				var value = token[(eq + 1)..];
+
+				if (value.Length == 0)
+					return false;
+
+				foreach (var c in value)
+				{
+					if (c < (char)33 || c > (char)126 || c == '=')
+						return false;
+				}
+			}
+
+			return true;
+		}
+
+		private static bool IsAsciiLetterOrDigit(char c) =>
+			c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9';
+
+		/// <summary>
+		/// Locates the bracketed path at the start of an SMTP address argument.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// The path is the FIRST angle-bracket pair, and nothing before it may contain '&lt;' or '&gt;'.
+		/// That prefix rule is what makes this anchored: it still tolerates the prefixes the protocol
+		/// and this codebase actually produce — a leading ':' left by command parsing, and a display
+		/// name such as "John Doe" &lt;john@example.com&gt; — while refusing an argument that hides the
+		/// real path behind something bracket-bearing.
+		/// </para>
+		/// <para>
+		/// Without that rule, a search for the first '&lt;' anywhere lets "AUTH=&lt;&gt; &lt;ceo@victim.example&gt;"
+		/// read as a null reverse-path: the caller sees an empty sender and skips SPF while a real
+		/// address sits in the command — a parser/policy differential. "&gt;&lt;&gt;" is refused for the
+		/// same reason. Trailing ESMTP parameters are still ignored, including bracket-bearing ones
+		/// like O365's AUTH=&lt;&gt;, because they follow the closing '&gt;'.
+		/// </para>
+		/// </remarks>
+		/// <param name="data">The command argument (everything after "MAIL FROM:" / "RCPT TO:").</param>
+		/// <param name="path">The text between the brackets, unvalidated; empty for "&lt;&gt;".</param>
+		/// <returns>True if a well-formed bracketed path was found at the anchored position.</returns>
+		private static bool TryGetBracketedPath(string? data, out string path)
+		{
+			path = string.Empty;
+
+			if (data == null)
+				return false;
+
+			var open = data.IndexOf('<', StringComparison.Ordinal);
+			if (open == -1)
+				return false;
+
+			// A '>' before the path's '<' is malformed — e.g. "><>".
+			var firstClose = data.IndexOf('>', StringComparison.Ordinal);
+			if (firstClose < open)
+				return false;
+
+			// Only two prefixes legitimately precede the path: the ':' left by command parsing (with
+			// optional surrounding whitespace), and an RFC 5322 quoted display name. Anything else is
+			// refused, so "ceo@victim.example <>" cannot present itself as a null reverse-path with the
+			// real address written off to one side.
+			if (!IsAllowedPathPrefix(data[..open]))
+				return false;
+
+			var close = data.IndexOf('>', open);
+			if (close == -1)
+				return false;
+
+			// Everything after the path must be ESMTP parameters (RFC 5321 §4.1.2:
+			// esmtp-param = esmtp-keyword ["=" esmtp-value], whitespace-separated). A later bracket pair
+			// is legitimate only as a parameter VALUE — O365 sends "<> BODY=8BITMIME AUTH=<>" — and is an
+			// attack when it is a bare path instead: "AUTH=<> <ceo@victim.example>" and
+			// "<><ceo@victim.example>" hide a real address behind an empty pair. Read as a null sender,
+			// those would leave filters seeing an empty sender and SPF skipped while a real address sat
+			// in the command.
+			//
+			// The whole suffix is validated, not just the next bracket. Checking only the following '<'
+			// left "<> AUTH=<> <ceo@victim.example>" smuggleable, because the AUTH value's '<' satisfied
+			// the check and the bare address after it was never examined.
+			if (close == open + 1 && !IsEsmtpParameterSuffix(data[(close + 1)..]))
+				return false;
+
+			path = data[(open + 1)..close];
+
+			// A '<' inside the path means the pair is not the path.
+			return !path.Contains('<', StringComparison.Ordinal);
+		}
+
+		/// <summary>
+		/// Determines whether a MAIL FROM argument carries the RFC 5321 §4.5.5 null reverse-path
+		/// ("&lt;&gt;"), as every DSN/bounce does.
+		/// </summary>
+		/// <remarks>
+		/// Uses the same anchored path locator as <see cref="ProcessAddress"/>, so the two cannot
+		/// disagree about which bracket pair is the reverse-path. See
+		/// <see cref="TryGetBracketedPath"/> for why that matters.
+		/// </remarks>
+		/// <param name="data">The MAIL FROM command argument.</param>
+		/// <returns>True if the reverse-path is present and empty.</returns>
+		internal static bool IsNullReversePath(string? data) =>
+			TryGetBracketedPath(data, out var path) && path.Length == 0;
+
 		internal static string? ProcessAddress(string? data, out string? domain)
 		{
 			domain = null;
 			if (data == null)
 				return null;
 
-			if (!data.Contains('<', StringComparison.Ordinal) || !data.Contains('>', StringComparison.Ordinal)) return null;
-
-			var address = data[(data.IndexOf("<", StringComparison.Ordinal) + 1)..];
-			address = address[..address.IndexOf(">", StringComparison.Ordinal)];
+			if (!TryGetBracketedPath(data, out var address))
+				return null;
 
 			if (string.IsNullOrWhiteSpace(address))
 				return null;

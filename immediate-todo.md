@@ -174,6 +174,23 @@ In `TransactionCommands.ProcessData` / `MailTransaction`:
 
 Several full copies coexist at peak, each doubled by UTF-16.
 
+### Also fix here: the size limit does not bound an unterminated line
+
+Found by adversarial review 2026-09-01, **pre-existing and not introduced by the items above.**
+
+`ClientProcessor.Receive` awaits `_reader.ReadLineAsync()`, which materialises a complete line before
+`ProcessData` increments `Counter`. A client that connects and streams without ever sending CRLF —
+either as a command line or inside DATA — grows the `StreamReader` buffer unbounded and never reaches
+`MessageCharactersLimit`. Unauthenticated, on an internet-facing listener.
+
+This qualifies item 1a's claim that a finite limit "genuinely bounds memory": it bounds *terminated
+lines*. The `OverLimitFlood` measurement is real but only covers the many-terminated-lines shape.
+
+The streaming rework already touches this exact read path, so fix it there: read with a bounded line
+reader, and once the cap is exceeded stop buffering while draining to the terminator (or drop the
+connection with a bounded response). Add a test that opens a connection, streams megabytes with no
+CRLF, and asserts working set stays bounded.
+
 ### Suggested fix
 
 Replace string accumulation with a stream the consumer reads:
@@ -213,6 +230,39 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build 
 implementing streaming. Metrics (msgs/sec, **MB/s**, latency percentiles) are written to
 `load-metrics.json` next to the test binary; integrity is asserted (SHA-256 per message, verified
 non-vacuous by fault injection), throughput is only reported.
+
+---
+
+## 5. Deferred from the 2026-09-01 adversarial reviews
+
+Both found while fixing items 1–3; neither blocks that work, both are real.
+
+### 5a. A null sender is not authenticated in either direction
+
+Accepting `MAIL FROM:<>` (item 2a) means an unauthenticated client can spoof `From:` under a
+`p=reject` domain and be accepted. The server cannot distinguish it from a genuine bounce, because:
+
+- RFC 7208 §2.4 defines the null-path MAIL FROM identity as `postmaster@<HELO domain>`, but the
+  EHLO/HELO argument is **discarded** — `ClientProcessor` keeps only `_protocolVersion`.
+- DKIM is not implemented, so there is no second aligned mechanism.
+
+Delivering was chosen deliberately: applying the policy destroys legitimate bounces, which for
+journaling is unrecoverable, and the gap is unreachable there because DMARC is off. **The fix** is to
+retain the EHLO/HELO argument on `ClientProcessor`, thread it into `MailTransaction`, run the §2.4
+check against it, and align that domain in `DmarcValidator`. When it lands,
+`NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation` **fails by design** and
+should be inverted to assert `554`.
+
+### 5b. Quoted local-parts containing angle brackets are rejected
+
+Pre-existing, not introduced by items 1–3. `TryGetBracketedPath` (and `ProcessAddress` before it)
+treats the first `>` as the path terminator with no awareness of RFC 5321 quoted-strings, so valid
+addresses like `<"a>b"@example.com>` and `<"a<b"@example.com>` get a permanent `501`. Shared by
+RCPT TO, so it can lose a recipient as well as a sender.
+
+Low priority for this deployment — O365 journal envelopes do not use quoted local-parts — but it is a
+permanent rejection of a legitimate address. The fix is a quote- and escape-aware scanner that
+recognises the closing bracket only outside a quoted-string.
 
 ---
 

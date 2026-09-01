@@ -1,5 +1,6 @@
 using System.Net;
 using CSharp_SMTP_Server.Networking;
+using CSharp_SMTP_Server.Protocol.Commands;
 using Xunit.Abstractions;
 
 namespace CSharp_SMTP_Server.Tests.Load;
@@ -343,27 +344,24 @@ public sealed class Office365RelayTests
     // ── envelope shapes Office 365 actually sends ─────────────────────────────────────────────
 
     /// <summary>
-    /// <c>MAIL FROM:&lt;&gt;</c> — the null sender — is currently <b>rejected with 501</b>.
+    /// <c>MAIL FROM:&lt;&gt;</c> — the null reverse-path — is accepted and the message is delivered.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>This is a live defect for this deployment, not merely a pinned quirk.</b> RFC 5321 §4.5.5
-    /// requires the null reverse-path to be accepted; it is what every bounce (DSN) and, importantly
-    /// here, what Exchange journaling uses for certain system-generated reports. Rejecting it drops
-    /// those messages permanently.
+    /// RFC 5321 §4.5.5 requires the null reverse-path to be accepted; it is what every bounce (DSN)
+    /// and, importantly here, what Exchange journaling uses for certain system-generated reports.
+    /// Rejecting it drops those messages permanently.
     /// </para>
     /// <para>
-    /// The cause is <c>TransactionCommands.ProcessAddress</c>, which requires a non-empty address
-    /// containing '@' and a dotted domain, so <c>&lt;&gt;</c> returns null and the caller answers
-    /// <c>501 5.5.2</c>. Fixing it means special-casing the empty path in the MAIL FROM branch.
-    /// </para>
-    /// <para>
-    /// This test asserts today's behavior so the gap is visible and tracked. <b>When the null sender
-    /// is fixed, this test fails by design</b> and should be inverted to assert 250.
+    /// <c>TransactionCommands.ProcessAddress</c> cannot parse <c>&lt;&gt;</c> (empty address, no '@'),
+    /// so the MAIL FROM branch recognizes the null path via <c>IsNullReversePath</c> before calling it
+    /// and yields an empty <c>From</c> and an empty <c>FromDomain</c>. This test drives the full
+    /// transaction rather than just the 250, because the empty domain has to survive header
+    /// generation and delivery, not merely the envelope command.
     /// </para>
     /// </remarks>
     [Fact]
-    public async Task NullSender_IsCurrentlyRejected_KnownGapForJournaling()
+    public async Task NullSender_IsAccepted_AndDelivered()
     {
         var delivery = new RecordingDelivery();
         var (server, port) = StartJournalingServer(delivery);
@@ -373,10 +371,110 @@ public sealed class Office365RelayTests
             await using var session = await OpenAsync(port, TimeSpan.FromMinutes(2));
 
             await session.Send("MAIL FROM:<>");
-            var response = await session.ReadLineAsync();
+            Assert.Equal("250 2.0.0", await session.ReadLineAsync());
 
-            // Today: rejected. RFC 5321 §4.5.5 requires 250 here.
-            Assert.StartsWith("501", response);
+            await session.Send("RCPT TO:<archive@journal.local>");
+            Assert.StartsWith("250", await session.ReadLineAsync());
+            await session.Send("DATA");
+            Assert.StartsWith("354", await session.ReadLineAsync());
+
+            await session.Send("Subject: delivery status notification");
+            await session.Send("");
+            await session.Send("The original message could not be delivered.");
+            await session.Send(".");
+
+            Assert.StartsWith("250", await session.ReadLineAsync());
+        }
+
+        var received = Assert.Single(delivery.Delivered);
+        Assert.Equal(string.Empty, received.From);
+        Assert.Equal(string.Empty, received.FromDomain);
+        Assert.Equal(new[] { "archive@journal.local" }, received.DeliverTo);
+        Assert.Equal("delivery status notification", received.Subject);
+    }
+
+    /// <summary>
+    /// The null reverse-path is the anchored first bracket pair — never a pair hidden behind
+    /// bracket-bearing text, and never a real address.
+    /// </summary>
+    /// <remarks>
+    /// The prefix rule matters for policy, not just syntax: if
+    /// <c>AUTH=&lt;&gt; &lt;ceo@victim.example&gt;</c> were read as a null sender, filters would see an
+    /// empty sender and SPF would be skipped while a real address sat in the command — a
+    /// parser/policy differential. Trailing parameters are still ignored, including O365's
+    /// <c>AUTH=&lt;&gt;</c>, because they follow the closing '&gt;'.
+    /// </remarks>
+    [Theory]
+    // Genuine null paths, with and without trailing ESMTP parameters.
+    [InlineData("<>", true)]
+    [InlineData("<> SIZE=1234", true)]
+    [InlineData("<> BODY=8BITMIME AUTH=<>", true)]
+    // Real addresses are never null paths, even when a later parameter contains "<>".
+    [InlineData("<journal@contoso.onmicrosoft.com>", false)]
+    [InlineData("<journal@contoso.onmicrosoft.com> AUTH=<>", false)]
+    // Bracket-bearing prefixes must not smuggle a null path past a real address.
+    [InlineData("AUTH=<> <ceo@victim.example>", false)]
+    [InlineData("><>", false)]
+    [InlineData("<><ceo@victim.example>", false)]
+    // The whole parameter suffix is validated, not just the next bracket: a bare address after a
+    // legitimate bracket-bearing parameter must not slip through.
+    [InlineData("<> AUTH=<> <ceo@victim.example>", false)]
+    [InlineData("<> X=foo=<ceo@victim.example>", false)]
+    [InlineData("<> BODY=8BITMIME <ceo@victim.example>", false)]
+    // ...while genuine parameter shapes after a null path stay valid.
+    [InlineData("<> BODY=8BITMIME", true)]
+    [InlineData("<> AUTH=<> BODY=8BITMIME", true)]
+    [InlineData("<> SMTPUTF8", true)]
+    // A bare address must never pass as an ESMTP keyword or hide beside the path.
+    [InlineData("<>ceo@victim.example", false)]
+    [InlineData("<> ceo@victim.example", false)]
+    [InlineData("ceo@victim.example <>", false)]
+    [InlineData("<> SIZE=1234 ceo@victim.example", false)]
+    // Legitimate prefixes still parse: the ':' left by command parsing, and a quoted display name.
+    [InlineData(":<>", true)]
+    // A prefix that merely starts and ends with a quote is not one quoted display name.
+    [InlineData("\"x\" ceo@victim.example \"<>", false)]
+    [InlineData("\"unterminated <>", false)]
+    // HTAB is not an esmtp-value character, so it cannot hide an address inside a parameter token.
+    [InlineData("<> SIZE=1234	<ceo@victim.example>", false)]
+    [InlineData("<> SIZE=", false)]        // empty esmtp-value
+    [InlineData("<> =1234", false)]        // empty keyword
+    // A genuine quoted display name on a real address still parses.
+    [InlineData("\"John Doe\" <john@example.com>", false)]
+    // Malformed / unterminated paths.
+    [InlineData(">", false)]
+    [InlineData("<", false)]
+    [InlineData("<a@b.c", false)]
+    public void IsNullReversePath_IsAnchored_AndRejectsSmuggledPaths(string argument, bool expected)
+        => Assert.Equal(expected, TransactionCommands.IsNullReversePath(argument));
+
+    /// <summary>
+    /// The anchored parser must not let a bracket-bearing prefix change which address is parsed:
+    /// an argument hiding a real address behind <c>AUTH=&lt;&gt;</c> is refused outright (501)
+    /// rather than silently accepted as a null sender.
+    /// </summary>
+    [Theory]
+    [InlineData("MAIL FROM:AUTH=<> <ceo@victim.example>")]
+    [InlineData("MAIL FROM:><>")]
+    [InlineData("MAIL FROM:<><ceo@victim.example>")]
+    [InlineData("MAIL FROM:<> AUTH=<> <ceo@victim.example>")]
+    [InlineData("MAIL FROM:<> X=foo=<ceo@victim.example>")]
+    [InlineData("MAIL FROM:<>ceo@victim.example")]
+    [InlineData("MAIL FROM:<> ceo@victim.example")]
+    [InlineData("MAIL FROM:ceo@victim.example <>")]
+    [InlineData("MAIL FROM:\"x\" ceo@victim.example \"<>")]
+    [InlineData("MAIL FROM:<> SIZE=1234	<ceo@victim.example>")]
+    public async Task MailFrom_BracketBearingPrefix_IsRefused_NotTreatedAsNullSender(string command)
+    {
+        var delivery = new RecordingDelivery();
+        var (server, port) = StartJournalingServer(delivery);
+
+        using (server)
+        {
+            await using var session = await OpenAsync(port, TimeSpan.FromMinutes(2));
+
+            await session.Send(command);
+            Assert.StartsWith("501", await session.ReadLineAsync());
         }
     }
 

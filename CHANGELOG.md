@@ -30,6 +30,45 @@ the upstream sync record.
 
   **Why this is listed as breaking:** a message shape that was previously delivered is now rejected.
 
+- **`MAIL FROM:<>` (the null reverse-path) is now accepted instead of refused with `501 5.5.2`.**
+  RFC 5321 §4.5.5 requires it to be accepted: it is the reverse-path of every DSN/bounce and of some
+  Exchange system-generated reports, so refusing it dropped those messages permanently.
+  `ProcessAddress` cannot parse `<>` (empty address, no '@'), so the MAIL FROM branch now recognises
+  the null path via `IsNullReversePath` before calling it.
+
+  A null-sender transaction is flagged by the new `MailTransaction.IsNullReversePath` and carries
+  `From` and `FromDomain` as **empty strings** (not null).
+  **Consumers must expect this**: an `IMailFilter` or `IMailDelivery` that assumes a non-empty
+  sender — a `.Split('@')[1]`, a domain-allowlist lookup — will now see `""` on these messages.
+  SPF is skipped for the null path (no envelope domain to query), so `SPFValidationResult` is
+  `CheckDisabled` and no `Authentication-Results: ... spf=` header is added. **DMARC returns `None`
+  for a null path** rather than evaluating alignment: with no envelope identity and no DKIM support,
+  RFC 7489 §3.1 has nothing to align, and treating an absent identity as a mismatched one made a
+  `p=reject` policy permanently destroy legitimate bounces from the very domain that published it.
+
+  **Known limitation — a null sender is not authenticated in either direction.** RFC 7208 §2.4
+  defines the null-path MAIL FROM identity as `postmaster@<HELO domain>`, but the EHLO/HELO argument
+  is discarded (only `_protocolVersion` is kept), and DKIM is not implemented. Consequently an
+  unauthenticated client can send `MAIL FROM:<>` with a spoofed `From:` under the victim domain's
+  `p=reject` and be accepted. The server cannot tell that from a genuine bounce.
+
+  This is a deliberate trade, not an oversight: the alternative — applying the policy — destroys
+  legitimate bounces from `p=reject` domains, which for a journaling relay is unrecoverable loss of a
+  compliance record. It is also unreachable in that deployment, where DMARC is off entirely. Closing
+  it properly means retaining the HELO identity and running the §2.4 check. Pinned as a known
+  limitation by `NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation`, which
+  should be inverted to assert `554` when that lands.
+
+  The reverse-path parser is now **anchored**: the path is the first bracket pair, and an argument
+  that hides a real address behind an empty pair — `MAIL FROM:AUTH=<> <ceo@victim.example>`,
+  `MAIL FROM:<><ceo@victim.example>`, `MAIL FROM:><>` — is refused with `501` instead of being read
+  as a null sender. Previously `ProcessAddress` searched for `<` anywhere, so such an argument would
+  have let filters see an empty sender while a real address sat in the command. Trailing ESMTP
+  parameters are still ignored, including O365's `AUTH=<>`.
+
+  **Why this is listed as breaking:** a command shape that was previously refused is now accepted, and
+  reaches delivery handlers with an empty sender.
+
 **On the version number.** This release is 2.0.0 rather than 1.2.0 because the getter changes above are
 *silent*: consumers still compile, but filtering, routing, or display logic reading these members
 changes behavior. A minor bump would let that reach users through a routine update, and a changelog is
@@ -76,6 +115,26 @@ not a dependency-resolution barrier. The major bump is the barrier.
   transaction. This matters more here than upstream: ACK-gating runs delivery inside the session.
 
 ### Changed
+
+- **EHLO now advertises the `SIZE` extension (RFC 1870).** The greeting previously ended at
+  `250 8BITMIME`; it now ends with `250 SIZE <n>`, letting a sender learn the limit up front rather
+  than discovering it only after transmitting a whole message.
+
+  The advertised value is `MessageCharactersLimit` unchanged, which is already a safe understatement:
+  the DATA counter adds each line's characters *after* CRLF is stripped, so
+  `octets = sum(line bytes) + 2 * lines >= counted characters` for every message. CRLF, UTF-8
+  multibyte and dot-stuffing all push octets up relative to characters, never down, so a message the
+  character limit accepts can never exceed that many octets. A limit of `0` advertises `SIZE 0`,
+  which RFC 1870 §6 independently defines as "no fixed maximum"; finite limits are never rounded down
+  into it.
+
+  **The `SIZE=` value a client declares on MAIL FROM is deliberately not acted upon**; the server
+  advertises only. Pre-rejecting on a declared size would refuse a message before its data arrived,
+  which loses anything a sender over-declares. Oversized messages are still caught at the terminating
+  dot with `552 5.4.3`.
+
+  Note for consumers asserting on the EHLO response: `8BITMIME` is no longer the last line, so its
+  prefix changed from `250 ` to `250-`.
 
 - `SMTPServer.VersionString` and `AssemblyVersionString` had drifted behind the published
   `PackageVersion` (`1.1.6-krugertech.1` vs `1.1.6-krugertech.3`). All three now move together at

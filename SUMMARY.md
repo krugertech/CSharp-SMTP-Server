@@ -435,15 +435,57 @@ causes OOM, not total volume: 4 × 50 MB concurrently peaked at ~1.9 GB. A pod a
 sequencing in [`immediate-todo.md`](immediate-todo.md) item 4. It is a breaking public API change
 (`RawBody` is public), so it wants a major version.
 
-### Two known gaps found while writing these tests
+### Two gaps found while writing these tests — both now fixed (2026-09-01)
 
-1. **`MAIL FROM:<>` (null sender) is rejected with `501 5.5.2`.** RFC 5321 §4.5.5 requires it to be
-   accepted; it is what DSNs and some Exchange system-generated reports use. Cause:
-   `TransactionCommands.ProcessAddress` requires a non-empty address with '@' and a dotted domain, so
-   `<>` returns null. **This is a live defect for this deployment**, pinned by
-   `NullSender_IsCurrentlyRejected_KnownGapForJournaling` — when fixed, that test fails by design and
-   should be inverted to assert 250. Fix = special-case the empty path in the MAIL FROM branch.
-2. **No `SIZE` extension advertised** (EHLO returns only `250-<name>` and `250 8BITMIME`). RFC 1870
-   lets a sender learn the limit up front; without it Exchange discovers an over-limit message only
-   after transmitting it in full. O365's `SIZE=`/`BODY=8BITMIME` parameters on MAIL FROM are parsed
-   correctly today (ignored, not rejected), pinned by `MailFrom_WithO365EsmtpParameters_IsAccepted`.
+1. **`MAIL FROM:<>` (null reverse-path) was rejected with `501 5.5.2`; it is now accepted.** RFC 5321
+   §4.5.5 requires it; it is what DSNs and some Exchange system-generated reports use, so rejecting it
+   lost those messages permanently. The cause was `TransactionCommands.ProcessAddress`, which requires
+   a non-empty address with '@' and a dotted domain. The MAIL FROM branch now recognises the null path
+   via `IsNullReversePath` *before* calling it, yielding an empty `From` and `FromDomain`.
+
+   SPF is skipped for the null path (no envelope domain to query), so no empty `smtp.mailfrom=` stanza
+   is emitted. **DMARC returns `None`** for a null path rather than evaluating alignment: with no
+   envelope identity and no DKIM support there is nothing to align, and an adversarial review caught
+   that treating the empty `FromDomain` as a mismatched identity made a `p=reject` policy return
+   `554` — permanently destroying a legitimate bounce sent by the domain that published the policy.
+   Pinned by `NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered`.
+
+   **Known limitation — a null sender is unauthenticated in both directions.** RFC 7208 §2.4 defines
+   the null-path MAIL FROM identity as `postmaster@<HELO domain>`, but the EHLO/HELO argument is
+   discarded (only `_protocolVersion` is kept), and DKIM is not implemented. So an unauthenticated
+   client can send `MAIL FROM:<>` with a spoofed `From:` under a `p=reject` domain and be accepted;
+   the server cannot distinguish that from a genuine bounce. Applying the policy instead would destroy
+   legitimate bounces, which for journaling is unrecoverable — so delivering is the chosen side, and
+   the gap is unreachable here because DMARC is off. Pinned as a known limitation by
+   `NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation`; closing it means
+   retaining the HELO identity and running the §2.4 check.
+
+   The reverse-path parser is **anchored**: `TryGetBracketedPath` is shared by `IsNullReversePath` and
+   `ProcessAddress` so the two cannot disagree about which pair is the path. An argument hiding a real
+   address behind an empty pair — `AUTH=<> <ceo@victim.example>`, `<><ceo@victim.example>`, `><>` —
+   is refused `501` rather than read as a null sender, which would have shown filters an empty sender
+   while a real address sat in the command. Pinned by
+   `IsNullReversePath_IsAnchored_AndRejectsSmuggledPaths` and
+   `MailFrom_BracketBearingPrefix_IsRefused_NotTreatedAsNullSender`.
+
+   **This is a public behavior change**: a command that used to be refused is now accepted.
+
+2. **The `SIZE` extension (RFC 1870) is now advertised.** EHLO previously returned only `250-<name>`
+   and `250 8BITMIME`, so a sender could not learn the limit up front and Exchange discovered an
+   over-limit message only after transmitting it in full. EHLO now ends with
+   `250 SIZE <MessageCharactersLimit>`; a limit of 0 advertises `SIZE 0`, which RFC 1870 §6 defines
+   as "no fixed maximum" — the same meaning the option already had.
+
+   **The declared `SIZE=` on MAIL FROM is deliberately not acted upon.** Pre-rejecting on it would
+   refuse a report before its data arrived, and for journaling a refused report is a compliance record
+   that no longer exists anywhere — a sender that over-declares would lose a message it could have
+   delivered. Oversized messages are still caught at the terminating dot. O365's
+   `SIZE=`/`BODY=8BITMIME` parameters remain parsed-and-ignored, pinned by
+   `MailFrom_WithO365EsmtpParameters_IsAccepted`.
+
+   The advertised value is the limit unchanged, which already understates the octet count: the DATA
+   counter adds each line's characters *after* CRLF is stripped, so
+   `octets = sum(line bytes) + 2*lines >= counted characters` always. CRLF, UTF-8 multibyte and
+   dot-stuffing all push octets up relative to characters, never down. Finite limits are never rounded
+   down into `SIZE 0` ("no fixed maximum"). Pinned by
+   `AdvertisedSizeLimit_NeverOverstates_AndPreservesFiniteLimits`.

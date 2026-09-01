@@ -88,6 +88,143 @@ public sealed class SpfDmarcIntegrationTests
         }
     }
 
+    /// <summary>
+    /// The null reverse-path is accepted with SPF and DMARC <b>enabled</b>, and delivers without an
+    /// SPF Authentication-Results header.
+    /// </summary>
+    /// <remarks>
+    /// The null path has no envelope domain, so there is nothing for SPF to check — RFC 7208 §2.4 has
+    /// the HELO identity checked instead. The MAIL FROM branch therefore skips SPF and leaves the
+    /// result <see cref="ValidationResult.CheckDisabled"/>, which in turn suppresses the SPF
+    /// Authentication-Results header rather than emitting an empty <c>smtp.mailfrom=</c>.
+    ///
+    /// This matters beyond the journaling deployment, where both checks are off: the library ships to
+    /// consumers who leave them on, and an empty FromDomain must not fault the DNS lookup or the
+    /// header-generation path.
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_WithSpfAndDmarcEnabled_Delivers_WithoutSpfArHeader()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("Subject: delivery status notification");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+
+            var tx = delivery.Delivered.Single();
+            Assert.Equal(string.Empty, tx.From);
+            Assert.Equal(string.Empty, tx.FromDomain);
+
+            // No envelope domain was checked, so no SPF stanza — in particular not an empty one.
+            Assert.Equal(ValidationResult.CheckDisabled, tx.SPFValidationResult);
+            Assert.DoesNotContain("spf=", tx.RawBody);
+            Assert.DoesNotContain("smtp.mailfrom=", tx.RawBody);
+        }
+    }
+
+    /// <summary>
+    /// A null-reverse-path DSN carrying a real, DMARC-aligned From header under <c>p=reject</c> must
+    /// be delivered, not refused with 554.
+    /// </summary>
+    /// <remarks>
+    /// This is the shape a real bounce takes: <c>MAIL FROM:&lt;&gt;</c> with
+    /// <c>From: postmaster@example.com</c>. Because the null path leaves <c>FromDomain</c> empty,
+    /// DMARC alignment compares "example.com" against "" and, under relaxed alignment, compares the
+    /// organizational domains — also "" — so nothing aligns and a <c>p=reject</c> policy yields Fail.
+    /// Under the journaling constraint that permanent rejection destroys a compliance record, this is
+    /// the failure mode that matters most.
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.example.com", "v=DMARC1; p=reject");
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("From: postmaster@example.com");
+            await s.Send("Subject: Undeliverable: quarterly report");
+            await s.Send("");
+            await s.Send("Your message could not be delivered.");
+            await s.Send(".");
+
+            // A bounce from the very domain that published p=reject must not be destroyed.
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+            Assert.Single(delivery.Delivered);
+        }
+    }
+
+    /// <summary>
+    /// <b>Known limitation, deliberately pinned:</b> a null reverse-path is not DMARC-enforced, so a
+    /// spoofed From under <c>p=reject</c> is accepted rather than refused.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the cost of the fix pinned by
+    /// <see cref="NullSender_WithAlignedFromHeader_UnderDmarcReject_IsDelivered"/>. The server has no
+    /// authenticated identity for a null path in either direction: RFC 7208 §2.4 would check
+    /// <c>postmaster@&lt;HELO domain&gt;</c>, but the EHLO/HELO argument is discarded, and DKIM is not
+    /// implemented. It therefore cannot distinguish this spoof from a genuine bounce.
+    /// </para>
+    /// <para>
+    /// Delivering is the correct side to err on here — for a journaling relay a wrongly rejected
+    /// report is an unrecoverable compliance record, while DMARC is off entirely. This test exists so
+    /// the gap stays visible: if the HELO identity is ever retained and the §2.4 check implemented,
+    /// this test <b>should fail</b> and be inverted to assert 554.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_WithSpoofedFrom_UnderDmarcReject_IsAccepted_KnownLimitation()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("From: ceo@victim.example");
+            await s.Send("Subject: wire transfer");
+            await s.Send("");
+            await s.Send("Please action immediately.");
+            await s.Send(".");
+
+            // Not refused: no authenticated identity exists for a null path, so DMARC returns None.
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+            var tx = Assert.Single(delivery.Delivered);
+            Assert.Equal(ValidationResult.None, tx.DMARCValidationResult);
+        }
+    }
+
     #endregion
 
     #region DMARC at DATA (§7)

@@ -1,5 +1,6 @@
 using System.Net;
 using CSharp_SMTP_Server.Interfaces;
+using CSharp_SMTP_Server.Networking;
 
 namespace CSharp_SMTP_Server.Tests;
 
@@ -14,7 +15,7 @@ public sealed class EhloHeloTests
     }
 
     [Fact]
-    public async Task Ehlo_NoAuthNoCert_AdvertisesOnly8BitMime()
+    public async Task Ehlo_NoAuthNoCert_Advertises8BitMimeAndSize()
     {
         var port = TestPorts.Allocate();
         using var server = TestServers.Build(port); // no auth, no certificate
@@ -23,7 +24,8 @@ public sealed class EhloHeloTests
         await using var s = await ConnectGreetedAsync(port);
         await s.Send("EHLO test.client");
 
-        Assert.Equal(new[] { "250-test.local at your service", "250 8BITMIME" },
+        Assert.Equal(
+            new[] { "250-test.local at your service", "250-8BITMIME", "250 SIZE 10485760" },
             (await s.ReadResponseAsync()).ToArray());
     }
 
@@ -37,9 +39,35 @@ public sealed class EhloHeloTests
         await using var s = await ConnectGreetedAsync(port);
         await s.Send("EHLO test.client");
 
-        Assert.Equal(new[] { "250-test.local at your service", "250-AUTH LOGIN PLAIN", "250 8BITMIME" },
+        Assert.Equal(
+            new[]
+            {
+                "250-test.local at your service", "250-AUTH LOGIN PLAIN", "250-8BITMIME",
+                "250 SIZE 10485760"
+            },
             (await s.ReadResponseAsync()).ToArray());
     }
+
+    /// <summary>
+    /// The advertised RFC 1870 SIZE must be a value the server will never reject, and must not
+    /// needlessly understate capacity.
+    /// </summary>
+    /// <remarks>
+    /// The character limit is already a safe understatement of the octet count: ProcessData counts
+    /// each line's characters after CRLF is stripped, so octets = sum(line bytes) + 2 * lines is
+    /// always >= the counted characters. CRLF, UTF-8 multibyte and dot-stuffing all push octets up
+    /// relative to characters, never down, so the limit passes through unchanged.
+    ///
+    /// In particular a small finite limit must NOT round down to 0, which RFC 1870 §6 reads as "no
+    /// fixed maximum" — that would advertise unlimited on a server that refuses at two characters.
+    /// </remarks>
+    [Theory]
+    [InlineData(10485760u, 10485760u)]
+    [InlineData(200u * 1024 * 1024, 200u * 1024 * 1024)]
+    [InlineData(1u, 1u)]  // must not become 0 ("no fixed maximum")
+    [InlineData(0u, 0u)]  // genuinely unlimited
+    public void AdvertisedSizeLimit_NeverOverstates_AndPreservesFiniteLimits(uint limit, uint expected)
+        => Assert.Equal(expected, ClientProcessor.AdvertisedSizeLimit(limit));
 
     [Fact]
     public async Task Helo_SingleLine_NoExtensions()
@@ -147,7 +175,7 @@ public sealed class EhloHeloTests
         await using var s = await ConnectGreetedAsync(port);
         await s.Send("EHLO test.client   ");
 
-        Assert.Equal("250 8BITMIME", (await s.ReadResponseAsync())[^1]);
+        Assert.Equal("250 SIZE 10485760", (await s.ReadResponseAsync())[^1]);
     }
 
     [Fact]

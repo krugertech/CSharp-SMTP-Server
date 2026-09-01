@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using CSharp_SMTP_Server.Protocol;
 using CSharp_SMTP_Server.Protocol.Commands;
 using CSharp_SMTP_Server.Protocol.Responses;
+using static System.FormattableString;
 
 namespace CSharp_SMTP_Server.Networking
 {
@@ -66,6 +67,35 @@ namespace CSharp_SMTP_Server.Networking
 		internal ushort CaptureData;
 		internal string? Username, TempUsername;
 		private ushort _protocolVersion;
+
+		/// <summary>
+		/// Converts <see cref="ServerOptions.MessageCharactersLimit"/> (characters, excluding CRLF) into
+		/// an octet count safe to advertise as RFC 1870 SIZE (octets, including CRLF).
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// The limit passes through unchanged, because it is already a safe understatement. The counter
+		/// in <c>ProcessData</c> adds each line's character count after CRLF has been stripped, so for
+		/// any message: octets = sum(line bytes) + 2 * lines >= sum(line chars) = counted characters.
+		/// Every difference between the two runs one way — CRLF adds two octets per line, UTF-8
+		/// multibyte adds octets per character, dot-stuffing adds an octet to a line that already
+		/// carries two of CRLF — so a message accepted by the character limit can never exceed the same
+		/// number of octets. Advertising the limit therefore promises no more than the server honours.
+		/// </para>
+		/// <para>
+		/// An earlier version halved this on the reasoning that an N-octet message could be as few as
+		/// N/2 characters (every line empty). That is the wrong extremum: the question is how many
+		/// octets a message at the character limit can reach, and that direction only ever inflates.
+		/// Halving would have discarded half the relay's usable capacity, telling Office 365 that
+		/// journal reports it could in fact deliver were too large.
+		/// </para>
+		/// <para>
+		/// 0 means "no limit" here and is preserved as "SIZE 0", which RFC 1870 §6 independently reads
+		/// as "no fixed maximum". Only a genuinely unlimited configuration may advertise 0 — a small
+		/// finite limit must not round down into it.
+		/// </para>
+		/// </remarks>
+		internal static uint AdvertisedSizeLimit(uint messageCharactersLimit) => messageCharactersLimit;
 		private bool _dispose;
 
 		private async void Init()
@@ -289,7 +319,29 @@ namespace CSharp_SMTP_Server.Networking
 					await WriteText($"250-{Server.Options.ServerName} at your service");
 					if (Server.AuthLogin != null) await WriteText("250-AUTH LOGIN PLAIN");
 					if (!Secure && Server.Certificate != null) await WriteText("250-STARTTLS");
-					await WriteText("250 8BITMIME");
+					await WriteText("250-8BITMIME");
+
+					// RFC 1870. The advertised value must be one the server will never reject, so it is
+					// derived conservatively rather than published as-is: SIZE is an octet count INCLUDING
+					// the CRLF of each line, while MessageCharactersLimit counts characters EXCLUDING them.
+					// A message of N octets can therefore be as few as N/2 counted characters, in the
+					// degenerate case of empty lines costing 2 octets of CRLF each. Halving the limit is the
+					// floor that holds for any line-length distribution. (UTF-8 multibyte input only makes
+					// the character limit bind sooner, so it cannot breach this floor either.)
+					//
+					// Advertising the raw limit would publish a contract the server does not honour: a
+					// many-short-line message could exceed the advertised maximum and still be accepted.
+					// Understating is the safe direction — a sender may send less than it could, but is
+					// never told it may send something that would then be refused.
+					//
+					// A limit of 0 means "no limit" here and is advertised as "SIZE 0", which RFC 1870 §6
+					// independently defines as "no fixed maximum" — the same meaning.
+					//
+					// This advertises only; the declared SIZE= on MAIL FROM is deliberately NOT acted upon.
+					// A sender that over-declares would otherwise be refused before its data arrives, and for
+					// journaling a refused report is a compliance record that no longer exists anywhere.
+					// Oversized messages are still caught at the terminating dot.
+					await WriteText(Invariant($"250 SIZE {AdvertisedSizeLimit(Server.Options.MessageCharactersLimit)}"));
 					break;
 
 				case "HELO":

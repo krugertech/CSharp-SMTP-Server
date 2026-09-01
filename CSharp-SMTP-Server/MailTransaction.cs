@@ -15,10 +15,11 @@ namespace CSharp_SMTP_Server
 	/// </summary>
 	public class MailTransaction : ICloneable
 	{
-		internal MailTransaction(string from, string fromDomain, ValidationResult validationResult)
+		internal MailTransaction(string from, string fromDomain, ValidationResult validationResult, bool isNullReversePath = false)
 		{
 			From = from;
 			FromDomain = fromDomain;
+			IsNullReversePath = isNullReversePath;
 			SPFValidationResult = validationResult;
 			DeliverTo = new List<string>();
 			AuthenticatedUser = null;
@@ -35,6 +36,18 @@ namespace CSharp_SMTP_Server
 		/// If SPF validation is enabled, this domain is validated
 		/// </summary>
 		public readonly string FromDomain;
+
+		/// <summary>
+		/// True when the sender used the RFC 5321 §4.5.5 null reverse-path (<c>MAIL FROM:&lt;&gt;</c>),
+		/// as every DSN/bounce does.
+		/// </summary>
+		/// <remarks>
+		/// Distinguishes "there is no envelope sender" from "the envelope sender is an empty string".
+		/// Both leave <see cref="From"/> and <see cref="FromDomain"/> empty, but only the former is a
+		/// valid transaction, and treating an absent identity as a mismatched one fails closed: DMARC
+		/// would find nothing to align and reject a legitimate bounce under <c>p=reject</c>.
+		/// </remarks>
+		public readonly bool IsNullReversePath;
 
 		/// <summary>
 		/// Raw message body
@@ -156,7 +169,7 @@ namespace CSharp_SMTP_Server
 		/// <inheritdoc />
 		public object Clone()
 		{
-			return new MailTransaction(From, FromDomain, SPFValidationResult)
+			return new MailTransaction(From, FromDomain, SPFValidationResult, IsNullReversePath)
 			{
 				AuthenticatedUser = AuthenticatedUser,
 				RawBody = RawBody,

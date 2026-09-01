@@ -184,6 +184,33 @@ public class DmarcValidator
 			else if (record.Contains(";p=quarantine", StringComparison.OrdinalIgnoreCase)) action = DmarcResult.Quarantine;
 		}
 
+		// A null reverse-path (every DSN/bounce) has no envelope identity to align against, and this
+		// server does not implement DKIM, so DMARC has no authenticated identity at all here. RFC 7489
+		// §3.1 builds alignment on SPF or DKIM; with neither available the result is "no determination",
+		// not a failure. Returning Fail would let a p=reject policy permanently destroy a legitimate
+		// bounce sent by the very domain that published the policy — the exact data-loss failure this
+		// deployment exists to prevent.
+		//
+		// ── KNOWN LIMITATION, deliberate ─────────────────────────────────────────────────────────
+		// This means a null-sender message is NOT DMARC-enforced: an unauthenticated client can send
+		// MAIL FROM:<> with a spoofed "From: ceo@victim.example" under victim.example's p=reject and
+		// be accepted. The server cannot currently tell that apart from a genuine bounce, because it
+		// has no authenticated identity for a null path in either direction:
+		//
+		//   * RFC 7208 §2.4 defines the null-path MAIL FROM identity as postmaster@<HELO domain>, but
+		//     the EHLO/HELO argument is discarded (ClientProcessor keeps only _protocolVersion), so
+		//     that check cannot be run.
+		//   * DKIM is not implemented, so there is no second aligned mechanism to fall back on.
+		//
+		// Closing this properly means retaining the HELO identity and running the §2.4 check, then
+		// aligning THAT domain against RFC5322.From. Until then the choice is between delivering
+		// unauthenticated bounces and destroying legitimate ones, and for a journaling relay —
+		// where DMARC is off entirely and a rejected report is an unrecoverable compliance record —
+		// delivering is the correct side to err on. Anyone enabling ValidateDMARC should know that
+		// null senders pass unauthenticated.
+		if (transaction.IsNullReversePath)
+			return ValidationResult.None;
+
 		bool isAligned = fromDomain.Equals(transaction.FromDomain, StringComparison.OrdinalIgnoreCase);
 
 		if (!isAligned && aspf == AlignmentMode.Relaxed)

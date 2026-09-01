@@ -43,7 +43,8 @@ public class TlsStartTlsTests
         // EHLO while already secure: no STARTTLS line (nothing left to upgrade to), no AUTH configured
         await s.Send("EHLO client.test");
         var ehlo = await s.ReadResponseAsync();
-        Assert.Equal(new[] { "250-test.local at your service", "250 8BITMIME" }, ehlo);
+        Assert.Equal(
+            new[] { "250-test.local at your service", "250-8BITMIME", "250 SIZE 10485760" }, ehlo);
 
         // full transaction over TLS
         await s.Send("MAIL FROM:<sender@test.local>");

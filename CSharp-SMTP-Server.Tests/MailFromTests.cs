@@ -29,7 +29,10 @@ public sealed class MailFromTests
     [InlineData("MAIL FROM:<a@b>", "501 5.5.2")]       // domain without a dot
     [InlineData("MAIL FROM:<a@@b.c>", "501 5.5.2")]    // two @ signs
     [InlineData("MAIL FROM:<a.b@c>", "501 5.5.2")]     // last dot before the @
-    [InlineData("MAIL FROM:<>", "501 5.5.2")]          // empty address
+    // The null reverse-path is required to be accepted by RFC 5321 §4.5.5 — it is the sender of
+    // every DSN/bounce. See Load/Office365RelayTests.NullSender_IsAccepted_AndDelivered.
+    [InlineData("MAIL FROM:<>", "250 2.0.0")]
+    [InlineData("MAIL FROM:<> SIZE=1234", "250 2.0.0")] // null path with ESMTP parameters
     public async Task MailFrom_WireMatrix(string command, string expected)
     {
         var (s, server, _) = await ConnectAsync();
