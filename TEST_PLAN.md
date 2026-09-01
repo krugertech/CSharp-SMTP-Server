@@ -62,6 +62,8 @@ Everything below is **new**.
    `ClientProcessor.WriteCode(int,string)` sanitization. Without it these are only reachable via raw TCP.
 2. **Extract a shared `SmtpSession` helper** (connect/read-line/send/multi-line-response + port allocator)
    into one common file — currently duplicated in all three test files; will be needed by ~8 more files.
+   Timeout is per-session (10 s default, unchanged for protocol tests); `LoadDriver` overrides it to 2 min,
+   because at high concurrency a legitimately-queued connection can wait past 10 s to be greeted.
 3. **Self-signed TLS certificate helper**: generate at test time (RSA 2048, CN=localhost, SAN =
    `localhost` + `127.0.0.1`) or check in a throwaway `.pfx`. Needed for all TLS/STARTTLS tests.
 4. **Local HTTP server helper** (`HttpListener` on loopback) serving a minimal Public Suffix List —
@@ -343,7 +345,8 @@ None result **and** zero DNS queries for a perfectly normal message.
 
 - SampleApp (console demo, no logic worth testing).
 - Real-network SPF/DMARC tests against live domains — flaky by nature; the DNS stub (§1.5) replaces them.
-- Performance/benchmarking (throughput under load) — separate effort if ever needed.
+- ~~Performance/benchmarking (throughput under load)~~ — **done 2026-09-01**: see `Load/` and SUMMARY.md §11.
+  Integrity-under-load is asserted; throughput is measured and reported, not asserted.
 - DKIM — not implemented in this fork (upstream `dkim` branch deliberately not merged).
 
 ## 11. Suggested build order & rough size

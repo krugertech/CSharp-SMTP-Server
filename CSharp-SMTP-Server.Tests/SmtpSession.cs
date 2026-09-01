@@ -20,22 +20,40 @@ public sealed class SmtpSession : IAsyncDisposable
     private StreamWriter _writer;
     private SslStream? _ssl;
 
+    /// <summary>
+    /// Per-session I/O timeout. Defaults to 10 s, which suits every protocol test: those assert on a
+    /// responsive server, so a stall is a defect and should fail fast.
+    /// </summary>
+    /// <remarks>
+    /// The load tests raise it. At high concurrency, hundreds of connections each pushing hundreds of
+    /// kilobytes will queue behind one another, and a connection accepted late can legitimately wait
+    /// longer than 10 s just to be greeted. That is client-side queueing on a saturated machine, not
+    /// server misbehavior — leaving the fixed 10 s here would make the load harness report the test
+    /// client's own limit as a server failure.
+    /// </remarks>
+    private readonly TimeSpan _timeout;
+
     public int Port { get; }
 
-    private SmtpSession(TcpClient client, int port)
+    private SmtpSession(TcpClient client, int port, TimeSpan timeout)
     {
         _client = client;
         Port = port;
+        _timeout = timeout;
         var stream = client.GetStream();
         _reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
         _writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true) { NewLine = "\r\n" };
     }
 
-    /// <summary>Connects to the server. Bounded by a 10 s timeout.</summary>
-    public static async Task<SmtpSession> ConnectAsync(ushort port, IPAddress? address = null)
+    /// <summary>
+    /// Connects to the server. Bounded by <paramref name="timeout"/>, defaulting to 10 s.
+    /// </summary>
+    public static async Task<SmtpSession> ConnectAsync(ushort port, IPAddress? address = null,
+        TimeSpan? timeout = null)
     {
+        var effective = timeout ?? DefaultTimeout;
         var client = new TcpClient();
-        using var cts = new CancellationTokenSource(DefaultTimeout);
+        using var cts = new CancellationTokenSource(effective);
         try
         {
             await client.ConnectAsync(address ?? IPAddress.Loopback, port).WaitAsync(cts.Token);
@@ -46,13 +64,13 @@ public sealed class SmtpSession : IAsyncDisposable
             throw new TimeoutException($"timed out connecting to SMTP server on port {port}");
         }
 
-        return new SmtpSession(client, port);
+        return new SmtpSession(client, port, effective);
     }
 
     /// <summary>Reads one line. Returns null on clean EOF; throws <see cref="TimeoutException"/> after 10 s.</summary>
     public async Task<string?> ReadLineAsync()
     {
-        using var cts = new CancellationTokenSource(DefaultTimeout);
+        using var cts = new CancellationTokenSource(_timeout);
         try
         {
             return await _reader.ReadLineAsync(cts.Token);
@@ -93,7 +111,7 @@ public sealed class SmtpSession : IAsyncDisposable
     /// <summary>Sends raw bytes without framing — for garbage-input tests.</summary>
     public async Task SendRaw(byte[] bytes)
     {
-        using var cts = new CancellationTokenSource(DefaultTimeout);
+        using var cts = new CancellationTokenSource(_timeout);
         try
         {
             await _client.GetStream().WriteAsync(bytes, cts.Token);
@@ -116,7 +134,7 @@ public sealed class SmtpSession : IAsyncDisposable
         var options = new SslClientAuthenticationOptions { TargetHost = targetHost };
         options.RemoteCertificateValidationCallback = (_, _, _, _) => acceptCertificate;
 
-        using var cts = new CancellationTokenSource(DefaultTimeout);
+        using var cts = new CancellationTokenSource(_timeout);
         try
         {
             await ssl.AuthenticateAsClientAsync(options, cts.Token);

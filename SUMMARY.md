@@ -18,7 +18,9 @@ the SMTP session by design.
 - Branch: **`dev`**, pushed. Tier 1 review fixes (B1, B3, B4, Q12(b), R11, R6) plus a Codex adversarial
   follow-up (C1, C2 below) are new commits on top; version **2.0.0-krugertech.1**.
 - Build: 0 errors (pre-existing harmless warnings: net7.0 EOL notice, CS8619 in MailTransaction).
-- Tests: **316/316 green**, ~11 s per run, stable across repeated runs. Working tree clean.
+- Tests: **343/343 green**, ~15 s per run, stable across repeated runs.
+- **➜ Next actions: [`immediate-todo.md`](immediate-todo.md)** — O365 journaling config, two defects
+  (null sender, memory amplification), and the streaming-DATA fix. Read that first.
 
 ### Commit stack (newest first)
 
@@ -162,7 +164,7 @@ Pinned by `MailTransactionTests`. Fixing this changes observable behavior.
 | Q12 | SPF DNS error handling deviates from RFC 7208. **(b) FIXED**: a failed `a`/`mx` address lookup now returns Temperror instead of the mechanism's qualifier — it previously failed *open* (a bare `a` returned **Pass** on DNS failure). Still open: (a) top-level NXDOMAIN → Temperror (should be none); (c) redirect to nonexistent domain → Temperror (should be permerror) |
 | Q13 | SPF `redirect=` is evaluated positionally and short-circuits later mechanisms; RFC 7208 §6.1/§4.7 only consults it after all mechanisms have failed |
 
-## 7. Test suite layout (316 tests)
+## 7. Test suite layout (343 tests)
 
 - **Phase 1 — pure unit** (107): `SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9),
   `MailTransactionTests` (19, pins B1–B4), `CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7,
@@ -189,7 +191,7 @@ Shared infrastructure: `SmtpSession` (raw-TCP client with timeouts, multi-line r
 
 ## 8. Remaining work
 
-All four test-plan phases are complete. **316 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
+All four test-plan phases are complete. **343 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
 Q12(b), R11, R6) and the Codex adversarial follow-up — see `CHANGELOG.md` for the 2.0.0 release notes.
 Left:
 
@@ -273,9 +275,175 @@ item 2 above, one is a version decision now taken (2.0.0), and one **could not b
 git log --oneline -15          # commit stack (see §2)
 cat ARCHITECTURE.md            # how the code works + upstream sync record
 cat TEST_PLAN.md               # what's tested, what's pinned, what's left (§11 build order)
-$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 316/316 in ~11 s
+$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 343/343 in ~15 s
 ```
 
 Key source files: `CSharp-SMTP-Server/Networking/{ClientProcessor,Listener}.cs` (connection lifecycle —
 all three fixed bugs live here), `Protocol/Commands/{TransactionCommands,AuthenticationCommands}.cs`,
 `MailTransaction.cs` (B1–B4), `SMTPServer.cs` (public API surface).
+
+## 11. Load & integrity harness (`CSharp-SMTP-Server.Tests/Load/`)
+
+Added 2026-09-01. Answers three questions: does the server stay reliable under concurrency, does
+message content survive transport intact, and how does throughput change between commits.
+
+**Two tiers.** The fast tier (4 tests + the Q1 pin) runs on every `dotnet test` — modest scale,
+deterministic, ~2 s. The heavy tier (concurrency ladder to 500, sustained 1000-message run,
+max-receive-rate burst) is opt-in:
+
+```powershell
+$env:SMTP_LOADTEST="1"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build --filter "Category=Load"
+```
+
+**Asserted vs. measured — deliberately separated.** Assertions are machine-independent invariants:
+every accepted message delivered exactly once, payload digest unchanged, no duplicates, no dropped
+connections, no `[Client receive loop]` errors, listener still accepting afterwards. Throughput and
+latency percentiles are *reported* to `load-metrics.json` (gitignored, next to the test binary;
+override the directory with `SMTP_LOADTEST_OUT`), never asserted — a msgs/sec floor tuned on one
+machine becomes a flaky red build on another, and flaky builds get ignored.
+
+**Integrity is hash-based but not byte-exact on the wire, for two structural reasons.** The server
+prepends a `Received:` header containing `DateTime.UtcNow`, so every delivery differs even for
+identical input; and DATA capture uses `StringBuilder.AppendLine`, i.e. `Environment.NewLine`, so a
+byte-exact digest would pass on Windows and fail on Linux CI. `MessageCorpus.ExtractPayload` strips
+server-prepended headers (anchoring on `Subject:`) and `Canonicalize` normalizes line endings; the
+SHA-256 is taken over that. Verified non-vacuous by fault injection: flipping **one character** in a
+large body failed the run with per-message diagnostics (re-verified against the current corpus).
+
+**Corpus: 100 KB / 200 KB / 1000 KB** (rebalanced 2026-09-01 from an earlier 284 B–74 KB set, which
+was too small to say anything about byte throughput). Sizes are exact to 0.1 KB and all sit well
+under the 10 MB default `MessageCharactersLimit`. The 200 KB sample carries ~72 KB of genuine
+multi-byte UTF-8 (Polish/Greek/CJK/emoji), so it actually exercises the UTF-8 decode path; the
+1000 KB sample is the structurally important one, spanning many socket reads and repeatedly growing
+the DATA `StringBuilder`. Mean message ≈ 433 KB, so a 1000-message run moves ~423 MB.
+
+**The corpus avoids lines beginning with `.`** because dot-unstuffing is not implemented (Q1). That
+defect is pinned separately by `DotStuffing_IsNotImplemented_PinsQ1` rather than being allowed to
+surface as intermittent "corruption" in load runs. **When Q1 is fixed that test fails by design** —
+it marks the behavior change.
+
+**Byte metrics.** `MegabytesPerSecond` and `BytesAccepted` (plus `MeanMessageBytes`) are reported
+alongside msgs/sec. With a mixed-size corpus msgs/sec alone cannot distinguish "slower" from "moving
+larger messages", and MB/s stays comparable if the corpus is rebalanced again. Byte counts include
+only *accepted* messages, so they always agree with the msgs/sec figure.
+
+**Measured baseline** (KAT6, 16 logical cores, .NET 7.0.20, Debug build, loopback, no-op delivery
+handler — Debug and loopback both matter, these are not production numbers):
+
+| Scenario | Conc. | Msgs | Failures | msgs/sec | MB/s | Volume | p95 |
+|---|---|---|---|---|---|---|---|
+| ladder-conc-500 | 500 | 1000 | 0 | 58 | 24.6 | 423 MB | 1099 ms |
+| ladder-conc-200 | 200 | 400 | 0 | 52 | 21.9 | 169 MB | 1573 ms |
+| sustained-1000 | 50 | 1000 | 0 | 45 | 18.8 | 423 MB | 1511 ms |
+| ladder-conc-100 | 100 | 200 | 0 | 47 | 19.9 | 84 MB | 1502 ms |
+| max-receive-rate | 200 | 200 | 0 | 31 | 13.0 | 84 MB | 1800 ms |
+| pipelined-single-conn | 1 | 25 | 0 | 19 | 7.6 | 10 MB | 133 ms |
+
+At ~433 KB/message the server is **byte-bound, not message-bound**: MB/s is flat at roughly
+**15–25 MB/s** across the whole ladder from 5 to 500 connections, while msgs/sec varies only because
+message size does. Single-connection throughput (~7.6 MB/s) is about a third of the concurrent
+ceiling, so concurrency buys ~3× and then saturates — consistent with a per-connection stream copy
+being the bottleneck rather than the accept path. **Zero failures and zero corruption at every
+level**, which is the part that is asserted.
+
+Contrast with the earlier small corpus (mean 25 KB), which reported 300–870 msgs/sec but only
+~8–19 MB/s: message rate collapses ~15× while byte rate stays in the same band. That is the clearest
+argument for keeping the byte metrics — msgs/sec on its own would have suggested a catastrophic
+regression where the server's actual data throughput barely moved.
+
+**Client timeout raised for load sessions.** `SmtpSession` now takes an optional per-session timeout
+(default 10 s, unchanged for the 316 protocol tests); `LoadDriver` uses 2 minutes. At 200+
+concurrency with ~433 KB messages, connections queue behind one another and one accepted late can
+wait past 10 s just to be greeted — with the fixed default the harness reported **its own client
+timeout as a server failure** (54 spurious failures at conc=500). The work was queued, not lost:
+every message that was actually attempted succeeded.
+
+`SlowHandler_SessionsOverlap_ThroughputScalesWithConcurrency` is the one timing-sensitive assertion,
+and it is deliberately loose: 12 sessions × a 200 ms handler complete in ~0.5 s against a
+fully-serialized ~2.4 s, so it proves sessions overlap without being sensitive to scheduler jitter.
+This is what confirms ACK-gated delivery does not serialize the server — the structural expectation
+recorded in §2a, now measured rather than assumed.
+
+## 12. Office 365 journaling relay — required configuration
+
+> **➜ Action items for the next session are in [`immediate-todo.md`](immediate-todo.md).** It covers
+> the size limit and missing SIZE extension, the two defects found, the four mail-losing defaults,
+> and the streaming-DATA design that fixes the memory amplification. This section is the summary;
+> that file is the working brief.
+
+Added 2026-09-01. Deployment target: this server receives **journaled** mail relayed from Exchange
+Online. The governing asymmetry is that **a rejected journal report is a compliance record that no
+longer exists anywhere** — for ordinary mail a 5xx is the sender's problem; here it is permanent data
+loss. Every limit that can 5xx a well-formed message must therefore be raised above what O365 sends —
+but **not disabled**, since the server is internet-adjacent and an unbounded limit is a trivial OOM.
+
+Encoded as tests in `Load/Office365RelayTests.cs` (13 tests) so a regression fails the build.
+
+### Required settings
+
+```csharp
+var options = new ServerOptions(validateSPF: false, validateDMARC: false, null)
+{
+    ServerName             = "journal.example.com",
+    MessageCharactersLimit = 200u * 1024 * 1024,  // finite, above O365's 150 MB max — NOT 0
+    RecipientsLimit        = 0,
+};
+```
+
+| Setting | Default | Required | Why the default loses mail |
+|---|---|---|---|
+| `MessageCharactersLimit` | 10 MB | **200 MB** (finite) | Over-limit → `552 5.4.3`, a **permanent** failure. Exchange does not retry. O365's own max is 150 MB. |
+| `RecipientsLimit` | 50 | **0** | 51st recipient → `550 5.5.3`. A journal report for a large distribution list easily exceeds 50. |
+| `ValidateSPF` | on | **off** | SPF fail → `554 5.7.23` before DATA. A journal report's envelope sender is the journaling mailbox, so the original message's alignment is irrelevant and can fail spuriously. Also a blocking DNS lookup on the session thread. |
+| `ValidateDMARC` | on | **off** | DMARC fail → `554 5.7.1`. Same reasoning. |
+
+Also verify: any `IMailFilter` must not reject (every filter hook can 5xx), and the `IMailDelivery`
+handler must **throw or return `TemporaryFailure`** on a backend outage — never `Ok`. Throwing yields
+`451 4.3.0`, which is transient, so Exchange queues and retries; returning `Ok` acknowledges a
+message that was never stored. Pinned by `DeliveryHandlerThrows_YieldsTemporaryFailure_SoExchangeRetries`.
+
+### Why the limit must be finite — and why that is safe
+
+Setting `MessageCharactersLimit = 0` removes the rejection path but lets one client stream unbounded
+data into a `StringBuilder` until the pod is OOM-killed. A finite ceiling above O365's 150 MB gives
+the same delivery guarantee while keeping the DoS bound.
+
+**A finite limit genuinely bounds memory** — `ProcessData` counts every line but appends only while
+`Counter` is within the limit, so over-limit data is discarded as it arrives rather than accumulated.
+Measured: **200 MB sent against a 10 MB limit peaked at ~126 MB** working set (not ~2 GB), returned
+`552` at the terminating dot, and the connection stayed usable. Pinned by
+`OverLimitFlood_IsDiscardedNotBuffered_AndConnectionSurvives`.
+
+Two caveats: the limit counts **characters excluding CRLF**, not bytes (1:1 for MIME's ASCII/base64,
+and the headroom above 150 MB covers base64 expansion plus headers); and it is enforced **late**, at
+the terminating dot, so it bounds memory but not bandwidth or connection time.
+
+### Measured: 150 MB works, but memory is the real constraint
+
+A 150 MB message is accepted and delivered intact in ~2.5 s. **Peak working set for that single
+message: ~1.6–1.9 GB — roughly 11× the message size.** The body is accumulated in a `StringBuilder`,
+materialized by `ToString()`, copied again by `MailTransaction.Clone()`, and .NET strings are UTF-16
+(2 bytes/char), so several full copies coexist.
+
+**Pod sizing must budget ~2 GB per _concurrent_ large message, not per pod.** Concurrency is what
+causes OOM, not total volume: 4 × 50 MB concurrently peaked at ~1.9 GB. A pod accepting several
+150 MB journal reports at once on a 2 GB limit will be OOM-killed mid-transaction.
+
+**This is unacceptable for production and is the top follow-up** — the fix is a streaming DATA path
+(buffer to a `Stream`, spill to disk past a threshold, expose `GetBodyStream()`, stop materializing
+`RawBody`), which would make peak memory *O(buffer)* instead of *O(11 × message)*. Design sketch and
+sequencing in [`immediate-todo.md`](immediate-todo.md) item 4. It is a breaking public API change
+(`RawBody` is public), so it wants a major version.
+
+### Two known gaps found while writing these tests
+
+1. **`MAIL FROM:<>` (null sender) is rejected with `501 5.5.2`.** RFC 5321 §4.5.5 requires it to be
+   accepted; it is what DSNs and some Exchange system-generated reports use. Cause:
+   `TransactionCommands.ProcessAddress` requires a non-empty address with '@' and a dotted domain, so
+   `<>` returns null. **This is a live defect for this deployment**, pinned by
+   `NullSender_IsCurrentlyRejected_KnownGapForJournaling` — when fixed, that test fails by design and
+   should be inverted to assert 250. Fix = special-case the empty path in the MAIL FROM branch.
+2. **No `SIZE` extension advertised** (EHLO returns only `250-<name>` and `250 8BITMIME`). RFC 1870
+   lets a sender learn the limit up front; without it Exchange discovers an over-limit message only
+   after transmitting it in full. O365's `SIZE=`/`BODY=8BITMIME` parameters on MAIL FROM are parsed
+   correctly today (ignored, not rejected), pinned by `MailFrom_WithO365EsmtpParameters_IsAccepted`.
