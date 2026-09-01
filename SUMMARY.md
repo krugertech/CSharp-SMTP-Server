@@ -44,6 +44,25 @@ the SMTP session by design.
 Fork diff vs baseline: `git diff 2f7386e..HEAD` (`2f7386e` = squashed import of v1.1.6, not an upstream commit).
 Re-audit upstream with: `git fetch upstream && git log --oneline 1.1.6..upstream/master` + check open PRs/issues on GitHub.
 
+## 2a. Deployment model (drives several priority calls below)
+
+**One server instance per Kubernetes pod**, each with its own IP, all on the same port. Scaling is
+horizontal across pods — never two instances in one process or on one host.
+
+Consequences worth knowing before judging any finding:
+- **Per-process static state is acceptable**, because the process is the unit of deployment. This is
+  why the `DmarcValidator` public-suffix statics (§8 item 2) are deprioritised rather than treated as
+  a defect. Pods share nothing, so horizontal scaling is close to linear.
+- **Shutdown correctness matters more than it would for a long-lived single server.** Pods terminate
+  routinely — scale-down, rolling deploys, node drains, evictions — so the shutdown paths fixed by R11
+  and R7 are exercised constantly rather than rarely. Graceful *drain* is still open (§8 item 3).
+- **Throughput is bounded by the delivery handler, not this library.** Delivery is ACK-gated and
+  awaited inside the session, so per-pod throughput is roughly
+  `concurrent_sessions / (handler_latency + round_trips)`. If SPF/DMARC are enabled, cold-cache DNS
+  lookups on the session thread will likely dominate everything else — consider a resolver cache
+  before optimising anything in this codebase. **No benchmark has been run**; these are structural
+  expectations, not measurements.
+
 ## 3. Build & test (exact commands)
 
 ```powershell
@@ -54,12 +73,11 @@ $env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SM
 
 Gotchas:
 - Without `DOTNET_ROLL_FORWARD=Major`, tests abort with "framework not found".
-- Test classes run **serially** (`xunit.runner.json`: `parallelizeTestCollections: false`). Measured,
-  not assumed: with `maxParallelThreads: 4`, 6 of 8 runs fail, always on
-  `DmarcOrganizationalDomainTests.MultiLevelPublicSuffix_WalksUpUntilNonSuffix` — `DmarcValidator`
-  keeps the public-suffix list in process-wide statics that `ForceRefreshList` mutates mid-run. See
-  §8 item 2 before re-enabling. (Port allocation, R8, did *not* surface in those runs, but is still
-  theoretically racy.)
+- Test classes run **serially** (`xunit.runner.json`: `parallelizeTestCollections: false`), and that is
+  the intended steady state — see §2a. Measured, not assumed: with `maxParallelThreads: 4`, 6 of 8 runs
+  fail, always on `DmarcOrganizationalDomainTests.MultiLevelPublicSuffix_WalksUpUntilNonSuffix`
+  (process-wide suffix-list statics mutated mid-run). Don't flip it without reading §8 item 2. ~11 s
+  serial is cheap; flaky is not.
 - Every test read is bounded by a 10 s timeout (in `SmtpSession`), so regressions fail instead of hanging.
 
 ## 4. Bugs found & fixed in this fork (each has regression tests)
@@ -179,28 +197,40 @@ Left:
    parse), **R1** (the `WriteCode(int,string)` overload accident — ~53 assertions across 10 files),
    **Q1** (no dot-stuffing in DATA — data-integrity, arguably P1), **Q3**, **Q8**, **Q11** (multi-string
    TXT records, needs a dependency decision), **Q12(a)/(c)**, **Q13**, plus R2/R4/R8/R9 (R7 is now done — see §4).
-2. **Parallel test classes — blocked on ONE remaining item, measured.** Goal: enable
-   `parallelizeTestCollections` so load/parallelism tests can be built. R7 (done) was a prerequisite,
-   not the whole job. Measured with `maxParallelThreads: 4`, **8 consecutive runs: 6 failed**, always
-   the same culprit —
-   `DmarcOrganizationalDomainTests.MultiLevelPublicSuffix_WalksUpUntilNonSuffix`.
+2. **Parallel test classes — DEPRIORITISED (deployment decision, 2026-09-01).** Production scales by
+   running one server per Kubernetes pod, each with its own IP and the same port — never two instances
+   in one process or on one host. The parallelism work was motivated by an in-process multi-instance
+   load harness, which is no longer the plan, so this is now optional cleanup rather than a
+   prerequisite. `xunit.runner.json` stays serial.
 
-   **Root cause:** `DmarcValidator` holds the public-suffix list in **process-wide statics**
-   (`PublicSuffixes`, `_publicSuffixesLoaded`), and `ForceRefreshList_SwitchesTheActiveSuffixSet`
-   swaps that set at runtime. Any DMARC test running concurrently reads a half-swapped list. This is a
-   *library* design issue, not a test one: the suffix list is per-process, so two `SMTPServer`
-   instances in one process cannot use different lists.
+   Recorded for whoever revisits it. R7 (done) was a prerequisite but not sufficient: with
+   `maxParallelThreads: 4`, **8 consecutive runs, 6 failed**, always
+   `DmarcOrganizationalDomainTests.MultiLevelPublicSuffix_WalksUpUntilNonSuffix`. `DmarcValidator`
+   holds the public-suffix list in **process-wide statics** (`PublicSuffixes`, `_publicSuffixesLoaded`)
+   and `ForceRefreshList_SwitchesTheActiveSuffixSet` swaps that set at runtime, so concurrent DMARC
+   tests read a half-swapped list. Options: (a) make the suffix set per-`DmarcValidator` instance —
+   the honest fix, a public behavior change; (b) put the mutating tests in one xUnit collection;
+   (c) have that test build its own validator instead of using the shared fixture.
 
-   **Options:** (a) make the suffix set per-`DmarcValidator` instance — the honest fix, and a public
-   behavior change worth noting; (b) keep the statics and put the mutating tests in one xUnit
-   collection, which restores safety without fixing the library; (c) leave `ForceRefreshList` alone and
-   have the test assert against a locally-constructed validator instead of the shared fixture.
+   **Under the pod-per-instance model the statics are no longer a defect** — the process *is* the unit
+   of deployment, so per-process suffix state is the right granularity. Only revisit if something ever
+   needs two `SMTPServer` instances with different suffix lists in one process.
 
-   Note the port-allocation TOCTOU (R8) did **not** surface in these runs, but is still theoretically
-   live: `TestPorts.Allocate()` binds port 0, reads the assignment, then releases before the caller
-   rebinds. Fix it opportunistically when doing the above; a load-test suite will hit it far harder
-   than the current tests do.
-3. Anything from the upstream re-audit.
+   R8 (port-allocation TOCTOU in `TestPorts.Allocate()` — binds port 0, reads the assignment, releases
+   before the caller rebinds) did **not** surface in those runs and stays theoretical while the suite
+   is serial.
+3. **Graceful drain on SIGTERM — the open question that actually matters in production.** Not
+   implemented, and worth a decision before heavy production traffic. `Dispose()` now shuts down
+   *correctly* (R11: connections accepted during shutdown are refused and disposed; R7: the accept
+   thread is joined before the TLS certificate is disposed), but it **terminates** open sessions rather
+   than draining them. Because delivery is ACK-gated and awaited inside the session, a pod killed
+   mid-delivery can leave the handler having committed a message while the sender never received its
+   250 — the sender then retries, producing a **duplicate**. Two things to settle:
+   - Confirm the host actually calls `SMTPServer.Dispose()` on `SIGTERM` rather than letting the
+     process exit. Without that, none of the shutdown correctness above runs at all.
+   - Decide whether idempotent delivery is enough, or whether to implement real drain (stop accepting,
+     let in-flight sessions finish, then exit) inside the K8s grace period (default 30 s).
+4. Anything from the upstream re-audit.
 
 ### Codex adversarial review — dispositions
 
