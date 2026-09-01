@@ -1,7 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
+    <!-- Multi-targeted so the DKIM suite can run. MimeKit 4.17 ships net8.0 and net10.0 builds;
+         a net7.0 consumer falls back to its netstandard2.1 build, whose Ed25519DigestSigner is
+         incompatible with the BouncyCastle 2.6.2 that MimeKit itself requires, so any DkimSigner
+         use throws TypeLoadException. net7.0 is retained because it is the framework the shipped
+         library targets and the rest of the suite must keep proving it works there. -->
+    <TargetFrameworks>net7.0;net8.0</TargetFrameworks>
     <RootNamespace>CSharp_SMTP_Server.Tests</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>

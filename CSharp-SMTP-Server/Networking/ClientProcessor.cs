@@ -82,6 +82,39 @@ namespace CSharp_SMTP_Server.Networking
 		internal bool DataTruncated;
 
 		/// <summary>
+		/// Whether any line of the current message was terminated by a bare LF rather than CRLF.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// RFC 5321 §4.1.1.4 requires a server to refuse these rather than repair them, and names the
+		/// <c>&lt;LF&gt;.&lt;LF&gt;</c> end-of-data case specifically — the SMTP-smuggling class. See
+		/// <see cref="BoundedLineReader.LastLineBareLf"/> for the mechanism.
+		/// </para>
+		/// <para>
+		/// Latched for the whole message and acted on at the terminating dot, in the same shape as
+		/// <see cref="DataTruncated"/>: refusing mid-body would leave the rest of the message to be
+		/// parsed as commands, so the transaction is read to its end and then refused.
+		/// </para>
+		/// <para>
+		/// Reset when DATA capture begins, and cleared with the transaction.
+		/// </para>
+		/// </remarks>
+		internal bool DataBareLf;
+
+		/// <summary>
+		/// Whether the line currently being processed was terminated by a bare LF.
+		/// </summary>
+		/// <remarks>
+		/// Per-line, unlike <see cref="DataBareLf"/>, which latches for the whole message. The DATA
+		/// path needs to know how <em>this</em> line ended in order to refuse to treat a bare-LF dot as
+		/// the end of DATA — see <c>TransactionCommands.ProcessData</c>. Keeping the latched and
+		/// per-line signals separate matters: by the time a conforming terminator arrives, the latch is
+		/// set for the message, and testing the latch instead would make every dot after the first bare
+		/// LF unrecognizable, so the transaction could never be terminated or refused at all.
+		/// </remarks>
+		internal bool LastLineWasBareLf;
+
+		/// <summary>
 		/// Ends the current transaction, releasing the storage its body holds.
 		/// </summary>
 		/// <remarks>
@@ -305,6 +338,15 @@ namespace CSharp_SMTP_Server.Networking
 						if (_reader.LastLineTruncated)
 							DataTruncated = true;
 
+						// Latch a bare-LF terminator for the whole message, and record it for this line
+						// alone. The per-line flag is what stops a bare-LF dot from ending DATA capture
+						// (see ProcessData); the latch is what refuses the message at the conforming
+						// terminator that eventually arrives.
+						LastLineWasBareLf = _reader.LastLineBareLf;
+
+						if (_reader.LastLineBareLf)
+							DataBareLf = true;
+
 						if (_greetSent)
 							await TransactionCommands.ProcessData(this, line.Value.Buffer, line.Value.Length);
 
@@ -315,6 +357,20 @@ namespace CSharp_SMTP_Server.Networking
 
 					if (read == null)
 						continue;
+
+					// A command line must be CRLF-terminated (RFC 5321 §2.3.8). Executing an LF-framed
+					// command preserves the same parser differential the DATA rule closes: a CRLF-strict
+					// gateway or policy layer in front of this server sees one line where this server
+					// would see several, so bytes that passed inspection as a single command become
+					// multiple backend commands. The connection is dropped rather than the line merely
+					// refused, because anything already buffered behind it was framed by the same
+					// non-conforming client and must not be executed either.
+					if (_reader.LastLineBareLf)
+					{
+						await WriteCode(500, "5.5.2",
+							"Line must be terminated by CRLF; bare linefeeds are not accepted.");
+						break;
+					}
 
 					await ProcessResponse(read);
 				}

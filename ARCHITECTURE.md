@@ -65,7 +65,11 @@ shutdown item in [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#graceful-shutdown-and-dupli
 2. The processor applies implicit TLS when configured, runs `IsConnectionAllowed`, and writes the
    greeting.
 3. `BoundedLineReader` reads commands with a 1 MB maximum line length. It truncates and drains an
-   overlong line without allowing unbounded allocation.
+   overlong line without allowing unbounded allocation. A command line terminated by a bare LF is
+   answered with `500 5.5.2` and the connection is closed: executing LF-framed commands would leave a
+   parser differential against any CRLF-strict gateway in front of the server, where bytes inspected
+   as one line become several backend commands. The connection is dropped rather than the line
+   skipped so that input already buffered behind it cannot execute either.
 4. `ClientProcessor.ProcessResponse` dispatches commands to the transaction or authentication
    command handlers.
 5. `EHLO` advertises the configured extensions, including `8BITMIME`, `SIZE`, optional AUTH, and
@@ -108,11 +112,24 @@ decoded strings:
    completed transaction receives `552`.
 4. A DATA line exceeding the 1 MB line cap latches a truncation flag. The server drains the line and
    rejects the transaction with `552` at the terminator rather than delivering incomplete bytes.
-5. The server prepends `Received:` and applicable `Authentication-Results:` headers.
-6. DMARC, if enabled, validates a single header-From mailbox. Authenticated clients bypass SPF and
+5. A line terminated by a bare LF rather than CRLF latches a flag, and the transaction is rejected
+   with `554 5.6.0` at the terminator. Critically, **a dot line terminated by bare LF is not
+   end-of-DATA**: capture continues and the dot is treated as body content. RFC 5321 §4.1.1.4
+   requires this and names `<LF>.<LF>` specifically. Leaving DATA capture there is what makes SMTP
+   smuggling exploitable — every octet after the bare-LF dot would be parsed as commands on an
+   already-authenticated connection, so a pipelined `MAIL FROM`/`RCPT TO`/`DATA` would deliver an
+   injected message under the first one's SPF and DMARC results. Staying in capture keeps those
+   octets inert. Normalizing instead of refusing would also rewrite the sender's octets and
+   invalidate any DKIM signature over them.
+
+   A truncated line (item 4) is excluded from this check: its discarded tail may have carried the CR
+   of a conforming CRLF, so testing the retained prefix would report a line-ending defect the client
+   did not commit. Such a line is refused as truncated instead.
+6. The server prepends `Received:` and applicable `Authentication-Results:` headers.
+7. DMARC, if enabled, validates a single header-From mailbox. Authenticated clients bypass SPF and
    DMARC. Null reverse-path DMARC alignment uses the HELO identity only when SPF authenticated it.
-7. `IMailFilter.CanProcessTransaction` gets the completed transaction.
-8. The transaction is handed to the delivery path and the processor releases its reference.
+8. `IMailFilter.CanProcessTransaction` gets the completed transaction.
+9. The transaction is handed to the delivery path and the processor releases its reference.
 
 The body path preserves the DATA octets and is suitable for downstream integrity verification. The
 server does not itself implement DKIM verification.

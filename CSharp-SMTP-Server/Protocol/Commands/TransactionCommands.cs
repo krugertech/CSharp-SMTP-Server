@@ -191,6 +191,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 					processor.Counter = 0;
 					processor.DataTruncated = false;
+					processor.DataBareLf = false;
 					processor.CaptureData = 1;
 					await processor.WriteCode(354);
 					break;
@@ -229,7 +230,19 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			}
 
 			{
-				if (IsTerminatingDot(buffer, length))
+				// A dot line is the end of DATA only when it was terminated by CRLF. RFC 5321 §4.1.1.4
+				// is explicit that <LF>.<LF> MUST NOT be treated as equivalent to <CRLF>.<CRLF>, and
+				// honouring it here would be the smuggling vulnerability itself rather than merely a
+				// conformance gap: leaving DATA capture hands every octet the client sent after the
+				// bare-LF dot to the command parser, on a connection an upstream hop has already
+				// authenticated. A pipelined MAIL FROM/RCPT TO/DATA after such a dot then delivers a
+				// second, injected message under the first one's SPF and DMARC results.
+				//
+				// So the dot is treated as ordinary body content and capture continues. The message is
+				// already doomed — DataBareLf is latched, and the transaction is refused at whatever
+				// conforming terminator eventually arrives — but staying in DATA is what keeps the
+				// attacker's trailing octets inert, because body bytes are stored, never executed.
+				if (IsTerminatingDot(buffer, length) && !processor.LastLineWasBareLf)
 				{
 					processor.CaptureData = 0;
 
@@ -257,6 +270,32 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					{
 						processor.DiscardTransaction();
 						await processor.WriteCode(552, "5.4.3", "Line length exceeds the administrative limit.");
+						return;
+					}
+
+					// RFC 5321 §2.3.8 and §4.1.1.4: CR and LF may appear only together, as a terminator,
+					// and a server MUST NOT accept lines ending in LF alone "even in the name of improved
+					// robustness" — the text names <LF>.<LF> specifically. Honouring a bare LF is the
+					// SMTP-smuggling class disclosed in December 2023: when this hop and the next
+					// disagree about what ends a message, one submission is read as one message here and
+					// as two elsewhere, and the smuggled message inherits this connection's
+					// authentication, SPF result and DMARC pass. For a journaling relay that means a
+					// forged record archived as authenticated.
+					//
+					// Refusing is also what keeps the archive faithful. The alternative — silently
+					// rewriting bare LF to CRLF, which is what this server used to do — changes the
+					// octets the sender transmitted and so invalidates any DKIM signature over them,
+					// destroying the origin proof that is the whole point of preserving the bytes.
+					// Exchange Online reaches the same conclusion and rejects with
+					// SMTPSEND.BareLinefeedsAreIllegal, having deliberately stopped stripping bare LFs
+					// for exactly this reason, so refusing costs no mail an Office 365 sender could send.
+					//
+					// 5.6.0 is the enhanced code for undeliverable message content (RFC 3463 §3.6).
+					if (processor.DataBareLf)
+					{
+						processor.DiscardTransaction();
+						await processor.WriteCode(554, "5.6.0",
+							"Message contains bare linefeeds, which cannot be accepted via DATA.");
 						return;
 					}
 

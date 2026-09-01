@@ -4,37 +4,39 @@ using System.Text;
 namespace CSharp_SMTP_Server.Tests.Load;
 
 /// <summary>
-/// The sample messages sent by the load tests, each with a SHA-256 digest of its canonical payload.
+/// The sample messages sent by the load tests, hashed as exact octets.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Integrity checking here is deliberately NOT a hash of the bytes on the wire, because the server
-/// legitimately rewrites every message before delivery:
-/// </para>
-/// <list type="bullet">
-/// <item><description>
-/// <c>TransactionCommands.ProcessData</c> prepends a <c>Received:</c> header containing
-/// <c>DateTime.UtcNow</c>, so the delivered body differs on every single message even for identical
-/// input. <c>Authentication-Results</c> may be prepended too.
-/// </description></item>
-/// <item><description>
-/// The DATA capture uses <c>StringBuilder.AppendLine</c>, which emits <see cref="Environment.NewLine"/>
-/// — CRLF on Windows, LF on Linux. A byte-exact comparison would pass locally and fail on Linux CI for
-/// reasons unrelated to the server's correctness.
-/// </description></item>
-/// </list>
-/// <para>
-/// So the contract verified is: <em>the payload the client sent survives transport unaltered, modulo
-/// server-prepended headers and line-ending normalization</em>. <see cref="Canonicalize"/> defines
-/// that normalization and <see cref="ExtractPayload"/> strips the prepended headers.
+/// The server prepends headers — <c>Received:</c> always, carrying a <c>DateTime.UtcNow</c> that
+/// differs on every message, and <c>Authentication-Results:</c> when validation is enabled — so the
+/// delivered message is never byte-identical to what was sent. Everything from the client's own
+/// first header onward is, and that is what these hashes cover:
+/// <see cref="ExtractPayloadBytes"/> anchors on the id header line and hashes from there to the end.
 /// </para>
 /// <para>
-/// No payload line begins with '.'. The server now unstuffs correctly (historical Q1, fixed), but a
-/// leading-dot line still has a wire form that differs from its stored form, and these samples are
-/// hashed as written rather than as framed — so keeping them dot-free means a corpus hash needs no
-/// knowledge of transparency encoding. Unstuffing has its own dedicated coverage; see
-/// <c>DotStuffing_IsUnstuffed_Q1Fixed</c> here and <c>DotStuffing_IsUnstuffed_BodyLinesStoredAsComposed</c>
-/// in <c>DataAndMessageTests</c>.
+/// <b>This was previously a hash of a canonicalized string, and that was too weak.</b> The old
+/// <c>Canonicalize</c> mapped CRLF to LF and trimmed trailing newlines before hashing, justified by
+/// the DATA path using <c>StringBuilder.AppendLine</c> and so emitting <see cref="Environment.NewLine"/>
+/// — bare LF on Linux. That justification is stale: the DATA path now writes through
+/// <c>MessageBody.WriteLine</c>, which appends an explicit CRLF on every platform. Normalizing line
+/// endings before hashing therefore erased a difference the server no longer produces, which meant a
+/// CRLF regression under load could not fail these tests. The hash is now over raw bytes, so it can.
+/// </para>
+/// <para>
+/// The old anchor was equally loose. It searched for the substring <c>"Subject:"</c>, which is not
+/// line-anchored and discarded every byte before it — including the <see cref="IdHeader"/> line the
+/// sender stamped. Anchoring on the exact id header line instead keeps every client header inside
+/// the hashed range, so corruption of <c>Subject</c>, <c>From</c> or <c>To</c> is now caught rather
+/// than skipped over.
+/// </para>
+/// <para>
+/// No payload line begins with '.'. The server unstuffs correctly (historical Q1, fixed), but a
+/// leading-dot line has a wire form that differs from its stored form, and these samples are hashed
+/// as composed rather than as framed — so keeping them dot-free means the corpus needs no knowledge
+/// of transparency encoding. Unstuffing has dedicated coverage: <c>DotStuffing_IsUnstuffed_Q1Fixed</c>
+/// here, <c>DotStuffing_IsUnstuffed_BodyLinesStoredAsComposed</c> in <c>DataAndMessageTests</c>, and
+/// <c>LeadingDotLines_RoundTripThroughTransparency</c> in the byte-integrity suite.
 /// </para>
 /// </remarks>
 internal static class MessageCorpus
@@ -42,14 +44,31 @@ internal static class MessageCorpus
     /// <summary>Marker header carrying the per-send unique id, used to pair sends with deliveries.</summary>
     internal const string IdHeader = "X-Load-Id";
 
-    /// <summary>A single sample message: a fixed payload plus the digest of its canonical form.</summary>
+    /// <summary>A single sample message: a fixed payload, hashed per-send as exact octets.</summary>
+    /// <remarks>
+    /// The digest depends on the send id, because the id header is part of the transmitted message
+    /// and therefore part of the hashed range — so it is computed by <see cref="ExpectedSha256"/> per
+    /// send rather than stored once on the sample.
+    /// </remarks>
     internal sealed record Sample(string Name, string Payload)
     {
-        /// <summary>SHA-256 of the canonicalized payload, in lowercase hex.</summary>
-        internal string Sha256 { get; } = Hash(Canonicalize(Payload));
-
         /// <summary>Payload size in UTF-8 bytes as sent — the basis for byte-throughput reporting.</summary>
         internal int Bytes { get; } = Encoding.UTF8.GetByteCount(Payload);
+
+        /// <summary>
+        /// The exact octets this sample produces on the wire for a given send id, headers included.
+        /// </summary>
+        /// <remarks>
+        /// Must match what <c>LoadDriver.SendOneAsync</c> transmits, byte for byte: the id header
+        /// line, the payload, and the CRLF that terminates the payload's final line. The driver sends
+        /// the payload line by line and each <c>SmtpSession.Send</c> appends a CRLF, so the final
+        /// line gets one even though <see cref="Trim"/> stripped it from the stored payload.
+        /// </remarks>
+        internal byte[] ExpectedBytes(string id) =>
+            Encoding.UTF8.GetBytes($"{IdHeader}: {id}\r\n{Payload}\r\n");
+
+        /// <summary>SHA-256 of <see cref="ExpectedBytes"/>, in lowercase hex.</summary>
+        internal string ExpectedSha256(string id) => Hash(ExpectedBytes(id));
     }
 
     /// <summary>
@@ -151,45 +170,74 @@ internal static class MessageCorpus
         return text;
     }
 
-    /// <summary>
-    /// Normalizes a message for hashing: CRLF/CR to LF, and strip trailing blank lines.
-    /// </summary>
-    /// <remarks>
-    /// Line-ending normalization is required because the server re-joins captured lines with
-    /// <see cref="Environment.NewLine"/>. Trailing-blank-line trimming absorbs the empty final line
-    /// that <c>AppendLine</c> leaves after the last body line. Neither weakens the check meaningfully:
-    /// any content change, reordering, truncation or cross-talk still alters the digest.
-    /// </remarks>
-    internal static string Canonicalize(string message) =>
-        message.Replace("\r\n", "\n").Replace('\r', '\n').TrimEnd('\n');
-
-    /// <summary>SHA-256 of a string's UTF-8 bytes, as lowercase hex.</summary>
-    internal static string Hash(string text) =>
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
+    /// <summary>SHA-256 of the given octets, as lowercase hex.</summary>
+    internal static string Hash(byte[] data) =>
+        Convert.ToHexString(SHA256.HashData(data)).ToLowerInvariant();
 
     /// <summary>
-    /// Recovers the client-sent payload from a delivered <c>RawBody</c> by dropping the headers the
-    /// server prepended, then canonicalizing.
+    /// Recovers the client-sent octets from a delivered message by locating the id header line.
     /// </summary>
     /// <remarks>
-    /// The server prepends whole headers (<c>Received</c>, optionally <c>Authentication-Results</c>)
-    /// to the front of the raw body, so the original payload starts at the first line that begins one
-    /// of the corpus's own headers. Anchoring on <c>Subject:</c> is exact for this corpus: every
-    /// sample starts with it, and no server-prepended header does.
+    /// <para>
+    /// Anchored on the exact line <c>X-Load-Id: &lt;id&gt;CRLF</c>. The server prepends its headers
+    /// into the same header block as the client's, so there is no structural boundary that separates
+    /// them — splitting at the first blank line would hash only the body and would miss corruption of
+    /// <c>Subject</c>, <c>From</c> or <c>To</c> entirely. The id line is the first thing the sender
+    /// transmits, so anchoring there keeps every client header inside the hashed range.
+    /// </para>
+    /// <para>
+    /// Returns null when the anchor is absent, which the caller reports as an unidentified delivery
+    /// rather than as a corruption.
+    /// </para>
     /// </remarks>
-    internal static string ExtractPayload(string rawBody)
+    internal static byte[]? ExtractPayloadBytes(byte[] delivered, string id)
     {
-        var normalized = Canonicalize(rawBody);
-        var index = normalized.IndexOf("Subject:", StringComparison.Ordinal);
-        return index < 0 ? normalized : normalized[index..];
+        var anchor = Encoding.ASCII.GetBytes($"{IdHeader}: {id}\r\n");
+        var index = IndexOfLineAnchored(delivered, anchor);
+
+        if (index < 0) return null;
+
+        var result = new byte[delivered.Length - index];
+        Buffer.BlockCopy(delivered, index, result, 0, result.Length);
+
+        return result;
+    }
+
+    /// <summary>Finds <paramref name="needle"/> where it begins a line (start of message, or after LF).</summary>
+    private static int IndexOfLineAnchored(byte[] haystack, byte[] needle)
+    {
+        for (var i = 0; i + needle.Length <= haystack.Length; i++)
+        {
+            if (i > 0 && haystack[i - 1] != (byte)'\n') continue;
+
+            var match = true;
+
+            for (var j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] == needle[j]) continue;
+                match = false;
+                break;
+            }
+
+            if (match) return i;
+        }
+
+        return -1;
     }
 
     /// <summary>
     /// Reads the <see cref="IdHeader"/> value the sender stamped on a message, or null if absent.
     /// </summary>
-    internal static string? ExtractId(string rawBody)
+    /// <remarks>
+    /// Decodes only enough of the message to find the header line. The id is ASCII by construction,
+    /// so decoding it is safe; the payload it identifies is never decoded.
+    /// </remarks>
+    internal static string? ExtractId(byte[] delivered)
     {
-        foreach (var line in Canonicalize(rawBody).Split('\n'))
+        var prefixLength = Math.Min(delivered.Length, 4096);
+        var prefix = Encoding.ASCII.GetString(delivered, 0, prefixLength);
+
+        foreach (var line in prefix.Split('\n'))
         {
             if (line.StartsWith(IdHeader + ":", StringComparison.OrdinalIgnoreCase))
                 return line[(IdHeader.Length + 1)..].Trim();

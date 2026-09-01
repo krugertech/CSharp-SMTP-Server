@@ -225,9 +225,11 @@ public sealed class LoadAndIntegrityTests
         var body = Assert.Single(delivery.Delivered).RawBody;
 
         // RFC 5321 §4.5.2: the stuffing dot is transport framing and is stripped, so the archive holds
-        // the line the sender composed.
+        // the line the sender composed. Asserted against CRLF directly rather than through the old
+        // MessageCorpus.Canonicalize: the DATA path writes an explicit CRLF on every platform, so
+        // normalizing line endings before the check would discard part of what is being asserted.
         Assert.DoesNotContain("..leading dot line", body);
-        Assert.Contains("\n.leading dot line", MessageCorpus.Canonicalize(body));
+        Assert.Contains("\r\n.leading dot line", body);
     }
 
     // ── heavy tier: opt in with SMTP_LOADTEST=1 ───────────────────────────────────────────────

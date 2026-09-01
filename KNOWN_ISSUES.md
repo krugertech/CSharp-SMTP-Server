@@ -37,6 +37,27 @@ authentication mechanism available to DMARC for null reverse-path messages.
 The unfinished upstream `dkim` branch was deliberately not merged. Treat DKIM verification as a
 future feature, not an advertised capability.
 
+`Integrity/DkimSurvivalTests` signs messages with a test key and verifies them after delivery. That
+is a test fixture and does not change the above: nothing in `CSharp-SMTP-Server` signs, verifies, or
+references DKIM, and the `IDkimPublicKeyLocator` those tests use lives in the test assembly.
+
+### Archived DKIM signatures cannot necessarily be re-verified later
+
+The server preserves signed octets, so a signature that arrived valid is still valid in the archive.
+Verifying it *later* is a separate problem: DKIM verification needs the signing domain's public key,
+fetched from DNS at the selector named in the signature. Selectors are rotated and retired, so a key
+looked up months after receipt may differ from the one that signed the message, or be gone.
+
+This matters wherever DKIM is the evidence of who sent a message — its value in a dispute depends on
+being able to re-verify, not merely on having verified once. Nothing in the library addresses it,
+and `Integrity/DkimSurvivalTests` does not cover it: those tests verify at delivery time with the key
+in memory.
+
+Pending decision, for the deployment rather than the library: capture the verification result and/or
+the public key at receipt, alongside the message. This is a consumer concern — the delivery handler
+sees the message and can resolve the key while it is still published — so it may not warrant a
+library change at all.
+
 ## SPF and DMARC
 
 These items matter only when SPF or DMARC validation is enabled. The Office 365 journaling profile in

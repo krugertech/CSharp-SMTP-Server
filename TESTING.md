@@ -57,6 +57,55 @@ The suites do not certify "100% compatibility" — no loopback suite can. The se
 `ENHANCEDSTATUSCODES`, `SMTPUTF8`, or `DSN`. What they establish is correct interoperation within the
 advertised subset, and safe, non-desyncing refusal of everything outside it.
 
+## Integrity suite
+
+`Integrity/` holds the chain-of-custody tests — that the octets accepted in DATA are the octets
+handed to `IMailDelivery`:
+
+```powershell
+$env:DOTNET_ROLL_FORWARD = "Major"
+dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Category=Integrity"
+```
+
+- `Integrity/ByteIntegrityTests.cs` — **the primary oracle.** Composes exact byte arrays, transmits
+  them with only the transport framing RFC 5321 §4.5.2 requires, and compares the delivered octets
+  against what was composed. Covers folded headers, trailing SP/HTAB, terminal blank lines, NUL and
+  control bytes, 8-bit/invalid-UTF-8 octets, leading-dot lines, and a body crossing the 4 MB spill
+  boundary. Includes a negative control proving the comparison fails on a single flipped byte.
+- `Integrity/DkimSurvivalTests.cs` — **origin authentication.** Signs with a test key, sends through
+  the server, verifies the delivered message. This is the only evidence the relay carries that a
+  message genuinely came from the customer it claims to: SPF authenticates the connecting IP (often
+  just the customer's own relay), while DKIM authenticates the message and survives forwarding. It is
+  also the check that catches someone relaying through us while impersonating a customer — they
+  cannot produce a signature that verifies against that customer's public key.
+
+  It answers a *different* question from the byte tests, not a weaker version of the same one. DKIM
+  coverage is deliberately lossy — both body canonicalizations are many-to-one, only headers in `h=`
+  are covered, and signer/parser/verifier are all MimeKit — so it cannot substitute for byte
+  comparison. `AlteredUnsignedHeader_StillVerifies_ShowingTheLimitOfThisOracle` asserts that limit
+  rather than leaving it to a comment. Note the suite verifies at *delivery* time; re-verifying an
+  archived message later needs the key as it was at receipt, since selectors get rotated.
+- `Integrity/LineEndingConformanceTests.cs` — **bare-LF refusal and SMTP smuggling.** Asserts that a
+  bare LF anywhere in DATA refuses the message (`554 5.6.0`), that a bare-LF dot does *not* end DATA
+  capture, that a complete transaction pipelined after `<LF>.<LF>` is never delivered, and that
+  LF-separated command lines are refused with `500 5.5.2` and the connection closed. These were
+  characterization tests pinning the defect before it was fixed; they now assert the contract.
+
+  `PipelinedTransactionAfterBareLfDot_IsNotDelivered` is the one that matters: it sends a complete
+  valid `MAIL FROM`/`RCPT TO`/`DATA` after the bare-LF dot. An earlier version sent only invalid
+  trailing content and so passed against a server that was still exploitable — if you modify these
+  tests, keep the payload a syntactically valid transaction.
+- `Integrity/RawMessage.cs` — the byte-exact send/compare helper. `SmtpSession.Send` encodes strings
+  as UTF-8 and `SendRaw` applies no dot-stuffing, so neither can carry these payloads on its own;
+  `RawMessage.SendDataAsync` stuffs at byte-defined line starts and appends the terminator.
+
+**Why the test project multi-targets.** MimeKit 4.17 ships no `net7.0` build, so a `net7.0` consumer
+resolves its `netstandard2.1` build, whose `Ed25519DigestSigner` is incompatible with the
+BouncyCastle 2.6.2 MimeKit itself requires — `DkimSigner` throws `TypeLoadException` before signing
+anything. The DKIM suite is therefore `#if NET8_0_OR_GREATER`, and the project targets
+`net7.0;net8.0` so the rest of the suite keeps proving the library works on the framework it ships
+for. The shipped library only calls `MimeMessage.Load` and never touches that code path.
+
 ## Load and integrity tests
 
 Fast load checks run with the normal suite. To run only the load category:
@@ -67,18 +116,34 @@ dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "C
 ```
 
 The heavy tier is opt-in because it includes high concurrency, sustained traffic, a 150 MB message,
-and concurrent large messages:
+and concurrent large messages. **Pass `-f` to run one target framework at a time:**
 
 ```powershell
 $env:DOTNET_ROLL_FORWARD = "Major"
 $env:SMTP_LOADTEST = "1"
-dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Category=Load"
+dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --filter "Category=Load" -f net7.0
 ```
+
+Without `-f`, the `net7.0` and `net8.0` runs execute concurrently and compete for the same cores.
+`SlowHandler_SessionsOverlap_ThroughputScalesWithConcurrency` asserts that sessions overlap rather
+than serialize, and that assertion is timing-based, so it can fail under that contention while
+passing for either framework alone — a false negative about the harness, not the server. The fast
+tier is short enough not to be affected.
 
 Load metrics are written to `load-metrics.json` beside the test assembly. Set
 `SMTP_LOADTEST_OUT` to choose another output directory. Throughput and latency are reported, not
 asserted; correctness checks cover accepted-message counts, duplicate delivery, connection failures,
 payload integrity, and server recovery.
+
+Payload integrity here is a SHA-256 over **raw octets**, anchored on the `X-Load-Id` header line that
+opens every sent message. It previously hashed a canonicalized string — CRLF mapped to LF, trailing
+newlines trimmed, anchored on an unanchored `Subject:` substring search — on the rationale that the
+DATA path emitted `Environment.NewLine`. That rationale went stale when the DATA path moved to
+`MessageBody.WriteLine`, which writes an explicit CRLF on every platform, so the normalization was
+erasing a difference the server no longer produces and a CRLF regression under load could not fail
+these tests. The `Subject:` anchor also discarded every byte before it, including the id header, so
+corruption of a header ahead of `Subject` went unhashed. Both are fixed; see
+`MessageCorpus.ExtractPayloadBytes`.
 
 ## Historical load baseline
 

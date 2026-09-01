@@ -11,6 +11,52 @@ skip decisions are retained in the architecture's
 
 ### Breaking
 
+- **A bare LF in DATA is now refused with `554 5.6.0` instead of being silently rewritten to CRLF.**
+  Closes the SMTP-smuggling class disclosed in December 2023.
+
+  RFC 5321 §2.3.8 permits CR and LF only together, and §4.1.1.4 requires that a server not accept
+  lines ending in LF alone *"even in the name of improved robustness"*, naming `<LF>.<LF>`
+  specifically. This server previously did both things that text forbids: `BoundedLineReader` framed
+  lines at any LF, and `MessageBody.WriteLine` then wrote CRLF, so a bare-LF message was accepted and
+  repaired — and `<LF>.<LF>` ended the message. When two hops disagree about what ends a message, one
+  submission is read as one message here and as two elsewhere; the smuggled message inherits this
+  connection's authentication, SPF result and DMARC pass. For a journaling relay that means a forged
+  record archived as authenticated.
+
+  **Why refusing rather than normalizing.** Rewriting bare LF to CRLF changes the octets the sender
+  transmitted, which invalidates any DKIM signature over them — destroying the origin proof that is
+  the point of preserving the bytes in the first place. Exchange Online reached the same conclusion:
+  it rejects with `SMTPSEND.BareLinefeedsAreIllegal`, having deliberately stopped stripping bare LFs
+  in order to support DKIM. An Office 365 sender therefore cannot produce a message this rule
+  refuses, so the stricter behaviour costs no legitimate mail on this deployment's inbound path.
+
+  **Refusing the message is not sufficient on its own, and the first version of this fix was not.**
+  What makes smuggling exploitable is *leaving DATA capture* at the bare-LF dot: every octet the
+  client sent after it is then parsed as SMTP commands on a connection the upstream hop has already
+  authenticated, so a pipelined `MAIL FROM`/`RCPT TO`/`DATA` delivers a second, injected message
+  under the first one's SPF and DMARC results. A dot line terminated by bare LF is therefore **not**
+  treated as end-of-DATA at all: capture continues, the dot is stored as body content, and the
+  message is refused at whatever conforming terminator arrives. Body bytes are stored, never
+  executed, so the attacker's trailing octets stay inert. `PipelinedTransactionAfterBareLfDot_IsNotDelivered`
+  is the regression test, and it sends a complete valid transaction rather than arbitrary trailing
+  content — an earlier test that sent only junk passed against the still-exploitable server.
+
+  **Command lines are covered too.** A command terminated by bare LF is answered `500 5.5.2` and the
+  connection is closed. Executing LF-framed commands leaves the same parser differential against a
+  CRLF-strict gateway or policy layer in front of this server: bytes inspected there as one malformed
+  line become several backend commands. Closing rather than skipping the line prevents input already
+  buffered behind it from executing.
+
+  A truncated line (one exceeding the 1 MB cap) is excluded from the bare-LF check, because its
+  discarded tail may have carried the CR of a conforming CRLF; it is refused as truncated instead.
+  The flag is latched for the whole message, so a single bare-LF line mid-body refuses it even when
+  every other line is correctly framed. Covered by `Integrity/LineEndingConformanceTests`.
+
+  **Migration:** a sender that emits bare LFs will now receive `554` (in DATA) or `500` and a closed
+  connection (in commands) where it previously received `250`. This is almost certainly a
+  non-conforming client, and the message it sent was being altered before storage; if such a sender
+  exists on your network, fix its line endings rather than relaxing this.
+
 - **The DATA path streams to a byte-backed store instead of accumulating a string, cutting peak
   memory for a large message by more than 10×.** A 150 MB message previously drove peak working set
   to **~1900 MB**; it now grows the working set by **no measurable amount** (whole-process peak in
@@ -249,6 +295,38 @@ is the barrier.
   transaction. This matters more here than upstream: ACK-gating runs delivery inside the session.
 
 ### Changed
+
+- **Chain-of-custody test coverage: a byte-exact integrity oracle, DKIM survival tests, and a
+  stronger load-integrity hash.** Test-only; no shipped code changed.
+
+  A new `Integrity/` suite compares delivered octets against exactly the octets transmitted, with no
+  string round trip on either side. It covers folded headers, trailing SP/HTAB, terminal blank
+  lines, NUL and control bytes, 8-bit and invalid-UTF-8 bodies, leading-dot transparency, and a body
+  crossing the 4 MB spill boundary — plus a negative control proving the comparison fails on a single
+  flipped byte. `Integrity/DkimSurvivalTests` covers *origin authentication* — the only evidence this
+  relay carries that a message genuinely came from the customer it claims to, and the check that
+  catches someone relaying through us while impersonating one. It answers a different question from
+  the byte tests rather than a weaker version of the same one: DKIM coverage is deliberately lossy
+  (both body canonicalizations are many-to-one, only `h=` headers are covered, and signer/verifier
+  are both MimeKit), and one test asserts that limit explicitly rather than leaving it to a comment.
+
+  The load corpus's integrity hash was strengthened from a canonicalized string to raw octets. It had
+  mapped CRLF to LF before hashing, justified by a DATA path that emitted `Environment.NewLine` —
+  stale since that path moved to `MessageBody.WriteLine`, which writes an explicit CRLF. The
+  normalization was erasing a difference the server no longer produces, so a CRLF regression under
+  load could not have failed those tests. Its `Subject:` payload anchor was also an unanchored
+  substring search that discarded the id header and any header ahead of `Subject`; it now anchors on
+  the exact `X-Load-Id` line, keeping every client header inside the hashed range.
+
+  `Integrity/LineEndingConformanceTests` began as characterization tests pinning the bare-LF defect
+  and now assert the contract, following the refusal change recorded under Breaking above.
+
+  The test project now multi-targets `net7.0;net8.0`. MimeKit 4.17 ships no `net7.0` build, so a
+  `net7.0` consumer resolves its `netstandard2.1` build, whose `Ed25519DigestSigner` is incompatible
+  with the BouncyCastle 2.6.2 MimeKit itself requires; `DkimSigner` throws `TypeLoadException`. The
+  DKIM suite is gated to `net8.0`, and `net7.0` is retained so the rest of the suite keeps proving the
+  library works on the framework it ships for. The shipped library only calls `MimeMessage.Load` and
+  never touches that path, so production is unaffected.
 
 - **EHLO now advertises the `SIZE` extension (RFC 1870).** The greeting previously ended at
   `250 8BITMIME`; it now ends with `250 SIZE <n>`, letting a sender learn the limit up front rather

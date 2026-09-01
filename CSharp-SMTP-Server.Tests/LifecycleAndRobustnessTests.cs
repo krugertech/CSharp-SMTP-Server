@@ -295,13 +295,18 @@ public sealed class LifecycleAndRobustnessTests
             garbage[i] = (byte)(i % 251); // includes NULs and invalid UTF-8 sequences
         await s.SendRaw(garbage);
 
-        // The server must respond to the junk lines it can form (unknown command / bad sequence)…
+        // The server must respond to the junk lines it can form rather than hanging or crashing.
+        // 500 is included because this garbage contains 0x0A bytes: those are bare-LF terminators,
+        // which the server refuses outright (RFC 5321 §2.3.8) before the line is ever dispatched as a
+        // command, so a byte pattern like this now draws the line-ending refusal rather than an
+        // unknown-command or bad-sequence reply. Which of the three arrives is not the point of this
+        // test — that the server answers, survives, and keeps serving is.
         var sawResponse = false;
         for (var i = 0; i < 20 && !sawResponse; i++)
         {
             var line = await s.ReadLineAsync();
             if (line == null) break;
-            sawResponse = line.StartsWith("503") || line.StartsWith("502");
+            sawResponse = line.StartsWith("503") || line.StartsWith("502") || line.StartsWith("500");
         }
         Assert.True(sawResponse, "server did not respond to garbage input");
 

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Text;
 using CSharp_SMTP_Server.Interfaces;
 using CSharp_SMTP_Server.Networking;
 using CSharp_SMTP_Server.Protocol.Responses;
@@ -50,16 +51,37 @@ internal sealed class LoadDelivery : IMailDelivery
             if (_handlerDelay > TimeSpan.Zero)
                 await Task.Delay(_handlerDelay, cancellationToken);
 
-            var body = transaction.RawBody;
+            // Read as octets, not via RawBody: that property decodes the message as UTF-8 into a
+            // .NET string, which replaces every byte that is not valid UTF-8 with U+FFFD. Hashing
+            // the result would compare a lossy rendering of the message rather than the message,
+            // and would agree with exactly the corruption these tests exist to detect.
+            byte[] body;
+
+            using (var stream = transaction.GetBodyStream())
+            using (var buffer = new MemoryStream())
+            {
+                await stream.CopyToAsync(buffer, cancellationToken);
+                body = buffer.ToArray();
+            }
+
             var id = MessageCorpus.ExtractId(body);
 
             if (id == null)
             {
-                Unidentified.Add(body.Length > 200 ? body[..200] : body);
+                var preview = Encoding.ASCII.GetString(body, 0, Math.Min(200, body.Length));
+                Unidentified.Add(preview);
                 return SmtpDeliveryResult.Ok();
             }
 
-            var hash = MessageCorpus.Hash(MessageCorpus.ExtractPayload(body));
+            var payload = MessageCorpus.ExtractPayloadBytes(body, id);
+
+            if (payload == null)
+            {
+                Unidentified.Add($"{id}: id header present but not line-anchored");
+                return SmtpDeliveryResult.Ok();
+            }
+
+            var hash = MessageCorpus.Hash(payload);
             if (!DeliveredHashes.TryAdd(id, hash))
                 Duplicates.Add(id);
 
@@ -165,7 +187,7 @@ internal static class LoadDriver
                     // ACK would also demand delivery of messages the server explicitly refused, or
                     // that were never fully sent, turning a correct rejection into a false corruption
                     // report.
-                    if (accepted) expected[id] = sample.Sha256;
+                    if (accepted) expected[id] = sample.ExpectedSha256(id);
 
                     metrics.Record(sw.Elapsed.TotalMilliseconds, accepted, sample.Bytes);
 
@@ -227,8 +249,10 @@ internal static class LoadDriver
             return false;
         }
 
-        // The id header goes first so it survives the server prepending its own headers, and so
-        // ExtractPayload's Subject: anchor still finds the corpus payload beneath it.
+        // The id header goes first, ahead of the sample's own headers, because it is the anchor
+        // ExtractPayloadBytes locates on delivery — everything from this line onward is hashed, so
+        // it must be the first byte the sender transmits for the comparison to cover every header
+        // the client sent. Sample.ExpectedBytes reproduces this exact framing.
         await session.Send($"{MessageCorpus.IdHeader}: {id}");
 
         foreach (var line in sample.Payload.Split("\r\n"))

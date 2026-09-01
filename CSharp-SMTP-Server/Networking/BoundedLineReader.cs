@@ -75,6 +75,28 @@ namespace CSharp_SMTP_Server.Networking
 		/// </summary>
 		internal bool LastLineTruncated { get; private set; }
 
+		/// <summary>
+		/// Whether the last line was terminated by a bare LF rather than CRLF.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// RFC 5321 §2.3.8 allows CR and LF only together, as a terminator, and §4.1.1.4 is explicit
+		/// that a server MUST NOT accept lines ending in LF alone "even in the name of improved
+		/// robustness" — naming the <c>&lt;LF&gt;.&lt;LF&gt;</c> case specifically, because a receiver
+		/// that honours it disagrees with one that does not about where a message ends. That
+		/// disagreement is the SMTP-smuggling class disclosed in December 2023: an attacker submits one
+		/// message that one hop reads as one and the next reads as two, and the smuggled message
+		/// inherits the first one's authenticated, SPF-passing connection.
+		/// </para>
+		/// <para>
+		/// The line is still framed at the LF and returned, rather than the terminator being ignored,
+		/// so the reader stays synchronized with a non-conforming client and the caller can refuse the
+		/// transaction with a proper SMTP reply instead of the connection desynchronizing or hanging.
+		/// Acting on the flag is the caller's job — see <c>TransactionCommands.ProcessData</c>.
+		/// </para>
+		/// </remarks>
+		internal bool LastLineBareLf { get; private set; }
+
 		internal BoundedLineReader(Stream stream) => _stream = stream;
 
 		/// <summary>
@@ -131,6 +153,7 @@ namespace CSharp_SMTP_Server.Networking
 		internal async Task<(byte[] Buffer, int Length)?> ReadLineBytesAsync(CancellationToken cancellationToken = default)
 		{
 			LastLineTruncated = false;
+			LastLineBareLf = false;
 
 			_lineLength = 0;
 
@@ -206,6 +229,15 @@ namespace CSharp_SMTP_Server.Networking
 				// Trim the CR of a CRLF pair; a lone LF leaves nothing to trim.
 				if (_lineLength > 0 && _line[_lineLength - 1] == (byte)'\r')
 					_lineLength--;
+				else if (!discarding)
+					// A truncated line is excluded deliberately. Once the cap is reached the tail is
+					// read and thrown away — including the CR of a conforming CRLF — so the retained
+					// prefix ends in whatever byte happened to fall on the boundary, and testing it
+					// here would report a correctly framed line as bare-LF. The line has already been
+					// flagged through LastLineTruncated and is refused on that basis, which is the
+					// accurate reason; claiming a line-ending defect that the client did not commit
+					// would be wrong, and on the command path it would drop the connection for it.
+					LastLineBareLf = true;
 
 				return (_line, _lineLength);
 			}
