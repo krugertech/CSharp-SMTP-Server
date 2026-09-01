@@ -84,12 +84,29 @@ public sealed class MailTransactionTests
     }
 
     [Fact]
-    public void GetFrom_GroupAddressOnly_ReturnsFirstMailbox()
+    public void GetFrom_SingleMailboxInGroup_ReturnsThatMailbox()
     {
         // From[0] would be a GroupAddress with no .Address at all; .Mailboxes flattens it.
-        var raw = "From: Team: alice@example.com, bob@example.com;\r\nSubject: t\r\n\r\nx";
+        var raw = "From: Team: alice@example.com;\r\nSubject: t\r\n\r\nx";
 
         Assert.Equal("alice@example.com", Tx(raw).GetFrom);
+    }
+
+    [Fact]
+    public void GetFrom_MultiMailboxGroup_ReturnsFirst_ButIsNotASingleIdentity()
+    {
+        // GetFrom is a presentation getter: it returns the first mailbox and CANNOT express "this
+        // header names several identities". That is exactly why DMARC must not authenticate off this
+        // value alone — a group is one .From entry but several .Mailboxes, so a naive
+        // "From.Count > 1" gate lets "From: Team: attacker@evil.com, victim@bank.com;" through while
+        // only the attacker's domain gets authenticated. The gate counts .Mailboxes for that reason;
+        // SpfDmarcIntegrationTests covers the rejection end-to-end.
+        var raw = "From: Team: alice@example.com, bob@other.com;\r\nSubject: t\r\n\r\nx";
+        var t = Tx(raw);
+
+        Assert.Equal("alice@example.com", t.GetFrom);
+        Assert.Equal(1, t.ParsedMessage.From.Count);           // one top-level entry…
+        Assert.Equal(2, t.ParsedMessage.From.Mailboxes.Count()); // …but two identities
     }
 
     [Fact]

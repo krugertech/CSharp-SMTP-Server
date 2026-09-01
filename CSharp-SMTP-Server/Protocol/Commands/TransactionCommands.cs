@@ -209,7 +209,12 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 					if (processor.Server.Options.ValidateDMARC)
 					{
-						if (processor.Transaction.ParsedMessage.From.Count > 1)
+						// DMARC authenticates ONE identity (RFC 7489 §6.6.1), so the message must carry
+						// exactly one From mailbox. Counting .From (top-level address entries) is not
+						// enough: a single group address — "From: Team: a@evil.com, b@bank.com;" — is one
+						// entry but several mailboxes, so it slipped past this gate while validation
+						// authenticated only the first member. Count .Mailboxes, which flattens groups.
+						if (processor.Transaction.ParsedMessage.From.Mailboxes.Count() > 1)
 						{
 							await processor.WriteCode(554, "5.7.1", "Message must not contain more than one From header, message refused");
 							return;

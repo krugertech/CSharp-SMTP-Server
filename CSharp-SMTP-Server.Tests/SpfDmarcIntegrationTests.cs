@@ -125,6 +125,71 @@ public sealed class SpfDmarcIntegrationTests
     }
 
     [Fact]
+    public async Task Data_MultiMailboxGroupFrom_RejectedWith554_NoDelivery()
+    {
+        // A single group address is ONE From entry but several mailboxes. The gate used to count
+        // .From, so this passed as "one From header" while DMARC authenticated only the first member —
+        // letting an attacker pair their own (authenticating) domain with a victim's in the same
+        // header. The gate counts .Mailboxes now, so the message is refused before any policy runs.
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.evil.com", "v=DMARC1; p=none"); // attacker's own domain would pass alignment
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<env@evil.com>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: Team: env@evil.com, victim@bank.com;");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("554 5.7.1 Message must not contain more than one From header, message refused",
+                await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
+        }
+    }
+
+    [Fact]
+    public async Task Data_SingleMailboxGroupFrom_IsAccepted()
+    {
+        // The gate must reject multiple identities, not groups as such: one mailbox inside a group is
+        // still a single identity and validates normally.
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.example.com", "v=DMARC1; p=reject");
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<env@example.com>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: Team: a@example.com;"); // aligned with the envelope → Pass
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+            Assert.Equal(ValidationResult.Pass, delivery.Delivered.Single().DMARCValidationResult);
+        }
+    }
+
+    [Fact]
     public async Task Data_DmarcPass_Delivers_WithDmarcArHeader()
     {
         using var stub = new DnsStub();
