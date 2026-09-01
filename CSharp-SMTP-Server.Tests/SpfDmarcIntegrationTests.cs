@@ -301,6 +301,53 @@ public sealed class SpfDmarcIntegrationTests
     }
 
     /// <summary>
+    /// A client cannot earn an SPF <c>Pass</c> under one HELO name and then re-greet as another to
+    /// have DMARC align the second one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The bypass this rules out: SPF authenticates the HELO domain at <c>MAIL FROM</c>, while DMARC
+    /// aligns at the terminating dot — two different moments. If the identity could change in between,
+    /// an attacker would pass SPF as <c>attacker.example</c> and then align as <c>victim.example</c>.
+    /// </para>
+    /// <para>
+    /// Two things prevent it, and this pins both: <c>EHLO</c> calls <c>DiscardTransaction()</c> before
+    /// updating the retained domain, so re-greeting destroys the in-flight transaction outright; and
+    /// <c>MailTransaction.HeloDomain</c> is captured by value at <c>MAIL FROM</c>, so the identity SPF
+    /// authenticated is the identity DMARC aligns.
+    /// </para>
+    /// </remarks>
+    [Fact]
+    public async Task NullSender_ReEhloAfterMailFrom_CannotSwapTheAlignedIdentity()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+        stub.AddTxt("attacker.example", "v=spf1 ip4:127.0.0.1 -all");
+
+        var (s, server, delivery) = await ConnectReadyAsync(
+            stub, http.Url, validateSpf: true, validateDmarc: true, helo: "attacker.example");
+
+        using (server)
+        await using (s)
+        {
+            // Establish a transaction whose HELO identity passes SPF.
+            await s.Send("MAIL FROM:<>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+
+            // Re-greet as the victim domain, attempting to swap the identity DMARC will align.
+            await s.Send("EHLO victim.example");
+            await s.ReadResponseAsync();
+
+            // The transaction was discarded by the re-greet, so DATA cannot follow.
+            await s.Send("DATA");
+            Assert.StartsWith("503", await s.ReadLineAsync());
+
+            Assert.Empty(delivery.Delivered);
+        }
+    }
+
+    /// <summary>
     /// A null sender whose HELO identity SPF actually authenticates, and which aligns with the From
     /// header, passes DMARC.
     /// </summary>
