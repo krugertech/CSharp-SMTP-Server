@@ -527,7 +527,7 @@ that is genuinely mislabelled.
 
 | # | Quirk | Recommendation |
 |---|---|---|
-| **Q1** | No dot-stuffing in DATA | **P1 — FIX.** RFC 5321 §4.5.2 requires the receiver to strip a leading `.` from data lines. Without it, any body line beginning with `.` is silently corrupted, and a line consisting of `..` prematurely… is mis-handled. This is a data-integrity bug affecting real mail, not a stylistic quirk. Worth reclassifying out of "quirk". |
+| **Q1** ✅ **FIXED 2026-09-01** | No dot-stuffing in DATA | **P1 — FIX.** RFC 5321 §4.5.2 requires the receiver to strip a leading `.` from data lines. Without it, any body line beginning with `.` is silently corrupted, and a line consisting of `..` prematurely… is mis-handled. This is a data-integrity bug affecting real mail, not a stylistic quirk. Worth reclassifying out of "quirk". **Fixed** together with byte-exact DATA — see `immediate-todo.md` §6; the two shared a cause, and DKIM verification downstream makes both signature-breaking. |
 | **Q2** | VRFY returns `252 5.5.1` | **P3 — leave, or change to `2.5.2`.** Mixing a 2xx code with a 5.x.x enhanced status is malformed per RFC 3463 (the first digit must agree). Cosmetic; no client depends on it. Fix opportunistically when touching R1, since the same call site is involved. |
 | **Q3** | Authenticated `Received:` omits `from <ip>` | **P2 — FIX.** Loses forensic provenance for authenticated submissions, which is exactly the traffic you most want traceable. Should include the IP regardless of auth state. |
 | **Q4** | STARTTLS accepted before EHLO | **P3 — leave.** Technically out of order (RFC 3207 expects EHLO first) but harmless and tolerant; some clients do this. Keep the pin test. |
@@ -588,8 +588,9 @@ Security-affecting items first; within a tier, cheapest first.
 
 **Tier 2 — data integrity.**
 
-5. **Q11, Q1** (P1) — split TXT records (dependency decision on `zabszk.DnsClient`) and DATA
-   dot-stuffing. Both silently corrupt real mail.
+5. **Q11** (P1) — split TXT records (dependency decision on `zabszk.DnsClient`). Silently corrupts
+   real mail. ~~**Q1** — DATA dot-stuffing~~ **fixed 2026-09-01**, together with byte-exact DATA; see
+   `immediate-todo.md` §6.
 
 **Tier 3 — cleanup, any order.**
 

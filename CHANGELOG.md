@@ -130,6 +130,28 @@ the upstream sync record.
   **Why this is listed as breaking:** a command shape that was previously refused is now accepted, and
   reaches delivery handlers with an empty sender.
 
+- **The DATA path is byte-exact, and dot-stuffing is now undone (Q1).** Two defects with one cause:
+  every body line was decoded to a .NET string and re-encoded as UTF-8 on the way into the body store.
+
+  **Byte-exactness.** A message body is an octet stream — it may be in any charset, or be an
+  unlabelled 8-bit body — and the round trip through UTF-16 replaced every byte that was not valid
+  UTF-8 with U+FFFD, stored as `EF BF BD`. The archived message was therefore not what the sender
+  transmitted. That matters wherever integrity is established downstream by **DKIM**, which hashes the
+  octets it is handed: a transcode in the middle invalidates the signature on any non-UTF-8 body.
+  `BoundedLineReader` is now byte-primary, `ReadLineBytesAsync` hands the DATA path the wire bytes
+  directly, and what arrives is what is stored.
+
+  **Dot-unstuffing.** RFC 5321 §4.5.2 requires the receiver to strip the transparency dot a sending
+  client prefixes to any body line already beginning with one. It was never implemented, so a composed
+  line `.text` was archived as `..text` — corruption of exactly the lines the mechanism exists to
+  carry, and on its own enough to break a DKIM signature over that body. The dot is now stripped, and
+  the line is counted against `MessageCharactersLimit` **after** unstuffing, so the enforced limit
+  measures the message as stored rather than as framed.
+
+  **Stored bytes change for affected messages.** A body line beginning with a dot is now archived
+  unstuffed, so the same message hashes differently across this boundary. This is the correct form —
+  messages archived before it are the ones that do not match what their sender signed.
+
 **On the version number.** This release is 2.0.0 rather than 1.2.0 because several of the changes above
 are *silent*: consumers still compile, but behavior changes underneath them. The getter changes alter
 what filtering, routing, or display logic sees; the streaming body changes `RawBody` from a field to a
@@ -139,6 +161,41 @@ users through a routine update, and a changelog is not a dependency-resolution b
 is the barrier.
 
 ### Fixed
+
+- **Quoted local-parts containing angle brackets or `@` are no longer refused.** RFC 5321 §4.1.2
+  permits the local-part to be a quoted-string, inside which `<`, `>` and `@` are ordinary characters.
+  The parser was unaware of quoting in two places: `TryGetBracketedPath` took the *first* `>` as the
+  path terminator, and `ProcessAddress` required exactly one `@` anywhere in the address. So
+  `<"a>b"@example.com>` and `<"a@b"@example.com>` — both valid — got a permanent `501`. Shared by
+  `RCPT TO`, so it could lose a recipient as well as a sender.
+
+  Scanning is now quote-aware and honours quoted-pairs. An unterminated quoted-string yields no path
+  rather than falling back to the first `>`: this is the anchored path locator that closes the
+  null-reverse-path smuggling differential, and a quote that could swallow the terminator would hand
+  an attacker control of where the parser thinks the path ends. Those defences are re-asserted
+  directly against the new scanner rather than assumed to survive it.
+
+- **A null sender's HELO identity is now SPF-checked (RFC 7208 §2.4).** §2.4 defines the SPF MAIL FROM
+  identity for a null reverse-path as `postmaster@<HELO domain>`, but the EHLO/HELO argument was
+  discarded, so SPF was skipped entirely for `MAIL FROM:<>` and a HELO domain publishing `-all` was
+  not enforced against a null sender. The argument is retained as the new public
+  `MailTransaction.HeloDomain` and checked in place of the absent envelope domain;
+  `Authentication-Results` reports `smtp.helo=` rather than an empty `smtp.mailfrom=`, per RFC 8601
+  §2.7.2.
+
+  Only a plausible DNS name is retained — an address literal or a bare label cannot carry an SPF
+  record — so a client with no checkable identity stays unchecked and this does not become a new
+  rejection for MTAs that greet with a literal. **New rejection path:** a null sender from a HELO
+  domain that fails SPF now gets `554 5.7.23`, reachable only with `ValidateSPF` on.
+
+  **DMARC alignment is deliberately unchanged.** RFC 7489 §4.1 has DMARC align "the MAIL FROM
+  identity" and defers the null case to RFC 7208 §2.4 without defining a DMARC behaviour of its own;
+  §2.4 substitutes a domain for the SPF *check*, which does not make it a DMARC alignment identity.
+  Aligning it anyway refuses ordinary bounces — a bouncing MTA greets with its own hostname, which
+  routinely differs from the From domain of the notification it carries — so a legitimate DSN would be
+  destroyed under the very policy its own domain published. A spoofed `From:` under `p=reject` with a
+  null sender is therefore still accepted; closing that needs an aligned identity DMARC recognizes,
+  which means DKIM.
 
 - **Listener shutdown now waits for its accept thread.** `Listener.Dispose()` returned without
   confirming the accept thread had exited, so the thread could still be inside `AcceptTcpClient` when
