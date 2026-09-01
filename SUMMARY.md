@@ -18,7 +18,7 @@ the SMTP session by design.
 - Branch: **`dev`**, pushed. Tier 1 review fixes (B1, B3, B4, Q12(b), R11, R6) plus a Codex adversarial
   follow-up (C1, C2 below) are new commits on top; version **2.0.0-krugertech.1**.
 - Build: 0 errors (pre-existing harmless warnings: net7.0 EOL notice, CS8619 in MailTransaction).
-- Tests: **313/313 green**, ~11 s per run, stable across repeated runs. Working tree clean.
+- Tests: **316/316 green**, ~11 s per run, stable across repeated runs. Working tree clean.
 
 ### Commit stack (newest first)
 
@@ -54,8 +54,12 @@ $env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SM
 
 Gotchas:
 - Without `DOTNET_ROLL_FORWARD=Major`, tests abort with "framework not found".
-- Test classes run **serially** (`xunit.runner.json`: `parallelizeTestCollections: false`) — the suite
-  binds loopback ports; parallel classes race on port allocation. Don't re-enable without fixing that.
+- Test classes run **serially** (`xunit.runner.json`: `parallelizeTestCollections: false`). Measured,
+  not assumed: with `maxParallelThreads: 4`, 6 of 8 runs fail, always on
+  `DmarcOrganizationalDomainTests.MultiLevelPublicSuffix_WalksUpUntilNonSuffix` — `DmarcValidator`
+  keeps the public-suffix list in process-wide statics that `ForceRefreshList` mutates mid-run. See
+  §8 item 2 before re-enabling. (Port allocation, R8, did *not* surface in those runs, but is still
+  theoretically racy.)
 - Every test read is bounded by a 10 s timeout (in `SmtpSession`), so regressions fail instead of hanging.
 
 ## 4. Bugs found & fixed in this fork (each has regression tests)
@@ -66,6 +70,16 @@ Gotchas:
 | `Listener.ClientProcessors` race | Unsynchronized `List<>` mutated from 3 contexts; concurrent Add/Remove corrupted internals → NRE in `Dispose()` under load (deterministic repro, 3/3 runs pre-fix) | `df4636e` (lock + snapshot-in-Dispose) | `ConcurrencyStress_ParallelSessions_AllDeliveriesSucceed` |
 | **B5** implicit-TLS crash | Failed/aborted handshake on a TLS port threw inside `async void Init()` → **whole process died** (silent disconnect, cert rejection, or plaintext probe — any scanner touching the port) | `7cb9fd9` (try/catch: log + drop connection) | 3 regression tests in `TlsStartTlsTests` (pre-fix: test run aborts outright) |
 | **R11** shutdown escape | Gap left by `df4636e`: a connection accepted but not yet registered when `Dispose()` snapshotted the list was added *afterwards*, into a list nobody reads again → never disposed, still serving a client (and still using the TLS certificate `SMTPServer.Dispose()` then disposes) | `AddProcessor` returns `bool`, refusing registration when `_dispose` is set; flag-set and snapshot now share one `_processorsLock` critical section; accept loop disposes a refused processor | `ConnectionAcceptedDuringShutdown_IsRefusedAndDisposed_R11` |
+
+**R7 (fixed)** — `Listener` used a plain non-volatile `bool` for shutdown, read by the accept loop
+without synchronisation, and `Dispose()` returned without confirming the accept thread had exited —
+while `SMTPServer.Dispose()` disposes the TLS certificate immediately afterwards. Termination is now a
+`CancellationTokenSource`, and `Dispose()` waits (bounded, 5 s) on a `ManualResetEventSlim` the loop
+signals in a `finally`. Guarded by `Dispose_JoinsAcceptThread_BeforeReturning_R7` (asserts
+`thread.IsAlive == false` synchronously after `Dispose()` returns — no polling),
+`Dispose_IsIdempotent_R7` and `Dispose_NeverStartedListener_ReturnsImmediately_R7`. The last two exist
+because owning disposable primitives made `Dispose()` non-idempotent — a real bug this change
+introduced and these tests caught, since `SMTPServer.Dispose()` plus a caller's `using` both reach it.
 
 **R6 (fixed)** — a throwing `IMailFilter.IsConnectionAllowed` used to crash the process via the same
 `async void Init()` path as B5. It is now caught in *two* places, both needed: `Init()` (plaintext
@@ -130,7 +144,7 @@ Pinned by `MailTransactionTests`. Fixing this changes observable behavior.
 | Q12 | SPF DNS error handling deviates from RFC 7208. **(b) FIXED**: a failed `a`/`mx` address lookup now returns Temperror instead of the mechanism's qualifier — it previously failed *open* (a bare `a` returned **Pass** on DNS failure). Still open: (a) top-level NXDOMAIN → Temperror (should be none); (c) redirect to nonexistent domain → Temperror (should be permerror) |
 | Q13 | SPF `redirect=` is evaluated positionally and short-circuits later mechanisms; RFC 7208 §6.1/§4.7 only consults it after all mechanisms have failed |
 
-## 7. Test suite layout (313 tests)
+## 7. Test suite layout (316 tests)
 
 - **Phase 1 — pure unit** (107): `SmtpDeliveryResultTests` (16), `ServerOptionsTests` (9),
   `MailTransactionTests` (19, pins B1–B4), `CheckCidrTests` (16), `DmarcOrganizationalDomainTests` (7,
@@ -157,22 +171,35 @@ Shared infrastructure: `SmtpSession` (raw-TCP client with timeouts, multi-line r
 
 ## 8. Remaining work
 
-All four test-plan phases are complete. **313 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
+All four test-plan phases are complete. **316 tests** after the REVIEW.md Tier 1 fixes (B1, B3, B4,
 Q12(b), R11, R6) and the Codex adversarial follow-up — see `CHANGELOG.md` for the 2.0.0 release notes.
 Left:
 
 1. **Remaining REVIEW.md items**, none started: **B2** (`AddHeader` duplicates the header before first
    parse), **R1** (the `WriteCode(int,string)` overload accident — ~53 assertions across 10 files),
    **Q1** (no dot-stuffing in DATA — data-integrity, arguably P1), **Q3**, **Q8**, **Q11** (multi-string
-   TXT records, needs a dependency decision), **Q12(a)/(c)**, **Q13**, plus R2/R4/R8/R9.
-2. **R7 / listener shutdown lifecycle — the recommended next item.** `Listener._dispose` is a plain
-   non-volatile `bool`. The R11 fix is sound on its own terms (flag-set and snapshot share one
-   `_processorsLock` section), but the accept loop's `while (!_dispose)` and its exception filter read
-   the field unsynchronised, and `Dispose()` never joins the listener thread. After `Stop()` a stale
-   read can keep the thread retrying `AcceptTcpClient` on a stopped listener and logging each failure.
-   Suggested shape: replace the field with a `CancellationTokenSource` (or `Volatile.Read/Write`) for
-   loop termination, and have `Dispose()` join the thread with a bounded timeout. Test that the thread
-   exits and logging stops after a concurrent shutdown. Doing this well supersedes R7 as written.
+   TXT records, needs a dependency decision), **Q12(a)/(c)**, **Q13**, plus R2/R4/R8/R9 (R7 is now done — see §4).
+2. **Parallel test classes — blocked on ONE remaining item, measured.** Goal: enable
+   `parallelizeTestCollections` so load/parallelism tests can be built. R7 (done) was a prerequisite,
+   not the whole job. Measured with `maxParallelThreads: 4`, **8 consecutive runs: 6 failed**, always
+   the same culprit —
+   `DmarcOrganizationalDomainTests.MultiLevelPublicSuffix_WalksUpUntilNonSuffix`.
+
+   **Root cause:** `DmarcValidator` holds the public-suffix list in **process-wide statics**
+   (`PublicSuffixes`, `_publicSuffixesLoaded`), and `ForceRefreshList_SwitchesTheActiveSuffixSet`
+   swaps that set at runtime. Any DMARC test running concurrently reads a half-swapped list. This is a
+   *library* design issue, not a test one: the suffix list is per-process, so two `SMTPServer`
+   instances in one process cannot use different lists.
+
+   **Options:** (a) make the suffix set per-`DmarcValidator` instance — the honest fix, and a public
+   behavior change worth noting; (b) keep the statics and put the mutating tests in one xUnit
+   collection, which restores safety without fixing the library; (c) leave `ForceRefreshList` alone and
+   have the test assert against a locally-constructed validator instead of the shared fixture.
+
+   Note the port-allocation TOCTOU (R8) did **not** surface in these runs, but is still theoretically
+   live: `TestPorts.Allocate()` binds port 0, reads the assignment, then releases before the caller
+   rebinds. Fix it opportunistically when doing the above; a load-test suite will hit it far harder
+   than the current tests do.
 3. Anything from the upstream re-audit.
 
 ### Codex adversarial review — dispositions
@@ -216,7 +243,7 @@ item 2 above, one is a version decision now taken (2.0.0), and one **could not b
 git log --oneline -15          # commit stack (see §2)
 cat ARCHITECTURE.md            # how the code works + upstream sync record
 cat TEST_PLAN.md               # what's tested, what's pinned, what's left (§11 build order)
-$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 313/313 in ~11 s
+$env:DOTNET_ROLL_FORWARD="Major"; dotnet test CSharp-SMTP-Server.Tests/CSharp-SMTP-Server.Tests.csproj --no-build   # expect 316/316 in ~11 s
 ```
 
 Key source files: `CSharp-SMTP-Server/Networking/{ClientProcessor,Listener}.cs` (connection lifecycle —

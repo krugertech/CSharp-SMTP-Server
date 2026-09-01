@@ -24,7 +24,22 @@ namespace CSharp_SMTP_Server.Networking
 		private readonly TcpListener _listener;
 		private readonly Thread _listenerThread;
 		private readonly bool _secure;
+
+		// Shutdown signal. A CancellationTokenSource rather than a plain bool: the flag is written by
+		// Dispose() on one thread and read by the accept loop on another, and a non-volatile bool gives
+		// no visibility guarantee for that read (R7). IsCancellationRequested does, and the same object
+		// also gives Dispose() something to wait on — see _stopped.
+		private readonly CancellationTokenSource _cts = new();
+
+		// Signalled by the accept loop as it exits, so Dispose() can confirm the thread is actually
+		// gone instead of returning while it may still be inside AcceptTcpClient. That matters because
+		// SMTPServer.Dispose() disposes the TLS certificate immediately after disposing listeners.
+		private readonly ManualResetEventSlim _stopped = new(false);
+
+		// Guarded by _processorsLock. _dispose is the R11 registration gate (may a processor still be
+		// added?); _disposeStarted makes Dispose() itself idempotent (has teardown already run?).
 		private bool _dispose;
+		private bool _disposeStarted;
 
 		internal Listener(IPAddress address, ushort port, SMTPServer s, bool secure, bool dualMode)
 		{
@@ -74,7 +89,7 @@ namespace CSharp_SMTP_Server.Networking
 			try
 			{
 				_listener.Start(200);
-				while (!_dispose)
+				while (!_cts.IsCancellationRequested)
 				{
 					try
 					{
@@ -91,8 +106,13 @@ namespace CSharp_SMTP_Server.Networking
 					}
 					catch (Exception e)
 					{
-						if (!_dispose)
-							Server.LoggerInterface?.LogError("[Listening inner loop] Exception: " + e.Message);
+						// Once shutdown has begun, AcceptTcpClient throws on every iteration because the
+						// socket is closed. Reading the cancellation token (not a plain bool) is what
+						// keeps that from becoming a log flood on a stale read.
+						if (_cts.IsCancellationRequested)
+							break;
+
+						Server.LoggerInterface?.LogError("[Listening inner loop] Exception: " + e.Message);
 					}
 				}
 			}
@@ -100,13 +120,42 @@ namespace CSharp_SMTP_Server.Networking
 			{
 				Server.LoggerInterface?.LogError("[Listening] Exception: " + e.Message);
 			}
+			finally
+			{
+				// Always signal, including on the outer catch path — Dispose() waits on this, and a
+				// missed signal would turn its join into a guaranteed timeout.
+				_stopped.Set();
+			}
 		}
+
+		/// <summary>How long Dispose() waits for the accept thread to exit before giving up on it.</summary>
+		private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(5);
 
 		public void Dispose()
 		{
-			_dispose = true;
+			// Dispose() is called more than once in practice (SMTPServer.Dispose plus a test's own
+			// `using`), and the pre-CTS version tolerated that because setting a bool twice is
+			// harmless. Disposing _cts is not, so guard the whole method and keep it idempotent.
+			lock (_processorsLock)
+			{
+				if (_disposeStarted)
+					return;
 
+				_disposeStarted = true;
+			}
+
+			// Signal first, then break the blocking accept: the loop re-checks the token after
+			// AcceptTcpClient throws, so it sees cancellation already set and exits instead of logging.
+			_cts.Cancel();
 			_listener.Stop();
+
+			// Wait for the accept thread to actually leave the loop before tearing anything down. Without
+			// this, Dispose() could return while the thread was still mid-accept — and SMTPServer.Dispose()
+			// disposes the TLS certificate immediately after disposing listeners. Bounded so a wedged
+			// thread degrades to the old behavior rather than hanging shutdown forever.
+			if (_listenerThread.IsAlive && !_stopped.Wait(StopTimeout))
+				Server.LoggerInterface?.LogError(
+					"[Listener] Accept thread did not exit within " + StopTimeout.TotalSeconds + "s; continuing shutdown.");
 
 			// Set the flag and take the snapshot in ONE critical section, using the same lock
 			// AddProcessor takes. That ordering is what closes the accept/registration window: a
@@ -116,9 +165,9 @@ namespace CSharp_SMTP_Server.Networking
 			// shutdown unnoticed, still holding a socket and using the certificate that
 			// SMTPServer.Dispose() disposes next.
 			//
-			// (_dispose is also assigned above, unsynchronised, so the accept loop's `while (!_dispose)`
-			// and the exception filter observe shutdown promptly. The assignment here is the one this
-			// invariant relies on; the plain-bool visibility issue on that other read is R7.)
+			// The join above makes this strictly stronger than before: in the normal case no accept is
+			// even in flight by the time the snapshot is taken. The lock still matters for the timeout
+			// path and for connections' own dispose paths calling RemoveProcessor concurrently.
 			ClientProcessor[] snapshot;
 			lock (_processorsLock)
 			{
@@ -128,6 +177,9 @@ namespace CSharp_SMTP_Server.Networking
 
 			foreach (var processor in snapshot)
 				processor.Dispose(true, true);
+
+			_cts.Dispose();
+			_stopped.Dispose();
 		}
 	}
 }

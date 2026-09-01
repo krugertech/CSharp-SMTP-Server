@@ -37,6 +37,14 @@ not a dependency-resolution barrier. The major bump is the barrier.
 
 ### Fixed
 
+- **Listener shutdown now waits for its accept thread.** `Listener.Dispose()` returned without
+  confirming the accept thread had exited, so the thread could still be inside `AcceptTcpClient` when
+  `SMTPServer.Dispose()` went on to dispose the TLS certificate — the same certificate-lifetime hazard
+  as the accepted-connection case fixed above, one level up. Shutdown is signalled through a
+  `CancellationTokenSource` rather than a non-volatile `bool` (which gave the accept loop's read no
+  visibility guarantee and could, on a stale read, leave it retrying and logging against a stopped
+  socket), and `Dispose()` waits up to 5 seconds for the loop to signal that it exited, logging and
+  continuing if it does not. `Dispose()` remains idempotent.
 - **SPF: NXDOMAIN in `a`/`mx` is a no-match, not a temperror.** RFC 7208 §5 treats a nonexistent name
   as a definitive answer, so evaluation must continue to the next mechanism (typically a terminal
   `-all`). Both the address lookup and the MX lookup previously collapsed every non-`NoError` response

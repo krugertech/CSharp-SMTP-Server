@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Net;
 using System.Net.Sockets;
 using CSharp_SMTP_Server.Interfaces;
@@ -137,6 +138,65 @@ public sealed class LifecycleAndRobustnessTests
 
         processor.Dispose(true, true); // what the accept loop now does with a refused processor
         sink.Stop();
+    }
+
+    [Fact]
+    public async Task Dispose_JoinsAcceptThread_BeforeReturning_R7()
+    {
+        // R7: Dispose() used to return without confirming the accept thread had exited, so the thread
+        // could still be inside AcceptTcpClient while SMTPServer.Dispose() went on to dispose the TLS
+        // certificate. It now waits (bounded) for the loop to signal that it left.
+        var port = TestPorts.Allocate();
+        using var server = new SMTPServer(null, TestServers.DefaultOptions(), NoopDelivery.Instance);
+        var listener = new Listener(IPAddress.Loopback, port, server, false, false);
+        listener.Start();
+
+        await using (var s = await SmtpSession.ConnectAsync(port))
+            Assert.StartsWith("220 ", await s.ReadLineAsync()); // thread is live and accepting
+
+        var thread = (Thread)typeof(Listener)
+            .GetField("_listenerThread", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(listener)!;
+        Assert.True(thread.IsAlive);
+
+        listener.Dispose();
+
+        // The guarantee is synchronous: no polling, no sleep. If Dispose() returned early this fails.
+        Assert.False(thread.IsAlive, "Dispose() returned while the accept thread was still running (R7)");
+    }
+
+    [Fact]
+    public void Dispose_IsIdempotent_R7()
+    {
+        // Dispose() now owns a CancellationTokenSource and a ManualResetEventSlim, so a second call
+        // would throw ObjectDisposedException where the old bool-flag version was harmless. Both
+        // SMTPServer.Dispose() and a caller's own `using` can reach this, so it must stay idempotent.
+        var port = TestPorts.Allocate();
+        using var server = new SMTPServer(null, TestServers.DefaultOptions(), NoopDelivery.Instance);
+        var listener = new Listener(IPAddress.Loopback, port, server, false, false);
+        listener.Start();
+
+        listener.Dispose();
+        listener.Dispose(); // must not throw
+        listener.Dispose();
+    }
+
+    [Fact]
+    public void Dispose_NeverStartedListener_ReturnsImmediately_R7()
+    {
+        // A listener whose thread was never started never signals the accept loop's exit event. Dispose()
+        // must not sit on its 5 s timeout waiting for a thread that will never run — this is the path
+        // taken by every server that is constructed and disposed without Start() (and by the
+        // port-already-in-use path below).
+        var port = TestPorts.Allocate();
+        using var server = new SMTPServer(null, TestServers.DefaultOptions(), NoopDelivery.Instance);
+        var listener = new Listener(IPAddress.Loopback, port, server, false, false); // never Start()ed
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        listener.Dispose();
+
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2),
+            $"Dispose() on an unstarted listener blocked for {sw.Elapsed.TotalSeconds:F1}s — it waited on a thread that never ran");
     }
 
     [Fact]
