@@ -213,6 +213,15 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 		/// <param name="length">Length of the line in bytes.</param>
 		internal static async Task ProcessData(ClientProcessor processor, byte[] buffer, int length)
 		{
+			// DATA is only entered with a transaction open, and every path that abandons one also
+			// clears CaptureData, so this cannot normally be null. Asserted rather than assumed because
+			// the alternative on an unexpected interleaving is an NRE inside the receive loop.
+			if (processor.Transaction == null)
+			{
+				processor.CaptureData = 0;
+				return;
+			}
+
 			{
 				if (IsTerminatingDot(buffer, length))
 				{
@@ -396,18 +405,22 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			if (string.IsNullOrWhiteSpace(address))
 				return null;
 
-			var atIndex = address.LastIndexOf('@');
-			var lastDotIndex = address.LastIndexOf('.');
+			// Quote-aware for the same reason ProcessAddress is: MimeKit hands back the address form of
+			// a quoted local-part with its quotes intact, so "a@b"@example.com arrives here carrying an
+			// '@' that does not separate local-part from domain.
+			var atIndex = LastIndexOfUnquoted(address, '@');
 
-			if (lastDotIndex == -1 || atIndex == -1 || lastDotIndex < atIndex)
+			if (atIndex == -1 || LastIndexOfUnquoted(address[..atIndex], '@') != -1)
 				return null;
 
-			if (address.Count(x => x == '@') != 1)
+			var lastDotIndex = address.LastIndexOf('.');
+
+			if (lastDotIndex == -1 || lastDotIndex < atIndex)
 				return null;
 
 			var domain = address[(atIndex + 1)..];
 
-			return domain.Contains('.') ? domain : null;
+			return domain.Contains('.') && !domain.Contains('"', StringComparison.Ordinal) ? domain : null;
 		}
 
 		/// <summary>
@@ -574,7 +587,7 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			if (!IsAllowedPathPrefix(data[..open]))
 				return false;
 
-			var close = data.IndexOf('>', open);
+			var close = FindPathEnd(data, open);
 			if (close == -1)
 				return false;
 
@@ -594,8 +607,102 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 
 			path = data[(open + 1)..close];
 
-			// A '<' inside the path means the pair is not the path.
-			return !path.Contains('<', StringComparison.Ordinal);
+			// A '<' inside the path means the pair is not the path — but only outside a quoted-string,
+			// where it is an ordinary character of the local-part. Scanning quote-aware is what lets
+			// <"a<b"@example.com> through while still refusing "<><ceo@victim.example>".
+			return !ContainsUnquoted(path, '<');
+		}
+
+		/// <summary>
+		/// Finds the '&gt;' that closes a bracketed path, ignoring any that falls inside a
+		/// quoted-string.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// RFC 5321 §4.1.2 allows the local-part to be a quoted-string, inside which '&lt;' and '&gt;'
+		/// are ordinary characters: &lt;"a&gt;b"@example.com&gt; is a valid, if unusual, address.
+		/// Treating the first '&gt;' as the terminator split that path at the wrong place, leaving
+		/// "a" as the address, which then failed validation and produced a permanent 501 for a
+		/// legitimate address. Shared by RCPT TO, so it could lose a recipient as well as a sender.
+		/// </para>
+		/// <para>
+		/// Quoted-pairs are honoured: a backslash escapes the following character, so a quote can
+		/// appear inside the quoted-string without ending it. An unterminated quoted-string yields no
+		/// terminator rather than falling back to the first '&gt;' — the argument is malformed, and
+		/// guessing where the path ends is what the anchored parsing elsewhere in this file exists to
+		/// avoid.
+		/// </para>
+		/// </remarks>
+		/// <param name="data">The command argument.</param>
+		/// <param name="open">Index of the path's opening '&lt;'.</param>
+		/// <returns>Index of the closing '&gt;', or -1 if there is none outside a quoted-string.</returns>
+		private static int FindPathEnd(string data, int open)
+		{
+			var inQuotes = false;
+
+			for (var i = open + 1; i < data.Length; i++)
+			{
+				var c = data[i];
+
+				if (inQuotes)
+				{
+					// A backslash escapes the next character, the closing quote included.
+					if (c == '\\')
+					{
+						i++;
+						continue;
+					}
+
+					if (c == '"')
+						inQuotes = false;
+
+					continue;
+				}
+
+				if (c == '"')
+					inQuotes = true;
+				else if (c == '>')
+					return i;
+			}
+
+			return -1;
+		}
+
+		/// <summary>
+		/// Determines whether a path contains the given character outside any quoted-string.
+		/// </summary>
+		/// <param name="path">The text between the path's brackets.</param>
+		/// <param name="value">The character to look for.</param>
+		/// <returns>True if the character occurs outside a quoted-string.</returns>
+		private static bool ContainsUnquoted(string path, char value)
+		{
+			var inQuotes = false;
+
+			for (var i = 0; i < path.Length; i++)
+			{
+				var c = path[i];
+
+				if (inQuotes)
+				{
+					if (c == '\\')
+					{
+						i++;
+						continue;
+					}
+
+					if (c == '"')
+						inQuotes = false;
+
+					continue;
+				}
+
+				if (c == '"')
+					inQuotes = true;
+				else if (c == value)
+					return true;
+			}
+
+			return false;
 		}
 
 		/// <summary>
@@ -624,22 +731,73 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			if (string.IsNullOrWhiteSpace(address))
 				return null;
 
-			var lastDotIndex = address.LastIndexOf('.');
-			var atIndex = address.LastIndexOf('@');
+			// The local-part/domain split is the last '@' OUTSIDE a quoted-string. RFC 5321 §4.1.2
+			// permits a quoted local-part, inside which '@' is an ordinary character, so
+			// <"a@b"@example.com> carries two '@' and only the second separates the parts. Requiring
+			// exactly one '@' anywhere in the address refused that outright.
+			var atIndex = LastIndexOfUnquoted(address, '@');
 
-			if (lastDotIndex == -1 || atIndex == -1 || lastDotIndex < atIndex)
+			if (atIndex == -1)
 				return null;
 
-			if (address.Count(x => x == '@') != 1)
+			// Exactly one unquoted '@': more than one is ambiguous and malformed regardless of quoting.
+			if (LastIndexOfUnquoted(address[..atIndex], '@') != -1)
+				return null;
+
+			var lastDotIndex = address.LastIndexOf('.');
+
+			if (lastDotIndex == -1 || lastDotIndex < atIndex)
 				return null;
 
 			domain = address[(atIndex + 1)..];
 
-			if (domain.Contains('.'))
+			// A quoted-string is only a local-part construct; the domain must not contain one, or a
+			// trailing quote could hide the dot this check relies on.
+			if (domain.Contains('.') && !domain.Contains('"', StringComparison.Ordinal))
 				return address;
 
 			domain = null;
 			return null;
+		}
+
+		/// <summary>
+		/// Finds the last occurrence of a character outside any quoted-string.
+		/// </summary>
+		/// <param name="path">The text to scan.</param>
+		/// <param name="value">The character to look for.</param>
+		/// <returns>Index of the last unquoted occurrence, or -1.</returns>
+		private static int LastIndexOfUnquoted(string path, char value)
+		{
+			var inQuotes = false;
+			var found = -1;
+
+			for (var i = 0; i < path.Length; i++)
+			{
+				var c = path[i];
+
+				if (inQuotes)
+				{
+					if (c == '\\')
+					{
+						i++;
+						continue;
+					}
+
+					if (c == '"')
+						inQuotes = false;
+
+					continue;
+				}
+
+				if (c == '"')
+					inQuotes = true;
+				else if (c == value)
+					found = i;
+			}
+
+			// An unterminated quoted-string leaves the split point undecidable; refuse rather than
+			// guess, consistent with FindPathEnd.
+			return inQuotes ? -1 : found;
 		}
 	}
 }
