@@ -214,6 +214,23 @@ namespace CSharp_SMTP_Server.Networking
 			{
 				try
 				{
+					// While capturing a message body, read the line as raw bytes and hand it straight to
+					// the DATA path. Decoding it to a string here and re-encoding it into the body store
+					// silently rewrote every byte that was not valid UTF-8 — a body is an octet stream,
+					// and the archive has to hold what arrived. Command lines still come back as text.
+					if (CaptureData == 1)
+					{
+						var line = await _reader.ReadLineBytesAsync(_t);
+
+						if (line == null)
+							continue;
+
+						if (_greetSent)
+							await TransactionCommands.ProcessData(this, line.Value.Buffer, line.Value.Length);
+
+						continue;
+					}
+
 					var read = await _reader.ReadLineAsync(_t);
 
 					if (read == null)
@@ -284,10 +301,8 @@ namespace CSharp_SMTP_Server.Networking
 
 			switch (CaptureData)
 			{
-				case 1:
-					await TransactionCommands.ProcessData(this, response);
-					return;
-
+				// CaptureData == 1 (message body) never reaches here: the receive loop reads those lines
+				// as bytes and dispatches them directly, so the body is never decoded to a string.
 				case 2:
 				case 3:
 				case 4:

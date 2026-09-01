@@ -29,9 +29,12 @@ namespace CSharp_SMTP_Server.Tests.Load;
 /// that normalization and <see cref="ExtractPayload"/> strips the prepended headers.
 /// </para>
 /// <para>
-/// No payload line may begin with '.' — the server has no dot-unstuffing (REVIEW.md Q1), so such a
-/// line is corrupted by design today. That defect is pinned by its own dedicated test rather than
-/// being allowed to contaminate load runs; see <c>DotStuffing_IsNotImplemented_PinsQ1</c>.
+/// No payload line begins with '.'. The server now unstuffs correctly (REVIEW.md Q1, fixed), but a
+/// leading-dot line still has a wire form that differs from its stored form, and these samples are
+/// hashed as written rather than as framed — so keeping them dot-free means a corpus hash needs no
+/// knowledge of transparency encoding. Unstuffing has its own dedicated coverage; see
+/// <c>DotStuffing_IsUnstuffed_Q1Fixed</c> here and <c>DotStuffing_IsUnstuffed_BodyLinesStoredAsComposed</c>
+/// in <c>DataAndMessageTests</c>.
 /// </para>
 /// </remarks>
 internal static class MessageCorpus

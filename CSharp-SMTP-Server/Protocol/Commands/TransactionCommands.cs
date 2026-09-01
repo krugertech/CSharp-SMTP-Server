@@ -191,13 +191,30 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 			}
 		}
 
-		internal static async Task ProcessData(ClientProcessor processor, string data)
+		/// <summary>
+		/// Consumes one line of DATA, as the bytes that arrived on the wire.
+		/// </summary>
+		/// <remarks>
+		/// <para>
+		/// Bytes rather than a string: a message body is an octet stream that may carry any charset or
+		/// none, and the previous path decoded each line to UTF-16 and re-encoded it as UTF-8 on the
+		/// way into the body store. Every byte that was not valid UTF-8 became U+FFFD and was stored as
+		/// EF BF BD, so the archived message was not what the sender transmitted — which matters
+		/// directly to a downstream DKIM verifier, since it hashes the octets it is handed and a
+		/// transcode invalidates the signature.
+		/// </para>
+		/// <para>
+		/// The buffer is borrowed from the reader and is overwritten by the next read, so it is copied
+		/// into the body store before this returns and never retained.
+		/// </para>
+		/// </remarks>
+		/// <param name="processor">The connection.</param>
+		/// <param name="buffer">Buffer holding the line, without its terminator.</param>
+		/// <param name="length">Length of the line in bytes.</param>
+		internal static async Task ProcessData(ClientProcessor processor, byte[] buffer, int length)
 		{
-			data = data.Replace("\r", "");
-			var dta = data.Split('\n');
-			foreach (var dt in dta)
 			{
-				if (dt == ".")
+				if (IsTerminatingDot(buffer, length))
 				{
 					processor.CaptureData = 0;
 
@@ -313,21 +330,53 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					return;
 				}
 
-				processor.Counter += (ulong)dt.Length;
+				// RFC 5321 §4.5.2 transparency: the sending client prefixes an extra '.' to any line
+				// that already begins with one, and the receiver MUST strip it. Without this a body
+				// line "..text" was stored verbatim, so what reached the archive was not what the
+				// sender composed — silent corruption of exactly the leading-dot lines the mechanism
+				// exists to carry, and enough on its own to break a DKIM signature over that body.
+				//
+				// Stripping is a one-byte offset here rather than a string operation because the line
+				// is still the wire's bytes; the '.' is ASCII 0x2E and cannot be part of a multi-byte
+				// sequence, so this is safe on any charset.
+				var offset = 0;
+
+				if (length > 0 && buffer[0] == (byte)'.')
+				{
+					offset = 1;
+					length--;
+				}
+
+				// Counted AFTER unstuffing, so the limit measures the message as stored rather than as
+				// framed: the stuffing dot is transport, not content, and charging the sender for it
+				// would make the enforced limit depend on how many of its body lines happen to start
+				// with a dot.
+				processor.Counter += (ulong)length;
 
 				// Over-limit data is counted but not stored, so an oversized message costs the limit in
 				// memory rather than its own size — the property the 552-at-the-dot design relies on.
 				if (processor.Server.Options.MessageCharactersLimit == 0 ||
 				    processor.Server.Options.MessageCharactersLimit >= processor.Counter)
 				{
-					// Written as UTF-8 bytes straight into the body store — a file, past the spill
-					// threshold — rather than accumulated in a StringBuilder that then has to be
-					// ToString()'d, cloned and re-encoded. CRLF is explicit: AppendLine emitted
-					// Environment.NewLine, so the stored message had bare LF on Linux.
-					processor.Transaction!.Body.WriteLine(dt);
+					// Written straight into the body store — a file, past the spill threshold — rather
+					// than accumulated in a StringBuilder that then has to be ToString()'d, cloned and
+					// re-encoded. CRLF is explicit: AppendLine emitted Environment.NewLine, so the
+					// stored message had bare LF on Linux.
+					processor.Transaction!.Body.WriteLine(buffer, offset, length);
 				}
 			}
 		}
+
+		/// <summary>
+		/// Determines whether a DATA line is the terminating dot that ends the message.
+		/// </summary>
+		/// <remarks>
+		/// The terminator is a line consisting of exactly one '.' (RFC 5321 §4.1.1.4). A line of "..",
+		/// which unstuffs to a literal ".", is body content and must not end the message — comparing
+		/// the bytes rather than a trimmed string keeps the two distinct.
+		/// </remarks>
+		private static bool IsTerminatingDot(byte[] buffer, int length) =>
+			length == 1 && buffer[0] == (byte)'.';
 
 		/// <summary>
 		/// Extracts the domain from a bare email address ("user@example.com" → "example.com").

@@ -164,6 +164,30 @@ namespace CSharp_SMTP_Server
 		}
 
 		/// <summary>
+		/// Appends one line of body bytes plus its CRLF terminator, without transcoding them.
+		/// </summary>
+		/// <remarks>
+		/// The DATA path's line writer. Taking bytes rather than a string is what makes the stored
+		/// message byte-identical to the wire: a body is an octet stream that may be in any charset or
+		/// none, and decoding it to UTF-16 and re-encoding to UTF-8 replaced every byte that was not
+		/// valid UTF-8 with U+FFFD. Whatever arrived is what is stored, so a downstream DKIM verifier
+		/// hashes the same octets the sender signed.
+		/// </remarks>
+		/// <param name="buffer">Source buffer holding the line.</param>
+		/// <param name="offset">Offset of the line within <paramref name="buffer"/>.</param>
+		/// <param name="count">Length of the line in bytes, excluding its terminator.</param>
+		internal void WriteLine(byte[] buffer, int offset, int count)
+		{
+			if (count > 0)
+				Write(buffer, offset, count);
+
+			Write(Crlf, 0, 2);
+		}
+
+		/// <summary>The line terminator written after every body line.</summary>
+		private static readonly byte[] Crlf = { (byte)'\r', (byte)'\n' };
+
+		/// <summary>
 		/// Records a header to appear before the body, ahead of any header added earlier.
 		/// </summary>
 		/// <remarks>

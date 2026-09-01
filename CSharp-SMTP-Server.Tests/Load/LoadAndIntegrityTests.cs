@@ -199,7 +199,7 @@ public sealed class LoadAndIntegrityTests
     /// and mark the behavior change.
     /// </remarks>
     [Fact]
-    public async Task DotStuffing_IsNotImplemented_PinsQ1()
+    public async Task DotStuffing_IsUnstuffed_Q1Fixed()
     {
         var delivery = new RecordingDelivery();
         var port = TestPorts.Allocate();
@@ -227,9 +227,10 @@ public sealed class LoadAndIntegrityTests
 
         var body = Assert.Single(delivery.Delivered).RawBody;
 
-        // Today the doubled dot is stored verbatim: no unstuffing happens.
-        Assert.Contains("..leading dot line", body);
-        Assert.DoesNotContain("\n.leading dot line", MessageCorpus.Canonicalize(body));
+        // RFC 5321 §4.5.2: the stuffing dot is transport framing and is stripped, so the archive holds
+        // the line the sender composed.
+        Assert.DoesNotContain("..leading dot line", body);
+        Assert.Contains("\n.leading dot line", MessageCorpus.Canonicalize(body));
     }
 
     // ── heavy tier: opt in with SMTP_LOADTEST=1 ───────────────────────────────────────────────

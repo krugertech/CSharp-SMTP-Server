@@ -167,11 +167,18 @@ public sealed class DataAndMessageTests
         }
     }
 
+    /// <summary>
+    /// RFC 5321 §4.5.2 transparency: a body line the client stuffed as ".." is stored unstuffed.
+    /// </summary>
+    /// <remarks>
+    /// Was the Q1 pin, asserting the defect — a stuffed line stored verbatim. Storing the wire form
+    /// meant the archive held something the sender never composed, which breaks a downstream DKIM
+    /// verifier: it hashes the octets it is handed, and the extra dot is transport framing that was
+    /// never part of the signed body.
+    /// </remarks>
     [Fact]
-    public async Task DotStuffing_IsNotSupported_BodyLinesStoredVerbatim()
+    public async Task DotStuffing_IsUnstuffed_BodyLinesStoredAsComposed()
     {
-        // Pin Q1 (TEST_PLAN.md §2): no RFC 5321 dot-unstuffing — a body line starting with ".." is
-        // stored as-is.
         var (s, server, delivery) = await ConnectReadyAsync();
         using (server)
         await using (s)
@@ -179,12 +186,108 @@ public sealed class DataAndMessageTests
             await StartTransactionAsync(s);
             await s.Send("DATA");
             Assert.StartsWith("354", await s.ReadLineAsync());
-            await s.Send("..foo"); // would be "un-stuffed" to ".foo" by a conforming server
+            await s.Send("..foo"); // the wire form of a body line reading ".foo"
             await s.Send(".");
             Assert.StartsWith("250", await s.ReadLineAsync());
 
-            Assert.Contains("..foo\r\n", delivery.Delivered[0].RawBody);
+            var raw = delivery.Delivered[0].RawBody;
+
+            Assert.Contains(".foo\r\n", raw);
+            Assert.DoesNotContain("..foo", raw);
         }
+    }
+
+    /// <summary>
+    /// A stuffed line of ".." unstuffs to a literal "." without ending the message.
+    /// </summary>
+    /// <remarks>
+    /// The terminator is a line of exactly one '.', so the two cases are distinguished before
+    /// unstuffing rather than after — unstuffing first would turn this body line into a terminator and
+    /// truncate the message at it.
+    /// </remarks>
+    [Fact]
+    public async Task StuffedLoneDot_IsBodyContent_NotTerminator()
+    {
+        var (s, server, delivery) = await ConnectReadyAsync();
+        using (server)
+        await using (s)
+        {
+            await StartTransactionAsync(s);
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("before");
+            await s.Send("..");   // a body line consisting of a single '.'
+            await s.Send("after");
+            await s.Send(".");
+            Assert.StartsWith("250", await s.ReadLineAsync());
+
+            var raw = delivery.Delivered[0].RawBody;
+
+            Assert.Contains("before\r\n.\r\nafter\r\n", raw);
+        }
+    }
+
+    /// <summary>
+    /// A body byte sequence that is not valid UTF-8 reaches the delivery handler unaltered.
+    /// </summary>
+    /// <remarks>
+    /// The DATA path used to decode each line to a .NET string and re-encode it as UTF-8 into the body
+    /// store, so every invalid byte was replaced by U+FFFD and stored as EF BF BD. A message body is an
+    /// octet stream — it may be Latin-1, an unlabelled 8-bit body, or a binary attachment — and a
+    /// downstream DKIM verifier hashes exactly the bytes it is given, so a transcode in the middle
+    /// invalidates the signature. Asserted on the stream, since RawBody is by definition text.
+    /// </remarks>
+    [Fact]
+    public async Task InvalidUtf8BodyBytes_AreStoredByteExact()
+    {
+        // 0x80 and 0xFF are not valid UTF-8 in any position; 0xE9 is 'é' in Latin-1 but a truncated
+        // lead byte in UTF-8. All three would previously have become U+FFFD.
+        var payload = new byte[] { 0x80, 0xE9, 0xFF };
+
+        var (s, server, delivery) = await ConnectReadyAsync();
+        using (server)
+        await using (s)
+        {
+            await StartTransactionAsync(s);
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            // Sent unframed so the bytes reach the socket exactly as written — Send() would encode
+            // the string form and defeat the point of the test.
+            await s.SendRaw(new byte[] { 0x80, 0xE9, 0xFF, (byte)'\r', (byte)'\n' });
+            await s.Send(".");
+            Assert.StartsWith("250", await s.ReadLineAsync());
+
+            using var stream = delivery.Delivered[0].GetBodyStream();
+            using var copy = new MemoryStream();
+            stream.CopyTo(copy);
+            var stored = copy.ToArray();
+
+            // The three payload bytes appear consecutively and intact somewhere after the prepended
+            // Received: header.
+            var index = IndexOf(stored, payload);
+            Assert.True(index >= 0, "body bytes were altered in transit to the delivery handler");
+        }
+    }
+
+    /// <summary>Finds the first occurrence of <paramref name="needle"/> in <paramref name="haystack"/>.</summary>
+    private static int IndexOf(byte[] haystack, byte[] needle)
+    {
+        for (var i = 0; i + needle.Length <= haystack.Length; i++)
+        {
+            var match = true;
+
+            for (var j = 0; j < needle.Length; j++)
+            {
+                if (haystack[i + j] == needle[j]) continue;
+
+                match = false;
+                break;
+            }
+
+            if (match) return i;
+        }
+
+        return -1;
     }
 
     [Fact]
