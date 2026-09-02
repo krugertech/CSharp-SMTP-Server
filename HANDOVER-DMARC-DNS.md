@@ -1,5 +1,51 @@
 # Handover: DMARC authentication gap and DNS client replacement
 
+> **STATUS: BOTH TASKS COMPLETE.** Retained as the record of what was asked for and why; the
+> reasoning behind each decision now lives in the code comments and in the documents below.
+>
+> | Task | Commit | Outcome |
+> |---|---|---|
+> | 1 — DMARC authentication gap | `c32d844`, `768d521` | DMARC requires an aligned SPF `Pass`; `Temperror` defers with `451 4.7.1` |
+> | 2 — DNS client replacement | `727f97f`, `7ec04b8` | DnsClient.NET 1.8.0 behind `IDnsResolver`, caching proven by query count |
+>
+> Suite: **517/517** (baseline was 490).
+>
+> Shipped behaviour is documented in
+> [RELAY-SENDER-AUTHORIZATION.md](RELAY-SENDER-AUTHORIZATION.md) and
+> [CHANGELOG.md](CHANGELOG.md); what remains open is in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+>
+> **Decisions taken that the text below left open:**
+>
+> - *Unauthenticated mail answers `None`, not `Fail`.* Per the requirement that DSNs and SPF-less
+>   customer mail keep flowing. The consequence is stated plainly rather than glossed: a `p=reject`
+>   domain with no SPF record is still not protected by this relay — DMARC just no longer claims it
+>   is. Closing that needs DKIM or per-customer mTLS.
+> - *`Temperror` defers (`451 4.7.1`)* rather than failing open or closed, per RFC 7489 §6.6.3.
+> - *External consumers: clean break at the 2.0 prerelease boundary.* No compatibility shims; the
+>   migration table is in CHANGELOG.md.
+> - *Resolver default: `System`* — the machine's own name servers, retiring the Cloudflare fallback
+>   rather than warning about it.
+>
+> **Found and fixed along the way, beyond the original scope** — each because it directly undermined
+> the task it touched:
+>
+> - SPF returned `Temperror` for NXDOMAIN instead of `None` (RFC 7208 §4.3, deviation Q12a, and Q12c
+>   with it). Left alone, every non-existent sender domain would have been deferred indefinitely once
+>   DMARC began deferring on `Temperror`.
+> - A `Temperror` cached in the connection-scoped `SpfResultsCache` pinned one SERVFAIL for the whole
+>   session, so a retrying sender kept being deferred after DNS recovered.
+> - The DMARC public suffix list was cleared and repopulated in place while connection threads read
+>   it, and set its "loaded" latch before the download began — a torn read silently changes
+>   relaxed-alignment verdicts.
+> - Two `DnsStub` wire-format defects, invisible to the old client: a byte-swapped RR class, and the
+>   response echoing an EDNS0 OPT record into the question section.
+> - Definitive DNS negatives were not cached at all, because DnsClient.NET classifies them with
+>   transient failures under one flag. Caught by adversarial review, which contradicted a claim made
+>   in these docs; testing confirmed the review was right.
+
+---
+
+
 Two pieces of work, in priority order. Task 1 is a confirmed security defect in committed code.
 Task 2 is a dependency replacement that Task 1 does not depend on — they can be done by different
 people, but read the shared context first.
