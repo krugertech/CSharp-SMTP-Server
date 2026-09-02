@@ -84,6 +84,15 @@ namespace CSharp_SMTP_Server
 
 			if (Options.DnsServerEndpoint != null)
 			{
+				// The Cloudflare fallback is silent at construction time — ServerOptions has no logger.
+				// Surface it here instead: a deployment that never chose a resolver still sends every
+				// SPF/DMARC lookup, and with it the sending domains of its inbound mail, to a third party.
+				if (Options.DnsServerEndpointIsDefault)
+					LoggerInterface?.LogError(
+						$"[Startup] No DNS server endpoint was configured; SPF/DMARC validation will use the default public resolver {Options.DnsServerEndpoint}. " +
+						"All SPF and DMARC lookups — including the sending domains of inbound mail — will be sent to that third-party operator. " +
+						"Pass an explicit endpoint to ServerOptions to keep DNS resolution on infrastructure you control.");
+
 				DnsClient = new DnsClient.DnsClient(Options.DnsServerEndpoint, new DnsClientOptions {ErrorLogging = new DnsLogger(this)});
 				SpfValidator = new SpfValidator(this);
 				DmarcValidator = new DmarcValidator(this);

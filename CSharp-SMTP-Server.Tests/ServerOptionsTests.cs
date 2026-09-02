@@ -62,6 +62,31 @@ public sealed class ServerOptionsTests
     }
 
     [Fact]
+    public void Ctor_FallbackApplied_IsFlaggedAsDefault()
+    {
+        Assert.True(new ServerOptions(true, false, null).DnsServerEndpointIsDefault);
+        Assert.True(new ServerOptions(false, true, null).DnsServerEndpointIsDefault);
+        Assert.True(new ServerOptions(true, true, null).DnsServerEndpointIsDefault);
+    }
+
+    [Fact]
+    public void Ctor_ExplicitEndpoint_IsNotFlaggedAsDefault()
+    {
+        var o = new ServerOptions(true, true, new IPEndPoint(IPAddress.Parse("9.9.9.9"), 53));
+
+        Assert.False(o.DnsServerEndpointIsDefault);
+    }
+
+    [Fact]
+    public void Ctor_NoValidation_NoFallback_IsNotFlaggedAsDefault()
+    {
+        var o = new ServerOptions(false, false, null);
+
+        Assert.Null(o.DnsServerEndpoint);
+        Assert.False(o.DnsServerEndpointIsDefault);
+    }
+
+    [Fact]
     public void ValidateSPF_SetterTrue_WithoutEndpoint_Throws()
     {
         var o = new ServerOptions(false, false);

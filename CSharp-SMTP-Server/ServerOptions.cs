@@ -97,17 +97,36 @@ namespace CSharp_SMTP_Server
 		}
 
 		/// <summary>
-		/// Endpoint to the DNS Server used for SPF validation.
+		/// Endpoint to the DNS Server used for SPF and DMARC validation.
+		/// <para>
+		/// If SPF or DMARC validation is enabled and no endpoint is supplied, this falls back to
+		/// 1.1.1.1:53 (Cloudflare Public DNS). <b>Every SPF and DMARC lookup then leaves your network
+		/// to a third-party resolver</b>, exposing the sending domains of your inbound mail — and your
+		/// query volume — to that operator. Where that is a privacy, compliance, or availability
+		/// concern, pass an explicit endpoint. <see cref="DnsServerEndpointIsDefault"/> reports whether
+		/// the fallback was applied, and <see cref="SMTPServer"/> logs a warning at startup when it was.
+		/// </para>
 		/// Default: 1.1.1.1:53 (Cloudflare Public DNS Server)
 		/// </summary>
 		public readonly EndPoint? DnsServerEndpoint;
+
+		/// <summary>
+		/// True when <see cref="DnsServerEndpoint"/> was not supplied by the caller and the built-in
+		/// Cloudflare fallback was applied. False when the caller passed an endpoint explicitly, and
+		/// false when no validation was requested and no endpoint was set.
+		/// </summary>
+		public readonly bool DnsServerEndpointIsDefault;
 
 		/// <summary>
 		/// Constructor
 		/// </summary>
 		/// <param name="validateSPF">Indicates whether SPF validation should be enabled</param>
 		/// <param name="validateDMARC">Indicates whether DMARC validation should be enabled</param>
-		/// <param name="dnsServerEndpoint">Specifies DNS server endpoint</param>
+		/// <param name="dnsServerEndpoint">
+		/// Specifies DNS server endpoint. If null and either validation is enabled, 1.1.1.1:53
+		/// (Cloudflare Public DNS) is used and all SPF/DMARC lookups go to that third-party resolver.
+		/// Pass an explicit endpoint to keep resolution on infrastructure you control.
+		/// </param>
 		// ReSharper disable InconsistentNaming
 		public ServerOptions(bool validateSPF = true, bool validateDMARC = true, EndPoint? dnsServerEndpoint = null)
 		{
@@ -116,7 +135,10 @@ namespace CSharp_SMTP_Server
 			DnsServerEndpoint = dnsServerEndpoint;
 
 			if ((validateSPF || validateDMARC) && DnsServerEndpoint == null)
+			{
 				DnsServerEndpoint = new IPEndPoint(IPAddress.Parse("1.1.1.1"), 53);
+				DnsServerEndpointIsDefault = true;
+			}
 		}
 
 		// ReSharper disable once InconsistentNaming
