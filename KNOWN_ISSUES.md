@@ -193,6 +193,30 @@ clearing per message would re-read from that rather than re-querying the wire. P
 drop this layer entirely and let the resolver cache do the work, which would make SPF verdicts follow
 DNS TTLs instead of connection lifetime.
 
+### The public-suffix reference swap has no regression test
+
+`DownloadList` builds each generation of the suffix set off to the side and publishes it by reference
+swap, and `GetOrganizationalDomain` captures that reference once per call. That replaced a real race —
+the set was previously cleared and repopulated in place while connection threads read it, and a torn
+read silently changes DMARC relaxed-alignment verdicts. It surfaced as intermittent suite failures.
+
+The fix is not pinned by a test. An attempt was made and removed rather than kept green: driving
+concurrent `GetOrganizationalDomain` calls against repeated `ForceRefreshList` cycles passes just as
+happily against a reverted, clear-in-place implementation, so it demonstrates nothing. Two reasons,
+both worth knowing before trying again:
+
+- The rebuild window is a few microseconds inside a call otherwise dominated by an HTTP fetch, so
+  readers almost never land in it. Padding the list to 20 000 entries widens the window but not
+  enough.
+- More fundamentally, a torn read has to change the *answer* to be observable, and the probe walk is
+  only two iterations deep — `Contains` against a partially filled set usually returns the same
+  organizational domain anyway.
+
+A test that actually pins this would need to drive the swap directly rather than through
+`ForceRefreshList`, with a probe domain whose answer depends on several suffix entries, and would
+still be probabilistic. Until then the fix rests on inspection: the swap is a single reference
+assignment under a lock, and readers capture once.
+
 ### Public suffix state is process-wide
 
 `DmarcValidator` holds the public suffix set in static state. Multiple servers in one process cannot
