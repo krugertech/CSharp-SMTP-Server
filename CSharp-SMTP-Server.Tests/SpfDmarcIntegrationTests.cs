@@ -840,4 +840,57 @@ public sealed class SpfDmarcIntegrationTests
     }
 
     #endregion
+
+    /// <summary>
+    /// The deferral on the SECOND policy lookup: the subdomain publishes no record of its own, so
+    /// evaluation falls back to the organizational domain — and that lookup is the one that fails.
+    /// </summary>
+    /// <remarks>
+    /// This is the branch the other two deferral tests do not reach, and the distinction is easy to
+    /// get wrong: both of those SERVFAIL the FIRST lookup, which returns before the fallback runs at
+    /// all. Deleting the second temporaryFailure check leaves both of them green — verified by
+    /// mutation, after an adversarial review pointed out that an earlier claim to have covered this
+    /// branch was mistaken.
+    ///
+    /// So the subdomain here answers NXDOMAIN rather than SERVFAIL: a definitive "no policy of my
+    /// own", which is what drives evaluation to the org domain. Only then does the org lookup fail.
+    /// Without the second check the failure would read as "no policy anywhere" and the message would
+    /// be delivered unvalidated — an organizational-policy outage silently regressing to delivery.
+    /// </remarks>
+    [Fact]
+    public async Task Data_DmarcOrgDomainLookupFails_DeferredWith451_NoDelivery()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+
+        stub.AddTxt("sub.victim.example", "v=spf1 ip4:127.0.0.1 -all"); // SPF authenticates cleanly
+        stub.SetNxDomain("_dmarc.sub.victim.example");                  // no policy of its own...
+        stub.SetServFail("_dmarc.victim.example");                      // ...and the org lookup fails
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<sender@sub.victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: sender@sub.victim.example");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("451 4.7.1 Temporary error validating DMARC, please retry later", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
+
+            // Both lookups must actually have been attempted, in that order.
+            var dmarcQueries = stub.Queries.Where(q => q.Name.StartsWith("_dmarc.")).Select(q => q.Name).ToArray();
+            Assert.Contains("_dmarc.sub.victim.example", dmarcQueries);
+            Assert.Contains("_dmarc.victim.example", dmarcQueries);
+        }
+    }
 }

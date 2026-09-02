@@ -142,6 +142,31 @@ handled as unauthenticated. See [RELAY-SENDER-AUTHORIZATION.md](RELAY-SENDER-AUT
 The former DNS fail-open for `a` and `mx` mechanisms (Q12b) is fixed and is documented in the
 changelog.
 
+### The SPF lookup limit is off by one, and is not enforced across `include:`
+
+Two defects in the RFC 7208 §4.6.4 budget of ten DNS-consuming terms. Both were found by adversarial
+review of the test suite rather than by a failing test, and the existing limit tests pass straight
+over them.
+
+**Off by one.** Each mechanism checks `requestsMade > 10` *before* incrementing, so an eleventh
+consuming term is permitted. Confirmed by probe: 10 terms → `Fail` (correct), **11 terms → `Fail`
+where the RFC requires `Permerror`**, 12 terms → `Permerror`. `MoreThanTenLookups_ReturnsPermerrorNotTerminal`
+uses twelve terms and therefore passes with the boundary broken; the boundary itself is untested.
+
+**The budget does not survive recursion.** `CheckHost` takes `requestsMade` by value and returns only
+a `ValidationResult`, so lookups consumed inside an `include:` or `redirect=` are never added back to
+the caller's count. Sibling includes each restart from the parent's total, and a record with several
+includes can drive far more than ten lookups in total while every individual branch stays under the
+limit. That is the amplification the limit exists to prevent, and the sender's domain is
+attacker-chosen.
+
+Also missing: the §4.6.4 "void lookup" limit (two NXDOMAIN/NODATA results) is not implemented or
+counted at all, and there is no cycle-termination test for mutually-recursive `include:` chains.
+
+Fixing the boundary is a one-character change (`>=` for `>`), but it will start rejecting records that
+currently pass, so it wants the same observe-before-enforce care as the DMARC change. The recursion
+fix needs `CheckHost` to return the consumed count alongside the verdict.
+
 ### The `exists:` mechanism is unimplemented and silently skipped
 
 `exists:` (RFC 7208 §5.7) is absent from the mechanism switch in `SpfValidator.CheckHost`. Because
