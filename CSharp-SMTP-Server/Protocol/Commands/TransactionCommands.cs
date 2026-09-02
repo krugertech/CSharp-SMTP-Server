@@ -357,6 +357,19 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 								return;
 							}
 
+							// RFC 7489 §6.6.3 permits a temporary-failure response when DMARC evaluation
+							// could not complete. The validator returns Temperror only when SPF itself hit a
+							// DNS failure, so there is no authenticated identity and no way to tell an
+							// outage from an attack. Deferring keeps the message recoverable — the sender
+							// retries once resolution works — where accepting would let a resolver outage
+							// silently disable DMARC and rejecting would bounce legitimate mail permanently.
+							if (dmarcValidation == ValidationResult.Temperror)
+							{
+								processor.DiscardTransaction();
+								await processor.WriteCode(451, "4.7.1", "Temporary error validating DMARC, please retry later");
+								return;
+							}
+
 							var fromDomain = GetAddressDomain(processor.Transaction.GetFrom);
 							processor.Transaction.AddHeader("Authentication-Results", $"{processor.Server.Options.ServerName}; dmarc={dmarcValidation.ToString().ToLowerInvariant()} header.from={fromDomain ?? "(none)"}");
 						}

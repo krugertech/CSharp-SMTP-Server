@@ -110,10 +110,18 @@ record TTLs in its cache. Requirements for the replacement:
 This is not urgent for the current journaling deployment, which disables SPF and DMARC, but it
 blocks enabling either with confidence.
 
-### Remaining SPF result deviations (Q12a/Q12c)
+### SPF result deviations (Q12a/Q12c) — fixed
 
-- A top-level TXT lookup returning NXDOMAIN produces `Temperror`; RFC 7208 requires `None`.
-- An SPF `redirect=` target returning NXDOMAIN produces `Temperror`; it should become `Permerror`.
+Both are resolved; the entry is kept because other documents reference these identifiers.
+
+- A top-level TXT lookup returning NXDOMAIN now produces `None`, per RFC 7208 §4.3 (Q12a). It
+  previously produced `Temperror`.
+- An SPF `redirect=` target returning NXDOMAIN now produces `Permerror` (Q12c), via the existing
+  §6.1 `None`→`Permerror` mapping. It was only ever `Temperror` as a consequence of Q12a.
+
+Fixing these became load-bearing when DMARC began deferring on `Temperror` (`451 4.7.1`): under the
+old mapping, mail from any non-existent domain would have been retried indefinitely rather than
+handled as unauthenticated. See [RELAY-SENDER-AUTHORIZATION.md](RELAY-SENDER-AUTHORIZATION.md).
 
 The former DNS fail-open for `a` and `mx` mechanisms (Q12b) is fixed and is documented in the
 changelog.

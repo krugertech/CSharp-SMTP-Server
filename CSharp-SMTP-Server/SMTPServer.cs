@@ -93,6 +93,18 @@ namespace CSharp_SMTP_Server
 						"All SPF and DMARC lookups — including the sending domains of inbound mail — will be sent to that third-party operator. " +
 						"Pass an explicit endpoint to ServerOptions to keep DNS resolution on infrastructure you control.");
 
+				// DMARC authenticates by checking that an already-AUTHENTICATED identifier aligns with the
+				// header-From domain (RFC 7489 §4.1). DKIM verification is unimplemented here
+				// (KNOWN_ISSUES.md), so SPF is the only mechanism that can supply one. With SPF off, DMARC
+				// has nothing to align and can never return Pass — it is enabled, visibly configured, and
+				// inert. Warn rather than throw: refusing to start would break existing deployments, and
+				// the validator now answers None instead of the Pass it used to invent.
+				if (Options.ValidateDMARC && !Options.ValidateSPF)
+					LoggerInterface?.LogError(
+						"[Startup] DMARC validation is enabled but SPF validation is disabled. DMARC needs an authenticated identifier to align, " +
+						"and with DKIM verification unimplemented SPF is the only source of one, so DMARC cannot authenticate any message and will " +
+						"never return a pass. Enable SPF validation, or disable DMARC to make its inertness explicit.");
+
 				DnsClient = new DnsClient.DnsClient(Options.DnsServerEndpoint, new DnsClientOptions {ErrorLogging = new DnsLogger(this)});
 				SpfValidator = new SpfValidator(this);
 				DmarcValidator = new DmarcValidator(this);

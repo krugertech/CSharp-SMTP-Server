@@ -39,6 +39,51 @@ skip decisions are retained in the architecture's
 
 ### Breaking
 
+- **DMARC no longer passes without an authenticated identifier.** Previously
+  `DmarcValidator.ProcessRecord` consulted the SPF result only for null reverse-path messages. For
+  ordinary mail — anything with a non-null `MAIL FROM`, which is nearly all traffic — it went
+  straight to the alignment comparison and returned `Pass` on a match.
+
+  Alignment compares the header-`From` domain against the envelope-sender domain, and the connecting
+  client supplies both, so making them match cost an attacker nothing. A domain publishing
+  `p=reject` with no SPF record could be spoofed through the server; an SPF softfail or a DNS
+  timeout downgraded DMARC to passing rather than failing closed.
+
+  RFC 7489 §4.1 requires at least one *authenticated* identifier to align. DKIM verification is
+  unimplemented here, so an aligned SPF `Pass` is now required for every message:
+
+  | SPF result | DMARC result | Effect at DATA |
+  |---|---|---|
+  | `Pass` | alignment evaluated as before | `Pass`, or the policy verdict when unaligned |
+  | `Temperror` | `Temperror` | `451 4.7.1`, deferred |
+  | `None`, `Neutral`, `Softfail`, `Permerror`, `CheckDisabled` | `None` | delivered, not labelled `dmarc=pass` |
+
+  Unauthenticated mail answers `None` ("no determination"), not `Fail`, and is still delivered.
+  Failing closed would refuse every DSN from a bouncing MTA and every customer domain with no usable
+  SPF record. **This means a `p=reject` domain without SPF is still not protected by this server** —
+  DMARC simply no longer claims otherwise. Closing that gap needs DKIM or per-customer mTLS.
+
+  Expect this to reject mail that previously passed, notably forwarded mail (SPF breaks by design on
+  forwarding, with no DKIM to fall back on). See
+  [`RELAY-SENDER-AUTHORIZATION.md`](RELAY-SENDER-AUTHORIZATION.md) for the observe-before-enforce
+  rollout.
+
+- **DMARC evaluation can now defer a message with `451 4.7.1`.** A DNS failure during SPF yields
+  `Temperror`, which RFC 7489 §6.6.3 permits answering with a temporary failure. Accepting would let
+  a resolver outage silently disable DMARC for every domain at once; permanently rejecting would
+  turn a transient hiccup into bounced mail. Callers that assumed DMARC only ever produced `554` or
+  delivery now need to expect a `4xx`.
+
+  Two supporting corrections were required:
+
+  - DMARC record lookups no longer collapse transient DNS errors into "no record". `NXDOMAIN` stays
+    definitive; any other error code yields `Temperror`, so an outage cannot disable enforcement by
+    making every domain look policy-free.
+  - **SPF `NXDOMAIN` now returns `None` instead of `Temperror`** (RFC 7208 §4.3), closing the
+    deviation recorded as Q12a — and Q12c with it, since an SPF `redirect=` to a non-existent target
+    now becomes `Permerror` through the existing §6.1 mapping. Without this, mail from any
+    non-existent domain would have been deferred indefinitely.
+
 - **A bare LF in DATA is now refused with `554 5.6.0` instead of being silently rewritten to CRLF.**
   Closes the SMTP-smuggling class disclosed in December 2023.
 
@@ -225,6 +270,20 @@ users through a routine update, and a changelog is not a dependency-resolution b
 is the barrier.
 
 ### Fixed
+
+- **The DMARC public suffix list is no longer rebuilt in place while it is being read.**
+  `DownloadList` cleared and repopulated one shared `HashSet` that `GetOrganizationalDomain` reads
+  from arbitrary connection threads, so a reader could observe the set empty or partially filled and
+  compute a different organizational domain for the same name — silently changing relaxed-alignment
+  verdicts. It also set the "loaded" latch *before* the download started, so a concurrent caller saw
+  a loaded-but-empty list. The list is now built off to the side and published by reference swap, and
+  the latch is set only once a complete generation is in place. Surfaced as intermittent test
+  failures under parallel execution.
+
+- **`SMTPServer` warns at startup when `ValidateDMARC` is enabled while `ValidateSPF` is off.** With
+  DKIM verification unimplemented, SPF is DMARC's only source of an authenticated identifier, so that
+  combination is an enabled-looking control that can never return a pass. It warns rather than
+  throwing, since refusing to start would break existing deployments.
 
 - **Quoted local-parts containing angle brackets or `@` are no longer refused.** RFC 5321 §4.1.2
   permits the local-part to be a quoted-string, inside which `<`, `>` and `@` are ordinary characters.

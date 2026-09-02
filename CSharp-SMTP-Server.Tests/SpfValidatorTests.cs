@@ -48,14 +48,19 @@ public sealed class SpfValidatorTests
     }
 
     [Fact]
-    public async Task TxtQueryNxDomain_ReturnsTemperror_PinQ12()
+    public async Task TxtQueryNxDomain_ReturnsNone()
     {
-        // RFC 7208 §4.3: NXDOMAIN on the initial lookup must yield "none". The validator maps every
-        // non-NoError RCODE to Temperror — pin current behavior (deviation Q12a).
+        // RFC 7208 §4.3: NXDOMAIN on the initial lookup yields "none" — the domain does not exist, so
+        // it publishes no SPF record. This previously pinned deviation Q12a, where every non-NoError
+        // RCODE became Temperror.
+        //
+        // Fixing it became necessary once DMARC started deferring on Temperror (451 4.7.1, RFC 7489
+        // §6.6.3): under the old mapping, mail from any non-existent domain would have been retried
+        // indefinitely rather than treated as the unauthenticated mail it is.
         using var stub = new DnsStub();
         stub.SetNxDomain(Domain);
 
-        Assert.Equal(ValidationResult.Temperror, await Check(stub, "v=spf1 -all", ClientV4));
+        Assert.Equal(ValidationResult.None, await Check(stub, "v=spf1 -all", ClientV4));
     }
 
     [Fact]
@@ -387,15 +392,18 @@ public sealed class SpfValidatorTests
     }
 
     [Fact]
-    public async Task Redirect_NonexistentTarget_ReturnsTemperror_PinQ12()
+    public async Task Redirect_NonexistentTarget_ReturnsPermerror()
     {
         // RFC 7208 §4.3+§6.1: NXDOMAIN at the target is "none" in check_host, which redirect maps to
-        // permerror. The validator's inner CheckHost returns Temperror for NXDOMAIN (Q12a) and redirect
-        // passes it through — pin current behavior (deviation Q12c).
+        // permerror — the same answer as a target that exists but publishes no record (above).
+        //
+        // This pinned deviation Q12c, which existed only as a consequence of Q12a: the inner CheckHost
+        // returned Temperror for NXDOMAIN and redirect passed it straight through. With §4.3 fixed the
+        // inner result is None, and the existing §6.1 mapping turns it into permerror unaided.
         using var stub = new DnsStub();
         stub.SetNxDomain("t.spf.test");
 
-        Assert.Equal(ValidationResult.Temperror, await Check(stub, "v=spf1 redirect:t.spf.test", ClientV4));
+        Assert.Equal(ValidationResult.Permerror, await Check(stub, "v=spf1 redirect:t.spf.test", ClientV4));
     }
 
     [Fact]

@@ -145,57 +145,97 @@ journal relay:
 This raises the false-positive risk of enforcement above what it would be on a DKIM-capable
 receiver, and is a strong argument for measuring before enforcing.
 
-> **Correction.** An earlier revision of this document said "SPF is therefore the only
-> authentication mechanism available to DMARC here." That was wrong in a way that overstated the
-> protection on offer. For ordinary mail this implementation does not require SPF either — see the
-> next section. DMARC here is an *alignment* check, not an authentication check.
+SPF is therefore the only authentication mechanism available to DMARC here. An earlier revision of
+this document made that claim while the implementation did not actually honour it — for ordinary
+mail DMARC required no SPF result at all, which is the defect described next. The statement is true
+of the shipped code as of this revision.
 
-### DMARC currently passes without any authentication (open defect)
+### DMARC requires an authenticated aligned identifier (fixed)
 
-**Do not rely on DMARC enforcement at this relay as a sender-authorization boundary until this is
-fixed.** Found by adversarial review and confirmed by test.
+**Status: fixed.** Previously DMARC could return `Pass` with nothing authenticated at all; the
+paragraphs below describe the shipped behaviour. Found by adversarial review, confirmed by test,
+and now pinned by `DmarcValidatorTests.AlignedFrom_WithoutSpfPass_MustNotPass`.
 
-`DmarcValidator.ProcessRecord` gates on the SPF result **only for null reverse-path messages**
-([DmarcValidator.cs:217](CSharp-SMTP-Server/Protocol/DMARC/DmarcValidator.cs#L217)):
+#### What the defect was
 
-```cs
-if (transaction.IsNullReversePath && transaction.SPFValidationResult != ValidationResult.Pass)
-    return ValidationResult.None;
-```
+`DmarcValidator.ProcessRecord` gated on the SPF result **only for null reverse-path messages**. For
+ordinary mail — anything with a non-null `MAIL FROM`, the overwhelming majority — `SPFValidationResult`
+was never consulted, so the method proceeded straight to the alignment comparison and returned
+`Pass` on a match.
 
-For ordinary mail — anything with a non-null `MAIL FROM`, which is the overwhelming majority —
-`SPFValidationResult` is never consulted. The method proceeds directly to the alignment comparison
-and returns `Pass` on a match
-([DmarcValidator.cs:234](CSharp-SMTP-Server/Protocol/DMARC/DmarcValidator.cs#L234)).
+Alignment compares the header-`From` domain against the envelope-sender domain, and both are
+supplied by the connecting client. Making them match required no authorization — the sender simply
+wrote the same domain in both places. `TransactionCommands` refuses only SPF `Fail`, so `None`,
+`Neutral`, `Softfail`, `Temperror`, `Permerror` and `CheckDisabled` all reached DMARC and all
+returned `Pass` against a `p=reject` domain. A domain publishing `p=reject` but no SPF record could
+be spoofed through this server, and a DNS outage silently downgraded DMARC from enforcing to
+passing rather than failing closed.
 
-Alignment compares the header-`From` domain against the envelope-sender domain. Both are supplied
-by the connecting client. Making them match requires no authorization — the sender simply writes
-the same domain in both places.
+#### What it does now
 
-`TransactionCommands` refuses only SPF `Fail`, so every other SPF state reaches DMARC: `None`
-(domain publishes no SPF record), `Neutral`, `Softfail`, `Temperror` (DNS degraded),
-`Permerror`, and `CheckDisabled` (SPF switched off).
+RFC 7489 §4.1 requires at least one *authenticated* identifier to align. With DKIM verification
+unimplemented (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)) SPF is the only mechanism that can supply
+one, so an aligned SPF `Pass` is now mandatory for **every** message, not only for bounces:
 
-Confirmed empirically against a `p=reject` domain with `From: ceo@victim.example` and a matching
-envelope sender. DMARC returned `Pass` for **every** one of `None`, `Neutral`, `Softfail`,
-`Temperror` and `CheckDisabled`. The test was a temporary probe and is not in the tree; recreating
-it is the first task in [HANDOVER-DMARC-DNS.md](HANDOVER-DMARC-DNS.md).
+| SPF result | DMARC result | Effect at DATA |
+|---|---|---|
+| `Pass` | alignment is evaluated as before | `Pass`, or the policy verdict when unaligned |
+| `Temperror` | `Temperror` | `451 4.7.1`, deferred — sender retries |
+| `None`, `Neutral`, `Softfail`, `Permerror`, `CheckDisabled` | `None` | delivered, **not** labelled `dmarc=pass` |
 
-Practical impact: a domain that publishes `p=reject` but no SPF record can be spoofed through this
-server. So can a domain whose SPF lookup merely soft-fails, or times out. A DNS outage silently
-downgrades DMARC from enforcing to passing rather than failing closed.
+The identity SPF checked and the identity DMARC aligns are the same name by construction:
+`TransactionCommands` checks `postmaster@<HELO domain>` for a null reverse-path (RFC 7208 §2.4) and
+the `MAIL FROM` domain otherwise, which is exactly how `ProcessRecord` picks its envelope domain. A
+`Pass` is therefore always a pass *for the domain being aligned*, never for an unrelated one.
 
-The null-path gate exists and is well-reasoned — the comments above it explain that requiring SPF
-`Pass` there prevents attacker-controlled HELO text from being treated as authenticated, while
-avoiding the destruction of legitimate bounces. That same reasoning was simply never extended to
-ordinary mail.
+#### Why unauthenticated mail answers `None` rather than `Fail`
 
-Fixing this correctly interacts with everything else in this document: requiring aligned SPF `Pass`
-is what RFC 7489 §4.1 calls for, but with no DKIM it will reject forwarded mail that a
-DKIM-capable receiver would accept. That is an argument for the observe-only rollout below, not
-against the fix.
+This is the deliberate part, and it is a deployment decision as much as a specification one.
 
----
+RFC 7489 §4.1 makes DMARC a statement about authenticated identifiers; with no authenticated
+identity there is no determination to report, which is what `None` means. Failing closed instead
+would refuse every DSN from a bouncing MTA (which greets with its own hostname, routinely unrelated
+to the `From` domain of the notification it carries) and every customer domain that publishes no
+usable SPF record — the permanent, unrecoverable mail loss this relay exists to prevent.
+
+The consequence to be explicit about: **a domain publishing `p=reject` that has no SPF record is
+still not protected by this relay.** DMARC no longer *claims* it is — the message is delivered
+without a `dmarc=pass` label rather than with one — but the message is delivered. Closing that gap
+needs a second authentication mechanism (DKIM) or per-customer mTLS
+([TENANT-CRYPTO-AUTH.md](TENANT-CRYPTO-AUTH.md)), not a stricter reading of this code path. Until
+then, the filter hooks ([WHITELIST.md](WHITELIST.md)) are where a policy stricter than "no
+determination" belongs, because they can distinguish a known customer domain from an unknown one.
+
+Spoofing is still caught wherever DMARC can actually speak: an attacker who authenticates their own
+domain and forges a victim's `From` header fails alignment and is refused under `p=reject`.
+
+#### `Temperror` is deferred, not accepted
+
+A DNS failure during SPF is not evidence either way. Accepting would let a resolver outage silently
+disable DMARC for every domain at once — precisely the window an attacker would choose — while
+permanently rejecting would turn a transient hiccup into bounced mail. RFC 7489 §6.6.3 permits a
+temporary-failure response, so the message is deferred with `451 4.7.1` and the sender retries.
+
+Two supporting fixes were required to make this safe:
+
+- **DMARC record lookups** no longer collapse transient DNS errors into "no record". `NXDOMAIN` is
+  definitive (no policy); any other error code now yields `Temperror` rather than `None`, so a
+  resolver outage cannot disable enforcement by making every domain look policy-free.
+- **SPF `NXDOMAIN` now returns `None`, not `Temperror`** (RFC 7208 §4.3; this closes the deviation
+  formerly recorded as Q12a, and Q12c with it). Without this, mail from any non-existent domain
+  would have been deferred forever instead of treated as the unauthenticated mail it is.
+
+#### Configuration note
+
+Enabling `ValidateDMARC` while `ValidateSPF` is off leaves DMARC with no authentication mechanism
+at all: it can never return `Pass`. `SMTPServer` now warns about this at startup rather than
+presenting an enabled-looking but inert control.
+
+#### Remaining exposure
+
+Requiring aligned SPF `Pass` is what RFC 7489 §4.1 calls for, but with no DKIM it rejects forwarded
+mail that a DKIM-capable receiver would accept — SPF breaks by design on forwarding and there is no
+second chance. That is an argument for the observe-only rollout below, not against the fix.
 
 ## DNS resolution and caching (design)
 
@@ -290,10 +330,11 @@ limits entry lifetime but not entry count.
 
 ## Recommended sequence
 
-0. **Fix the DMARC authentication gap first.** Until DMARC requires an authenticated, aligned
-   identity, enforcing it at the relay provides far less protection than it appears to — an aligned
-   spoof from a domain with no SPF record passes today. See
-   [HANDOVER-DMARC-DNS.md](HANDOVER-DMARC-DNS.md).
+0. ~~**Fix the DMARC authentication gap first.**~~ **Done.** DMARC now requires an authenticated,
+   aligned identifier; see [the section above](#dmarc-requires-an-authenticated-aligned-identifier-fixed).
+   Note what this does and does not buy: an aligned spoof from a domain with no SPF record is no
+   longer labelled `dmarc=pass`, but it is still *delivered* (`None` = no determination), so the
+   observe-and-enforce sequence below still carries the weight for actual sender authorization.
 1. **Publish `p=none` with `rua=` for `ourdomain.com`** if not already. No delivery risk; keeps the
    reports coming.
 2. **Keep the Exchange Online CIDR allowlist** as a coarse ingress filter on TCP 25.

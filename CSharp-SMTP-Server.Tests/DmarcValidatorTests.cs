@@ -42,8 +42,18 @@ public sealed class DmarcValidatorTests
     /// Builds a transaction from an ordinary From header line and an envelope (MAIL FROM) domain.
     /// DMARC validates the header-From domain and checks it against the envelope domain for alignment.
     /// </summary>
-    private static MailTransaction Tx(string fromLine, string envelopeDomain) =>
-        new($"env@{envelopeDomain}", envelopeDomain, ValidationResult.CheckDisabled)
+    /// <remarks>
+    /// The SPF result defaults to <see cref="ValidationResult.Pass"/> because DMARC only reaches
+    /// alignment when an identifier was actually authenticated (RFC 7489 §4.1). These cases exist to
+    /// exercise alignment and policy mapping, which presuppose that gate has been cleared.
+    ///
+    /// It used to default to <c>CheckDisabled</c>, which meant every one of them ran with NO
+    /// authenticated identity — and still expected Pass. That is the defect this suite now pins
+    /// against in <see cref="AlignedFrom_WithoutSpfPass_MustNotPass"/>: alignment between two
+    /// attacker-supplied names authenticates nobody, so it can never be sufficient on its own.
+    /// </remarks>
+    private static MailTransaction Tx(string fromLine, string envelopeDomain, ValidationResult spf = ValidationResult.Pass) =>
+        new($"env@{envelopeDomain}", envelopeDomain, spf)
         {
             RawBody = $"From: {fromLine}\r\nTo: r@example.com\r\nSubject: t\r\n\r\nbody"
         };
@@ -210,6 +220,133 @@ public sealed class DmarcValidatorTests
         env.Stub.AddTxt("_dmarc.h.com", "v=DMARC1; p=none; sp=reject");
 
         Assert.Equal(ValidationResult.Softfail, await env.Validator.ValidateTransaction(Tx("a@sub.h.com", "other.org")));
+    }
+
+    #endregion
+
+    #region Authenticated identifier required (§4.1)
+
+    /// <summary>
+    /// The core of the fix. DMARC passes only when an *authenticated* identifier aligns. Alignment
+    /// compares the header-From domain to the envelope domain — both attacker-supplied — so making
+    /// them match costs nothing. Without an SPF Pass over that envelope identity there is no
+    /// authentication at all, and every one of these results previously returned Pass, letting a
+    /// domain publishing p=reject be spoofed outright.
+    /// </summary>
+    [Theory]
+    [InlineData(ValidationResult.None)]
+    [InlineData(ValidationResult.Neutral)]
+    [InlineData(ValidationResult.Softfail)]
+    [InlineData(ValidationResult.Temperror)]
+    [InlineData(ValidationResult.Permerror)]
+    [InlineData(ValidationResult.CheckDisabled)]
+    public async Task AlignedFrom_WithoutSpfPass_MustNotPass(ValidationResult spf)
+    {
+        using var env = new Env();
+        env.Stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        var tx = new MailTransaction("attacker@victim.example", "victim.example", spf)
+        {
+            RawBody = "From: ceo@victim.example\r\nTo: r@example.com\r\nSubject: t\r\n\r\nbody"
+        };
+
+        Assert.NotEqual(ValidationResult.Pass, await env.Validator.ValidateTransaction(tx));
+    }
+
+    /// <summary>
+    /// The unauthenticated answer is None ("no determination"), not Fail. Failing closed here would
+    /// refuse every DSN from a bouncing MTA and every customer domain with no usable SPF record —
+    /// the permanent, unrecoverable mail loss this deployment exists to prevent. Temperror is the
+    /// one exception and is asserted separately below.
+    /// </summary>
+    [Theory]
+    [InlineData(ValidationResult.None)]
+    [InlineData(ValidationResult.Neutral)]
+    [InlineData(ValidationResult.Softfail)]
+    [InlineData(ValidationResult.Permerror)]
+    [InlineData(ValidationResult.CheckDisabled)]
+    public async Task NoAuthenticatedIdentity_IsNoDetermination_NotFail(ValidationResult spf)
+    {
+        using var env = new Env();
+        env.Stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        Assert.Equal(ValidationResult.None,
+            await env.Validator.ValidateTransaction(Tx("ceo@victim.example", "victim.example", spf)));
+    }
+
+    /// <summary>
+    /// A DNS failure during SPF is not evidence either way, so DMARC neither passes nor permanently
+    /// rejects: RFC 7489 §6.6.3 permits a temporary-failure response, which TransactionCommands turns
+    /// into 451 4.7.1. Answering None here would let a resolver outage silently disable DMARC for
+    /// every domain at once.
+    /// </summary>
+    [Fact]
+    public async Task SpfTemperror_DefersRatherThanPassingOrRejecting()
+    {
+        using var env = new Env();
+        env.Stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        Assert.Equal(ValidationResult.Temperror,
+            await env.Validator.ValidateTransaction(Tx("ceo@victim.example", "victim.example", ValidationResult.Temperror)));
+    }
+
+    /// <summary>
+    /// The gate must not swallow enforcement: an SPF Pass for the attacker's OWN domain still fails
+    /// to align with the spoofed header-From, so p=reject applies exactly as before.
+    /// </summary>
+    [Fact]
+    public async Task SpfPassForDifferentDomain_StillFailsAlignment()
+    {
+        using var env = new Env();
+        env.Stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        var tx = new MailTransaction("attacker@attacker.test", "attacker.test", ValidationResult.Pass)
+        {
+            RawBody = "From: ceo@victim.example\r\nTo: r@example.com\r\nSubject: t\r\n\r\nbody"
+        };
+
+        Assert.Equal(ValidationResult.Fail, await env.Validator.ValidateTransaction(tx));
+    }
+
+    #endregion
+
+    #region Null reverse-path / DSN behaviour is unchanged
+
+    /// <summary>
+    /// A bouncing MTA greets with its own hostname, which routinely differs from the From domain of
+    /// the notification it carries. With no SPF Pass there is no authenticated identity, so the answer
+    /// stays None and the DSN is delivered — unchanged by the fix.
+    /// </summary>
+    [Fact]
+    public async Task NullReversePath_WithoutSpfPass_ReturnsNone()
+    {
+        using var env = new Env();
+        env.Stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        var tx = new MailTransaction(string.Empty, string.Empty, ValidationResult.None, true, "mail-out-3.provider.example")
+        {
+            RawBody = "From: postmaster@victim.example\r\nTo: r@example.com\r\nSubject: t\r\n\r\nbody"
+        };
+
+        Assert.Equal(ValidationResult.None, await env.Validator.ValidateTransaction(tx));
+    }
+
+    /// <summary>
+    /// When the bounce's HELO domain IS authenticated and aligns with the From domain, DMARC passes on
+    /// the HELO identity (RFC 7489 §3.1.2 / RFC 7208 §2.4).
+    /// </summary>
+    [Fact]
+    public async Task NullReversePath_WithAlignedAuthenticatedHelo_ReturnsPass()
+    {
+        using var env = new Env();
+        env.Stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+
+        var tx = new MailTransaction(string.Empty, string.Empty, ValidationResult.Pass, true, "victim.example")
+        {
+            RawBody = "From: postmaster@victim.example\r\nTo: r@example.com\r\nSubject: t\r\n\r\nbody"
+        };
+
+        Assert.Equal(ValidationResult.Pass, await env.Validator.ValidateTransaction(tx));
     }
 
     #endregion

@@ -402,7 +402,14 @@ public sealed class SpfDmarcIntegrationTests
         // through a quoted display name; an ordinary From header now reaches the 554 gate.
         stub.AddTxt("_dmarc.header.com", "v=DMARC1; p=reject");
 
-        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        // SPF must actually authenticate the envelope domain, otherwise DMARC has no authenticated
+        // identifier and correctly answers None (no determination) instead of reaching the alignment
+        // comparison at all. Authorizing the test client's own 127.0.0.1 gives a genuine SPF Pass for
+        // example.com — an attacker who has authenticated their OWN domain but spoofs header.com in
+        // the From header, which is exactly the case p=reject must refuse.
+        stub.AddTxt("example.com", "v=spf1 ip4:127.0.0.1 -all");
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
         using (server)
         await using (s)
         {
@@ -466,8 +473,11 @@ public sealed class SpfDmarcIntegrationTests
         using var stub = new DnsStub();
         using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
         stub.AddTxt("_dmarc.example.com", "v=DMARC1; p=reject");
+        // DMARC Pass requires an authenticated aligned identifier, so the envelope domain has to
+        // genuinely pass SPF for the connecting client (127.0.0.1) rather than merely align.
+        stub.AddTxt("example.com", "v=spf1 ip4:127.0.0.1 -all");
 
-        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
         using (server)
         await using (s)
         {
@@ -496,8 +506,11 @@ public sealed class SpfDmarcIntegrationTests
         using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
         // Aligned: header domain == envelope domain (example.com), even though p=reject.
         stub.AddTxt("_dmarc.example.com", "v=DMARC1; p=reject");
+        // ...and authenticated: alignment alone is not a DMARC pass (RFC 7489 §4.1), so the envelope
+        // domain must authorize the connecting client for the aligned identifier to count.
+        stub.AddTxt("example.com", "v=spf1 ip4:127.0.0.1 -all");
 
-        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: false, validateDmarc: true);
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
         using (server)
         await using (s)
         {
@@ -521,6 +534,83 @@ public sealed class SpfDmarcIntegrationTests
 
             // B3 (fixed): the delivered clone now carries the real result too, not just the header.
             Assert.Equal(ValidationResult.Pass, tx.DMARCValidationResult);
+        }
+    }
+
+    #endregion
+
+    #region DMARC requires an authenticated identifier (§4.1)
+
+    [Fact]
+    public async Task Data_AlignedButSpfNotPass_DoesNotReportDmarcPass()
+    {
+        // The security defect, end to end. The client controls both the envelope domain and the
+        // header-From domain, so it simply makes them match; victim.example publishes p=reject but no
+        // SPF record, so nothing authenticates the sender. This used to be delivered stamped
+        // "dmarc=pass". It must not claim a pass now.
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+        stub.SetNxDomain("victim.example"); // no SPF record at all → SPF None, not Fail
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<attacker@victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: ceo@victim.example"); // aligned, but authenticated by nothing
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+
+            // Delivered (None is "no determination", not a rejection — see the validator's comment on
+            // why failing closed here would destroy DSNs and SPF-less customer mail), but it must NOT
+            // be labelled as having passed DMARC.
+            var tx = delivery.Delivered.Single();
+            Assert.NotEqual(ValidationResult.Pass, tx.DMARCValidationResult);
+            Assert.DoesNotContain("dmarc=pass", tx.RawBody);
+        }
+    }
+
+    [Fact]
+    public async Task Data_SpfTemperror_DeferredWith451_NoDelivery()
+    {
+        // A resolver failure must not silently disable DMARC. RFC 7489 §6.6.3 permits a temporary
+        // failure, so the message is deferred and the sender retries — rather than being accepted
+        // unauthenticated or bounced permanently.
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+        stub.SetServFail("victim.example"); // SPF lookup fails → Temperror
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<attacker@victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync()); // Temperror is not Fail — not refused here
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: ceo@victim.example");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("451 4.7.1 Temporary error validating DMARC, please retry later", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered); // deferred at DATA — the handler never runs
         }
     }
 

@@ -81,6 +81,16 @@ public class SpfValidator
 
 		var txtQuery = await DnsClient.Query(domain, QType.TXT);
 
+		// RFC 7208 §4.3: if the domain does not exist, the result is None — "no SPF record" — not a
+		// transient failure. The MX and A/AAAA paths below already draw this line (see §5); the initial
+		// TXT lookup did not, so every non-existent sender domain reported Temperror.
+		//
+		// That was survivable while nothing consumed Temperror, but DMARC now defers on it (451 4.7.1
+		// per RFC 7489 §6.6.3). Left unfixed, mail from any domain without a DNS entry would be
+		// retried forever instead of being handled as the unauthenticated mail it is.
+		if (txtQuery.ErrorCode == DnsErrorCode.NameError)
+			return ValidationResult.None;
+
 		if (txtQuery.ErrorCode != DnsErrorCode.NoError || txtQuery.Records == null)
 			return ValidationResult.Temperror;
 
