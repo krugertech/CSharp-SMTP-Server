@@ -48,6 +48,8 @@ public sealed class ConfigurableFilter : IMailFilter
     public string? LastDeliverDestination;
     public bool? LastDeliverAuthenticated;
     public string? LastDeliverUsername;
+    public EndPoint? LastDeliverEp;
+    public EndPoint? LastSenderSpfVerifiedEp;
 
     public Task<SmtpResult> IsConnectionAllowed(EndPoint? ep)
     {
@@ -67,6 +69,7 @@ public sealed class ConfigurableFilter : IMailFilter
     public Task<SmtpResult> IsAllowedSenderSpfVerified(string source, EndPoint? ep, string? username, ValidationResult validationResult)
     {
         LastSpfResult = validationResult;
+        LastSenderSpfVerifiedEp = ep;
         return Task.FromResult(SenderSpfVerified);
     }
 
@@ -76,6 +79,7 @@ public sealed class ConfigurableFilter : IMailFilter
         LastDeliverDestination = destination;
         LastDeliverAuthenticated = authenticated;
         LastDeliverUsername = username;
+        LastDeliverEp = ep;
         return Task.FromResult(Deliver);
     }
 

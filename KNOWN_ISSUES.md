@@ -185,6 +185,50 @@ identifier.
 Related: SPF macro expansion (`%{i}`, `%{s}`, `%{d}` …, RFC 7208 §7) is not implemented at all, and
 `exists:` is rarely useful without it. Implementing one without the other has limited value.
 
+### The `a`/`mx` dual-CIDR suffix is misparsed, so IPv6 prefixes are ignored
+
+RFC 7208 §5.3 allows `a` and `mx` to carry an IPv4 prefix length, an IPv6 length introduced by a
+double slash, or both: `a/24`, `a//64`, `a/24//64`. `SpfValidator.CheckHost` splits at the **first**
+slash and parses everything after it as one decimal length, so `a//64` yields `"/64"` and `a/24//64`
+yields `"24//64"`. Neither parses as a byte, the length is discarded, and the IPv6 side silently
+falls back to `/128` — an exact-address comparison.
+
+Confirmed by probe, with the client at `2001:db8::7` and the domain's AAAA at `2001:db8::1` (same
+`/64`): `v=spf1 a//64 -all` and `v=spf1 a/24//64 -all` both return **`Fail` where the RFC requires
+`Pass`**. The control `v=spf1 ip6:2001:db8::/64 -all` returns `Pass`, so `CheckCIDR` is sound and the
+defect is confined to parsing the dual-CIDR syntax.
+
+The error direction rejects mail that should be accepted — the same direction as the `exists:` defect
+above. A provider that authorizes a `/64` of its own sending range gets `554 5.7.23` at `MAIL FROM`
+for every host in it except the one that exactly matches the AAAA record. It also denies DMARC the
+`Pass` it would otherwise rely on.
+
+Pinned by `Ipv6AddressHandlingTests.SpfDualCidr_Ipv6PrefixIsIgnored_WronglyFails`, which asserts the
+current wrong result so the fix shows up as a deliberate change; the control case is
+`SpfIp6Cidr_SamePrefix_Passes`. Fixing it means parsing the IPv4 and IPv6 lengths separately and
+selecting by client family.
+
+### IPv4-mapped addresses reach filters, AUTH and delivery un-normalized
+
+`ClientProcessor` stores `RemoteEndPoint` exactly as the socket reports it. On a dual-mode listener
+(`IPAddress.IPv6Any` with `dualMode: true`) an IPv4 client is reported as the v4-mapped
+`::ffff:a.b.c.d`, and that is what `IMailFilter.IsConnectionAllowed`, `IsAllowedSender`, `CanDeliver`,
+the `IAuthLogin` callbacks, and `MailTransaction.RemoteEndPoint` all receive.
+
+Two other consumers of the same address unmap it first — `SpfValidator.CheckHost` and the `Received`
+header builder — so the normalization is inconsistent rather than absent, and the inconsistency is
+consumer-visible.
+
+It matters for authorization. An operator's IPv4 CIDR allowlist silently stops matching when a
+listener is switched to dual-mode: a rule written to admit a sender no longer admits it, and a
+family-specific deny rule no longer denies. Nothing in the API documents which form a filter should
+expect.
+
+Pinned by `Ipv6AddressHandlingTests.FilterAndTransaction_Ipv4MappedClient_SeeUnnormalizedMappedAddress`,
+which asserts the current behavior. Normalizing once where `ClientProcessor` captures the endpoint
+would resolve it, but that changes the address every existing filter implementation observes, so it
+belongs with a documented behavior change rather than a silent fix.
+
 ### An unrecognized SPF mechanism is skipped instead of producing `permerror`
 
 The same missing `default` case. RFC 7208 §4.6.1 makes an unknown mechanism a syntax error, and
@@ -284,6 +328,26 @@ blocked. Add validation without weakening that response-splitting protection.
 
 For authenticated sessions, the prepended `Received:` header omits `from <ip>`. Preserve the client
 address for forensic traceability regardless of authentication state.
+
+### `Received` writes address literals unbracketed and untagged
+
+The header builder formats the client address with a bare `IPAddress.ToString()`, producing
+`Received: from 127.0.0.1 by …` and, for an IPv6 client, `Received: from ::1 by …`.
+
+RFC 5321 §4.4 defines the `From-domain` as an `Extended-Domain`, whose address-literal form is the
+`address-literal` of §4.1.3: bracketed, and for IPv6 carrying the `IPv6:` tag — `[127.0.0.1]` and
+`[IPv6:::1]`. Both forms this server emits are therefore non-conformant, the IPv6 one more visibly so.
+The server already parses the tagged bracketed form correctly on input (see `EhloBracketedIpv6Tests`);
+only the output path is wrong.
+
+The practical effect is on downstream consumers rather than on delivery: a strict trace parser doing
+forensic analysis or loop detection may fail to extract the address. Nothing in this server reads back
+its own `Received` headers, so the defect is contained.
+
+Fixing it changes a header on every accepted message, which is why it is filed rather than silently
+corrected — `DataAndMessageTests.NormalBody_DeliveredWithReceivedHeader` and the two
+`Ipv6AddressHandlingTests` Received cases all pin the current unbracketed form and would need updating
+together with the fix.
 
 ### Minor accepted protocol behavior
 

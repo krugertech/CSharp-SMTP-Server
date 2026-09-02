@@ -458,6 +458,12 @@ public sealed class SpfValidatorTests
         // its address check consume two of the counted requests; ten non-matching "a" mechanisms then
         // push the counter past 10 while ptrWasUsed=true → Fail (not the terminal's result either way,
         // but distinct from Permerror).
+        //
+        // Fail is also what a ptr mechanism that never matched reaches through the terminal "-all", so
+        // the expected value alone does not prove ptrWasUsed was ever set — and for a long time it was
+        // not: a DnsStub reverse-name parsing defect meant AddPtr could not be answered at all, and
+        // this test passed without the mechanism running. The query assertions below close that hole by
+        // pinning the two lookups the comment above claims are consumed. See TESTING.md.
         using var stub = new DnsStub();
         stub.AddPtr(ClientV4, Domain); // PTR name equals the validated domain…
         stub.AddA(Domain, IPAddress.Parse("198.51.100.1")); // …but its A record never matches
@@ -466,6 +472,11 @@ public sealed class SpfValidatorTests
 
         var record = "v=spf1 ptr " + string.Join(' ', Enumerable.Range(1, 10).Select(i => $"a:a{i}.many.spf.test")) + " -all";
         Assert.Equal(ValidationResult.Fail, await Check(stub, record, ClientV4));
+
+        // The reverse lookup happened…
+        Assert.Contains(stub.Queries, q => q.QType == 12 && q.Name.EndsWith(".in-addr.arpa"));
+        // …and so did its forward confirmation on the PTR name, which is the second counted request.
+        Assert.Contains(stub.Queries, q => q.QType == 1 && q.Name == Domain);
     }
 
     #endregion

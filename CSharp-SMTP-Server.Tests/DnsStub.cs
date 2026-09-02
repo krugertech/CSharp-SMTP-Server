@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -213,8 +214,8 @@ public sealed class DnsStub : IDisposable
                         break;
 
                     case 12: // PTR — key by the IP encoded in the reverse name
-                        if (TryParseReverseName(name, out var ip) && _ptr.TryGetValue(ip, out ptrDomain))
-                            ;
+                        if (TryParseReverseName(name, out var ip))
+                            _ptr.TryGetValue(ip, out ptrDomain);
                         break;
                 }
             }
@@ -261,6 +262,20 @@ public sealed class DnsStub : IDisposable
     }
 
     /// <summary>Parses an in-addr.arpa / ip6.arpa reverse name back into the IP address it encodes.</summary>
+    /// <remarks>
+    /// This returned false for every well-formed reverse name, so the stub answered no PTR record at
+    /// all and the SPF "ptr" mechanism could never match. That was invisible because the only ptr test
+    /// asserted Fail, which is also what a non-matching mechanism produces via "-all" — it passed for
+    /// the wrong reason and never reached the forward-confirmation lookup it claimed to count.
+    ///
+    /// Three separate defects, all fixed here:
+    /// - IPv4 read labels at <c>Length - 5 + i</c>. For the 6-label "7.113.0.203.in-addr.arpa" that is
+    ///   indices 1..4 — "113","0","203","in-addr" — and the last fails byte.TryParse.
+    /// - IPv4 never reversed the octets, though in-addr.arpa stores them least-significant first.
+    /// - IPv6 used <c>Take(32)</c> on labels that still included the "ip6" and "arpa" suffixes, and
+    ///   assembled each byte with <c>new string(char, int)</c> — the repeat-count overload — rather
+    ///   than building the two-character hex pair, then parsed it as decimal instead of hex.
+    /// </remarks>
     private static bool TryParseReverseName(string name, out IPAddress ip)
     {
         ip = null!;
@@ -268,11 +283,12 @@ public sealed class DnsStub : IDisposable
 
         if (name.EndsWith(".in-addr.arpa", StringComparison.OrdinalIgnoreCase))
         {
-            // last 5 labels are "x.x.x.x.in-addr.arpa" with octets in reverse order
-            if (labels.Length < 6) return false;
+            // "d.c.b.a.in-addr.arpa" encodes a.b.c.d — four octets, least-significant label first.
+            if (labels.Length != 6) return false;
+
             var octets = new byte[4];
             for (var i = 0; i < 4; i++)
-                if (!byte.TryParse(labels[labels.Length - 5 + i], out octets[i])) return false;
+                if (!byte.TryParse(labels[3 - i], out octets[i])) return false;
 
             ip = new IPAddress(octets);
             return true;
@@ -280,13 +296,17 @@ public sealed class DnsStub : IDisposable
 
         if (name.EndsWith(".ip6.arpa", StringComparison.OrdinalIgnoreCase))
         {
-            // 32 hex nibble labels in reverse order, most-significant nibble first within each byte
+            // 32 single-hex-digit labels, least-significant nibble first, then "ip6.arpa".
+            if (labels.Length != 34) return false;
+
             var nibbles = labels.Take(32).Reverse().ToArray();
-            if (nibbles.Length != 32 || nibbles.Any(l => l.Length != 1)) return false;
+            if (nibbles.Any(l => l.Length != 1)) return false;
 
             var bytes = new byte[16];
             for (var i = 0; i < 16; i++)
-                if (!byte.TryParse(new string(nibbles[i * 2][0], nibbles[i * 2 + 1][0]), out bytes[i])) return false;
+                if (!byte.TryParse($"{nibbles[i * 2]}{nibbles[i * 2 + 1]}",
+                        NumberStyles.HexNumber, CultureInfo.InvariantCulture, out bytes[i]))
+                    return false;
 
             ip = new IPAddress(bytes);
             return true;

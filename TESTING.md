@@ -243,6 +243,33 @@ The durable workflow is therefore:
 3. Design the fix from both pieces of evidence.
 4. Re-review the conclusion, not only the implementation.
 
+### A negative assertion can pass without exercising the path it names
+
+`MoreThanTenLookups_AfterPtrWasUsed_ReturnsFailNotPermerror` asserted `Fail` for a record beginning
+with `ptr`. It passed without the `ptr` mechanism ever matching: the `DnsStub` reverse-name parser
+rejected every well-formed `in-addr.arpa` and `ip6.arpa` name, so `AddPtr` could not be answered, and
+the mechanism fell through to the terminal `-all` — which also yields `Fail`. The
+expected value could not distinguish "the path ran and produced this" from "the path never ran".
+
+Three fixture defects hid behind that single expectation: the IPv4 branch indexed labels at
+`Length - 5 + i` (reading `in-addr` as an octet) and never reversed them; the IPv6 branch called
+`Take(32)` on labels that still included the `ip6` and `arpa` suffixes, built each byte with
+`new string(char, int)` — the repeat-count overload — and parsed the result as decimal rather than
+hexadecimal.
+
+Two habits prevent the class of error:
+
+- **Assert a positive outcome somewhere.** Only a genuine match produces `Pass`, so a `Pass` test is
+  load-bearing in a way a `Fail` test may not be. `SpfPtr_Ipv4Client_ForwardConfirmedName_Passes` and
+  its IPv6 counterpart exist for this reason.
+- **Assert the observable side effect too.** `DnsStub.Queries` records every lookup; asserting that a
+  PTR query for an `.ip6.arpa` name actually went out distinguishes a working mechanism from a stub
+  that would answer anything.
+
+The general rule: when a test's expected value is also the failure-fallback value, it proves nothing
+about the mechanism it is named for. Mutation-check such a test — delete the code it covers and
+confirm it fails.
+
 ### Preserve actionable non-reproductions
 
 A suspected processor-registration leak was not reproduced across 5,000 connections, but it has a
