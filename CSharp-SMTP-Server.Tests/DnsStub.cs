@@ -7,15 +7,17 @@ namespace CSharp_SMTP_Server.Tests;
 /// <summary>
 /// Minimal UDP DNS stub for SPF/DMARC tests (see TESTING.md). Answers TXT/A/AAAA/MX/PTR queries
 /// from in-memory tables on a loopback ephemeral port so SpfValidator / DmarcValidator can be tested
-/// deterministically without internet access. ServerOptions.DnsServerEndpoint points at it.
+/// deterministically without internet access. ServerOptions points at it via DnsResolverMode.Explicit.
 ///
-/// Wire behavior verified against zabszk.DnsClient 1.0.1 (scratch capture): plain UDP, no EDNS, one
-/// query per datagram, sequential retries (5 × 500 ms) on silence; responses are matched by ID and
-/// the question section is echoed back verbatim. Names in answers are written in full form (no
-/// compression). The stub never sets the TC bit, so DnsClient's TCP fallback is never triggered.
+/// Plain UDP, one query per datagram; responses are matched by ID and the question section is echoed
+/// back. Names in answers are written in full form (no compression). The stub never sets the TC bit,
+/// so TCP fallback is never triggered.
 ///
-/// NOTE: zabszk.DnsClient only parses TXT records whose RDATA is a single character-string; responses
-/// with multiple strings per record are silently dropped (pinned by SpfValidatorTests — Q11).
+/// Two wire-format defects lived here undetected while the previous DNS client was in use, because it
+/// validated neither: answer RRs carried a byte-swapped class (0x0100 rather than 0x0001 for IN), and
+/// the response echoed everything after the header as the question section — so a client advertising
+/// EDNS0 had its OPT record copied in behind the question and then read as the first answer RR. Both
+/// are fixed; a stricter client returns an empty answer if either regresses.
 /// </summary>
 public sealed class DnsStub : IDisposable
 {
@@ -56,7 +58,7 @@ public sealed class DnsStub : IDisposable
 
     /// <summary>
     /// Registers raw TXT RDATA for a domain (each byte[] is one TXT RR). Used to emit multi-string
-    /// character-strings — which zabszk.DnsClient silently drops (Q11 pin).
+    /// character-strings, which RFC 7208 §3.3 evaluates as their concatenation.
     /// </summary>
     public void AddRawTxt(string domain, params byte[][] rdatas)
     {
@@ -302,13 +304,22 @@ public sealed class DnsStub : IDisposable
         resp.AddRange(new byte[2] { 0, 1 });          // QDCOUNT = 1
         resp.AddRange(BE16((ushort)rrs.Count));       // ANCOUNT
         resp.AddRange(new byte[4]);                   // NSCOUNT / ARCOUNT = 0
-        resp.AddRange(query.Skip(12));                // echo the question section verbatim
+
+        // Echo ONLY the question — name + QTYPE + QCLASS — not the rest of the datagram. A client that
+        // advertises EDNS0 puts an OPT record in the additional section, and copying everything after
+        // the header appended those bytes right behind the question while QDCOUNT still said 1. The
+        // client then read the OPT record as the first answer RR and found no TXT at all. The previous
+        // DNS client sent no OPT, so the bug was invisible.
+        resp.AddRange(QuestionSection(query));
 
         foreach (var (type, rdata) in rrs)
         {
             resp.AddRange(ExtractQuestionName(query));
             resp.AddRange(BE16(type));
-            resp.AddRange(new byte[] { 0x01, 0x00 }); // class IN
+            // Class IN is 1, big-endian: 0x00,0x01. This was byte-swapped (0x0100 = class 256), which
+            // the previous DNS client ignored — it never looked at the class of an answer RR. A stricter
+            // client drops the record as not-IN and the whole answer reads as an empty response.
+            resp.AddRange(new byte[] { 0x00, 0x01 });
             resp.AddRange(new byte[] { 0, 0, 0, 60 }); // TTL = 60 s
             resp.AddRange(BE16((ushort)rdata.Length));
             resp.AddRange(rdata);
@@ -318,6 +329,23 @@ public sealed class DnsStub : IDisposable
     }
 
     private static byte[] BE16(ushort v) => new byte[] { (byte)(v >> 8), (byte)v };
+
+    /// <summary>
+    /// The question section only: QNAME + QTYPE + QCLASS, excluding anything the client appended after
+    /// it (notably an EDNS0 OPT record in the additional section).
+    /// </summary>
+    private static byte[] QuestionSection(byte[] query)
+    {
+        var name = ExtractQuestionName(query);
+        int off = 12;
+
+        while (query[off] != 0)
+            off += query[off] + 1;
+
+        off++; // root label
+
+        return [.. name, .. query.Skip(off).Take(4)]; // QTYPE + QCLASS
+    }
 
     /// <summary>Re-encodes the question name in full form for use as the answer RR owner name.</summary>
     private static byte[] ExtractQuestionName(byte[] query)

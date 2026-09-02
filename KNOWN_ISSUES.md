@@ -63,52 +63,43 @@ library change at all.
 These items matter only when SPF or DMARC validation is enabled. The Office 365 journaling profile in
 the README disables both.
 
-### Split TXT records are dropped by the DNS dependency (Q11)
+### Split TXT records dropped by the DNS dependency (Q11) — fixed
 
-`zabszk.DnsClient` 1.0.1 does not concatenate the character-strings in a multi-string TXT record.
-Long SPF or DMARC records can therefore appear absent, producing SPF `None` or preventing the
-expected DMARC policy lookup.
+`zabszk.DnsClient` 1.0.1 did not concatenate the character-strings in a multi-string TXT record, so
+a long SPF or DMARC record appeared absent — SPF `None`, or no DMARC policy found. Since real SPF
+records exceeding 255 bytes are always published this way, this hid exactly the provider
+include-chains this relay sees most.
 
-This is the highest-priority validation issue. Fixing it requires replacing or patching the DNS
-dependency and retaining the regression coverage in `SpfValidatorTests`.
+Fixed by the DnsClient.NET replacement, which concatenates per RFC 7208 §3.3. Covered by
+`SpfValidatorTests.MultiStringTxtRecord_IsConcatenated_AndEvaluated`.
 
-### The DNS dependency is unmaintained and cannot honor record TTLs
+### The DNS dependency is unmaintained and cannot honor record TTLs — fixed
 
-`zabszk.DnsClient` 1.0.1 is the single DNS dependency for SPF and DMARC. Three separate problems
-point at the same fix, so they should be resolved together rather than patched individually:
+`zabszk.DnsClient` 1.0.1 has been replaced by DnsClient.NET 1.8.0. It had no cache at all
+(`DnsClientOptions` exposed no cache or TTL setting), dropped multi-string TXT records, and its last
+published target was `net7.0`, resolved by roll-forward since the `net10.0` retarget.
 
-- It does not concatenate multi-string TXT records (Q11 above), silently hiding long SPF and DMARC
-  records.
-- It has no cache. `DnsClientOptions` exposes only `Timeout`, `MaxAttempts`, `TimeoutInnerDelay`,
-  `UseTCPForTruncated`, `TCPEndpointOverride`, and `ErrorLogging` — there is no cache or TTL setting
-  to configure. Every lookup is a fresh blocking query, which is why `SpfResultsCache` exists as a
-  connection-scoped workaround and why that cache has no TTL of its own.
-- Its last published target is `net7.0`. Since the retarget to `net10.0` the package resolves that
-  `net7.0` asset by roll-forward. That works today and the suite passes against it, but it is an
-  unmaintained dependency on the critical path of two authentication mechanisms.
+Resolution: SPF and DMARC now resolve through `IDnsResolver` (`Protocol/Dns/`), backed by
+DnsClient.NET with a TTL-aware in-process cache. `DnsResolverCacheTests` proves the cache by query
+count against the stub — a repeated lookup within TTL issues no second wire query, and an SPF
+include chain resolves once across repeated evaluations rather than per message.
 
-Note that TTL data is available and simply discarded: the package does expose `DNSRecord.TTL` on
-every record. Nothing in `CSharp-SMTP-Server` reads it — the only `ttl` matches in the library are
-`StartTLS` identifiers. So a replacement is not strictly required to honor TTLs; a caching layer over
-the existing client could read the TTL that is already returned. A replacement is preferred because
-it also addresses the split-TXT defect and the maintenance risk in one move.
+### The DNS response cache has no entry-count bound
 
-Pending work: select a maintained DNS client that concatenates multi-string TXT records and honors
-record TTLs in its cache. Requirements for the replacement:
+DnsClient.NET's cache is keyed by query and bounded only in *time*: `MaximumCacheTimeout` limits how
+long an entry lives, and there is no setting for how many entries may exist. Sending domains are
+chosen by whoever connects, so cache keys are attacker-influenced and a flood of distinct domains
+grows the cache with nothing evicting entries early.
 
-- Correct multi-string TXT concatenation, keeping the regression coverage in `SpfValidatorTests`.
-- A TTL-respecting cache, so SPF include chains do not re-query on every message. This is also the
-  preferred fix for the stale-`Pass` window in "SPF results can remain stale for a connection"
-  below, which should be revisited once the client itself can cache.
-- Support for `netstandard2.1` while that target is retained, otherwise the shipped netstandard
-  build loses SPF and DMARC. Note this dependency is also what blocks adding a `netstandard2.0` or
-  `net48` target: it ships no such asset, so .NET Framework consumers are unreachable until it is
-  replaced.
-- An async query API and configurable timeouts, since `SpfValidator` and `DmarcValidator` query on
-  the connection path.
+`DnsClientResolver` caps `MaximumCacheTimeout` at 5 minutes to keep the working set bounded by
+connection rate rather than by uptime. That is a mitigation, not a fix: the ceiling trades some cache
+effectiveness for a bounded window, and a sustained flood of unique names can still grow memory
+within it. A hard bound would need an eviction policy the library does not provide — a bounded LRU in
+front of the resolver, or per-connection admission control.
 
-This is not urgent for the current journaling deployment, which disables SPF and DMARC, but it
-blocks enabling either with confidence.
+Transient failures are deliberately not cached (`CacheFailedResults = false`), because SPF reports
+`Temperror` for them and DMARC defers on `Temperror`; a cached SERVFAIL would keep deferring a sender
+that retries after resolution recovered.
 
 ### SPF result deviations (Q12a/Q12c) — fixed
 
@@ -138,9 +129,14 @@ until the mechanism loop completes.
 no TTL and is not cleared by `RSET` or a repeated greeting, so a previously authorized client can
 retain a stale `Pass` after DNS changes.
 
-This is accepted for the current journaling deployment because SPF is disabled there. If it is
-addressed, prefer honoring DNS TTLs over clearing the cache for every message: the DNS client has no
-cache of its own and SPF include chains can require several blocking queries.
+Transient failures are no longer cached here — a `Temperror` is not stored, because DMARC defers on
+it and a stale one would keep deferring a sender that retries after DNS recovered. A stale `Pass` or
+`Fail` can still persist for the connection.
+
+The reason for keeping this cache is now weaker: the resolver has a TTL-aware cache of its own, so
+clearing per message would re-read from that rather than re-querying the wire. Preferred fix is to
+drop this layer entirely and let the resolver cache do the work, which would make SPF verdicts follow
+DNS TTLs instead of connection lifetime.
 
 ### Public suffix state is process-wide
 

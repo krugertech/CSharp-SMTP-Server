@@ -37,8 +37,8 @@ CSharp-SMTP-Server.sln
 └── SampleApp/                     demonstration console application
 ```
 
-The principal dependencies are MimeKit 4.17.0 for MIME parsing and `zabszk.DnsClient` 1.0.1 for
-SPF/DMARC DNS queries.
+The principal dependencies are MimeKit 4.17.0 for MIME parsing and DnsClient.NET 1.8.0 for SPF/DMARC
+DNS queries. The latter replaced `zabszk.DnsClient` 1.0.1, which had no response cache of any kind.
 
 ## Runtime ownership
 
@@ -183,9 +183,12 @@ their only timeout.
 
 ## SPF and DMARC
 
-SPF and DMARC are optional and enabled by default. Their validators use a configured DNS endpoint,
-which defaults to Cloudflare `1.1.1.1:53`. DMARC also loads the Mozilla Public Suffix List and caches
-it in process-wide state.
+SPF and DMARC are optional and enabled by default. Their validators resolve through `IDnsResolver`
+(`Protocol/Dns/`), which keeps the third-party client out of this package's public API. The resolver is
+selected by `DnsResolverMode`: `System` (the default — the machine's own name servers), `Explicit`
+(caller-supplied endpoints), or `Disabled`. Responses are cached in process, TTL-aware; transient
+failures are not cached, because DMARC defers on them. DMARC also loads the Mozilla Public Suffix List
+and caches it in process-wide state, published by reference swap so a refresh cannot be read torn.
 
 Authentication results are prepended to delivered messages when validation runs. SPF hard failure is
 rejected during MAIL FROM; DMARC hard failure is rejected after DATA. Authenticated sessions bypass
@@ -234,7 +237,7 @@ Dependabot branches, and open issues #11, #15, #16, and #18.
 | `49e6a64`: replace separate `AuthPlain`/`AuthLogin` methods with `CheckAuthCredentials` | Skipped as a breaking API redesign rather than a bug fix. Separate hooks also let consumers handle LOGIN and PLAIN differently. | Not merged |
 | `dispose-log` branch | Skipped because it was diagnostic stack-trace logging that would add noise during normal shutdown. | Not merged |
 | `dkim` branch: unfinished DKIM verification plus a `ServerOptions` rework into `Config/` | Skipped because it was an unfinished feature, not a contained fix; it tracked upstream issue #15. | Not merged |
-| Issue #11: namespace collision between `zabszk.DnsClient` and Couchbase's `DnsClient` package | Not actionable without forking or renaming the separate DNS dependency. | Deferred |
+| Issue #11: namespace collision between `zabszk.DnsClient` and Couchbase's `DnsClient` package | Resolved by replacing the dependency with DnsClient.NET 1.8.0, the package the collision was with. | Resolved |
 
 To re-audit upstream:
 

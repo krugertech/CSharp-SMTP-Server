@@ -39,6 +39,63 @@ skip decisions are retained in the architecture's
 
 ### Breaking
 
+- **`zabszk.DnsClient` 1.0.1 replaced by DnsClient.NET 1.8.0, behind a resolver abstraction.**
+  The old package had no response cache of any kind, so every SPF evaluation re-resolved its whole
+  include chain on every message — TXT, MX and A/AAAA queries recursing through `include:` and
+  `redirect=` up to RFC 7208's limit of ten DNS-consuming terms, plus a DMARC TXT lookup. The only
+  caching was `SpfResultsCache`, a per-connection map of final SPF verdicts discarded on close. It
+  also dropped multi-string TXT records (so any SPF record over 255 bytes looked absent) and its last
+  published target was `net7.0`, resolved by roll-forward.
+
+  **Migration.** SPF and DMARC now resolve through `IDnsResolver` in
+  `CSharp_SMTP_Server.Protocol.Dns`, which keeps the DNS library out of this package's API:
+
+  | Removed | Replacement |
+  |---|---|
+  | `SpfValidator.DnsClient` (field, typed `DnsClient.DnsClient`) | `SpfValidator.Resolver`, typed `IDnsResolver` |
+  | `SpfValidator(DnsClient.DnsClient)` | `SpfValidator(IDnsResolver)` |
+  | `SpfValidator(EndPoint, DnsClientOptions?)` and `(EndPoint, IErrorLogging?)` | `SpfValidator(IPEndPoint)` |
+  | `SpfValidator(IPAddress, ushort, DnsClientOptions?)` and `(string, ushort, DnsClientOptions?)` | `SpfValidator(IPEndPoint)` |
+  | `SMTPServer.DnsClient` | `SMTPServer.DnsResolver`, typed `IDnsResolver` |
+  | `DnsLogger` (implemented the old client's `IErrorLogging`) | Removed. DnsClient.NET uses `Microsoft.Extensions.Logging`; failed lookups surface as `DnsQueryStatus.Failure` |
+
+  Supply a custom resolver by implementing `IDnsResolver`; build the stock one with
+  `SMTPServer.CreateResolver(DnsResolverMode, endpoints)`. Responses are cached in process, TTL-aware,
+  with a 5-second floor and a 5-minute ceiling. Transient failures are **not** cached — see Fixed.
+
+  This also resolves upstream issue #11, the namespace collision with Couchbase's `DnsClient`
+  package: the collision was with DnsClient.NET, which is now the dependency.
+
+- **The silent Cloudflare DNS fallback is gone; `ServerOptions` gains resolver modes.**
+  Constructing with validation enabled and no endpoint substituted `1.1.1.1:53`, sending every SPF
+  and DMARC lookup — and with it the sending domains of all inbound mail — to a third-party operator
+  the deployment never chose. A startup warning was added for this previously, but it was invisible
+  on the riskiest path: `ILogger` defaults to null, so the least-configured deployment got nothing.
+
+  `DnsResolverMode` replaces the nullable endpoint:
+
+  - `System` (**the new default**) — the machine's own configured name servers.
+  - `Explicit` — caller-supplied endpoints, with no substitution on any path.
+  - `Disabled` — no resolver, and therefore no validation.
+
+  `ServerOptions.DnsServerEndpoint` and `DnsServerEndpointIsDefault` are replaced by `ResolverMode`
+  and `DnsServerEndpoints`. The existing `ServerOptions(bool, bool, EndPoint?)` constructor still
+  works and now selects `Explicit` for a non-null endpoint and `System` for null.
+
+  **Behaviour change to check before upgrading:** a deployment that relied on the Cloudflare fallback
+  now queries its own network's resolvers instead. If those cannot resolve external names, SPF and
+  DMARC will report `Temperror` — which DMARC defers on. Pass an explicit endpoint to keep the old
+  behaviour deliberately.
+
+- **`ServerOptions` constructor and property setters no longer contradict each other.**
+  The constructor wrote the `ValidateSPF`/`ValidateDMARC` backing fields directly and invented an
+  endpoint, while the setters threw for that same enabled-without-a-resolver state. Because the
+  endpoint field was `readonly`, an instance created with validation disabled could never enable it
+  afterwards — identical configuration succeeded or failed based only on the order it was applied in.
+  Both paths now enforce one rule: validation requires a resolver mode other than `Disabled`. The
+  setters throw `InvalidOperationException` (was a bare `Exception`); the constructor throws
+  `ArgumentException` for contradictory arguments.
+
 - **DMARC no longer passes without an authenticated identifier.** Previously
   `DmarcValidator.ProcessRecord` consulted the SPF result only for null reverse-path messages. For
   ordinary mail — anything with a non-null `MAIL FROM`, which is nearly all traffic — it went
@@ -270,6 +327,25 @@ users through a routine update, and a changelog is not a dependency-resolution b
 is the barrier.
 
 ### Fixed
+
+- **Multi-string TXT records are concatenated instead of dropped.** RFC 7208 §3.3 evaluates a TXT
+  record split across several character-strings as their concatenation, which is how every SPF record
+  longer than 255 bytes is published — notably provider include-chains. The old client parsed only
+  single-string RDATA and silently discarded the whole record, so such a domain looked as though it
+  published no SPF at all. This closes deviation Q11, and matters more since the DMARC fix: "no SPF
+  record" now means the sender cannot be authenticated.
+
+- **Transient DNS failures are not cached.** `CacheFailedResults` is off deliberately. SPF reports
+  `Temperror` for a failed lookup and DMARC defers on it, so a cached SERVFAIL would keep deferring a
+  sender that retries within the cache window, after resolution had already recovered. Definitive
+  negatives (NXDOMAIN, empty NOERROR) are still cached by the normal TTL path, so a domain that
+  genuinely publishes no record is not re-queried per message.
+
+- **Two wire-format defects in the `DnsStub` test server.** Neither was reachable with the previous
+  DNS client, and both broke every SPF and DMARC test against a stricter one: answer RRs carried a
+  byte-swapped class (`0x0100`, class 256, instead of `0x0001` for IN), and the response echoed
+  everything after the header as the question section — so a client advertising EDNS0 had its OPT
+  record copied in behind the question and then parsed as the first answer RR.
 
 - **A transient SPF failure is no longer cached for the life of the connection.**
   `ClientProcessor.SpfResultsCache` is connection-scoped, has no TTL and is not cleared by `RSET`, so

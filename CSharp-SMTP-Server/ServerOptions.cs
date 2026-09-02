@@ -1,6 +1,9 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Security.Authentication;
+using CSharp_SMTP_Server.Protocol.Dns;
 // ReSharper disable FieldCanBeMadeReadOnly.Global
 // ReSharper disable ConvertToConstant.Global
 
@@ -52,6 +55,10 @@ namespace CSharp_SMTP_Server
 		/// Enables or disables SPF validation of emails sent by unauthenticated users.
 		/// Default: true
 		/// </summary>
+		/// <exception cref="InvalidOperationException">
+		/// Thrown when enabling validation while <see cref="ResolverMode"/> is
+		/// <see cref="DnsResolverMode.Disabled"/> — there would be no resolver to validate with.
+		/// </exception>
 		// ReSharper disable once InconsistentNaming
 		public bool ValidateSPF
 		{
@@ -59,23 +66,27 @@ namespace CSharp_SMTP_Server
 
 			set
 			{
-				if (!value)
-				{
-					_validateSPF = false;
-					return;
-				}
+				if (value)
+					RequireResolver(nameof(ValidateSPF));
 
-				if (DnsServerEndpoint == null)
-					throw new Exception("SPF validation can't be enabled if DNS endpoint is not defined!");
-
-				_validateSPF = true;
+				_validateSPF = value;
 			}
 		}
 
 		/// <summary>
 		/// Enables or disables DMARC validation of emails sent by unauthenticated users.
-		/// Default: true
 		/// </summary>
+		/// <remarks>
+		/// DMARC needs an authenticated identifier to align (RFC 7489 §4.1), and with DKIM verification
+		/// unimplemented SPF is the only mechanism that can supply one. Enabling this while
+		/// <see cref="ValidateSPF"/> is off leaves DMARC unable to pass anything;
+		/// <see cref="SMTPServer"/> warns about that combination at startup.
+		/// Default: true
+		/// </remarks>
+		/// <exception cref="InvalidOperationException">
+		/// Thrown when enabling validation while <see cref="ResolverMode"/> is
+		/// <see cref="DnsResolverMode.Disabled"/>.
+		/// </exception>
 		// ReSharper disable once InconsistentNaming
 		public bool ValidateDMARC
 		{
@@ -83,62 +94,87 @@ namespace CSharp_SMTP_Server
 
 			set
 			{
-				if (!value)
-				{
-					_validateDMARC = false;
-					return;
-				}
+				if (value)
+					RequireResolver(nameof(ValidateDMARC));
 
-				if (DnsServerEndpoint == null)
-					throw new Exception("DMARC validation can't be enabled if DNS endpoint is not defined!");
-
-				_validateDMARC = true;
+				_validateDMARC = value;
 			}
 		}
 
 		/// <summary>
-		/// Endpoint to the DNS Server used for SPF and DMARC validation.
+		/// How the DNS resolver used for SPF and DMARC validation is obtained.
 		/// <para>
-		/// If SPF or DMARC validation is enabled and no endpoint is supplied, this falls back to
-		/// 1.1.1.1:53 (Cloudflare Public DNS). <b>Every SPF and DMARC lookup then leaves your network
-		/// to a third-party resolver</b>, exposing the sending domains of your inbound mail — and your
-		/// query volume — to that operator. Where that is a privacy, compliance, or availability
-		/// concern, pass an explicit endpoint. <see cref="DnsServerEndpointIsDefault"/> reports whether
-		/// the fallback was applied, and <see cref="SMTPServer"/> logs a warning at startup when it was.
+		/// Default: <see cref="DnsResolverMode.System"/> — the machine's own configured name servers.
+		/// No public resolver is ever substituted silently.
 		/// </para>
-		/// Default: 1.1.1.1:53 (Cloudflare Public DNS Server)
 		/// </summary>
-		public readonly EndPoint? DnsServerEndpoint;
+		public readonly DnsResolverMode ResolverMode;
 
 		/// <summary>
-		/// True when <see cref="DnsServerEndpoint"/> was not supplied by the caller and the built-in
-		/// Cloudflare fallback was applied. False when the caller passed an endpoint explicitly, and
-		/// false when no validation was requested and no endpoint was set.
+		/// DNS server endpoints used when <see cref="ResolverMode"/> is
+		/// <see cref="DnsResolverMode.Explicit"/>. Empty otherwise.
 		/// </summary>
-		public readonly bool DnsServerEndpointIsDefault;
+		public readonly IReadOnlyList<IPEndPoint> DnsServerEndpoints;
 
 		/// <summary>
-		/// Constructor
+		/// Constructor.
 		/// </summary>
 		/// <param name="validateSPF">Indicates whether SPF validation should be enabled</param>
 		/// <param name="validateDMARC">Indicates whether DMARC validation should be enabled</param>
 		/// <param name="dnsServerEndpoint">
-		/// Specifies DNS server endpoint. If null and either validation is enabled, 1.1.1.1:53
-		/// (Cloudflare Public DNS) is used and all SPF/DMARC lookups go to that third-party resolver.
-		/// Pass an explicit endpoint to keep resolution on infrastructure you control.
+		/// An explicit DNS server endpoint. When null, the machine's configured name servers are used
+		/// (<see cref="DnsResolverMode.System"/>).
 		/// </param>
 		// ReSharper disable InconsistentNaming
 		public ServerOptions(bool validateSPF = true, bool validateDMARC = true, EndPoint? dnsServerEndpoint = null)
+			: this(validateSPF, validateDMARC,
+				dnsServerEndpoint == null ? DnsResolverMode.System : DnsResolverMode.Explicit,
+				dnsServerEndpoint == null ? null : new[] {AsIPEndPoint(dnsServerEndpoint, nameof(dnsServerEndpoint))})
 		{
+		}
+
+		/// <summary>
+		/// Constructor taking an explicit resolver mode.
+		/// </summary>
+		/// <param name="validateSPF">Indicates whether SPF validation should be enabled</param>
+		/// <param name="validateDMARC">Indicates whether DMARC validation should be enabled</param>
+		/// <param name="resolverMode">How the DNS resolver is obtained</param>
+		/// <param name="dnsServerEndpoints">
+		/// Endpoints to query, required when <paramref name="resolverMode"/> is
+		/// <see cref="DnsResolverMode.Explicit"/> and rejected otherwise.
+		/// </param>
+		/// <exception cref="ArgumentException">Thrown when the arguments contradict each other.</exception>
+		public ServerOptions(bool validateSPF, bool validateDMARC, DnsResolverMode resolverMode, IEnumerable<IPEndPoint>? dnsServerEndpoints)
+		{
+			ResolverMode = resolverMode;
+			DnsServerEndpoints = dnsServerEndpoints?.ToArray() ?? Array.Empty<IPEndPoint>();
+
+			if (resolverMode == DnsResolverMode.Explicit && DnsServerEndpoints.Count == 0)
+				throw new ArgumentException("At least one DNS server endpoint is required when the resolver mode is Explicit.", nameof(dnsServerEndpoints));
+
+			if (resolverMode != DnsResolverMode.Explicit && DnsServerEndpoints.Count > 0)
+				throw new ArgumentException($"DNS server endpoints cannot be supplied when the resolver mode is {resolverMode}.", nameof(dnsServerEndpoints));
+
+			// The constructor and the property setters used to disagree: the constructor wrote the
+			// backing fields directly and invented an endpoint, while the setters threw for the same
+			// enabled-without-a-resolver state. Because the endpoint was readonly, an instance built
+			// with validation off could never turn it on afterwards — so identical configuration
+			// succeeded or failed based only on the order it was applied in. Both paths now go through
+			// the same rule.
+			if ((validateSPF || validateDMARC) && resolverMode == DnsResolverMode.Disabled)
+				throw new ArgumentException("SPF and DMARC validation require a resolver; the resolver mode cannot be Disabled.", nameof(resolverMode));
+
 			_validateSPF = validateSPF;
 			_validateDMARC = validateDMARC;
-			DnsServerEndpoint = dnsServerEndpoint;
+		}
 
-			if ((validateSPF || validateDMARC) && DnsServerEndpoint == null)
-			{
-				DnsServerEndpoint = new IPEndPoint(IPAddress.Parse("1.1.1.1"), 53);
-				DnsServerEndpointIsDefault = true;
-			}
+		private static IPEndPoint AsIPEndPoint(EndPoint endPoint, string paramName) =>
+			endPoint as IPEndPoint ?? throw new ArgumentException("Only IPEndPoint DNS endpoints are supported.", paramName);
+
+		private void RequireResolver(string propertyName)
+		{
+			if (ResolverMode == DnsResolverMode.Disabled)
+				throw new InvalidOperationException($"{propertyName} can't be enabled when the DNS resolver mode is Disabled.");
 		}
 
 		// ReSharper disable once InconsistentNaming

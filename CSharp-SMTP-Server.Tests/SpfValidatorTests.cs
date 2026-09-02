@@ -8,12 +8,12 @@ namespace CSharp_SMTP_Server.Tests;
 /// SpfValidator.CheckHost against the local UDP DnsStub; no internet. See TESTING.md.
 /// The validator is constructed directly with the stub endpoint (no SMTP server needed).
 ///
-/// New quirks pinned here:
-/// - Q11: zabszk.DnsClient silently drops TXT responses whose RDATA contains multiple character-strings,
-///   so split real-world SPF records are invisible to validation.
-/// - Q12: DNS error handling deviates from RFC 7208 — top-level NXDOMAIN yields Temperror (RFC §4.3 says
-///   "none"); a failed `a`/`mx` lookup returns the mechanism's qualifier instead of temperror (RFC §5);
-///   redirect to a nonexistent domain yields Temperror (RFC §6.1+§4.3 say permerror).
+/// Deviations formerly pinned here, now fixed and asserted the RFC-correct way:
+/// - Q11: the previous DNS client dropped TXT responses whose RDATA held multiple character-strings,
+///   making split real-world SPF records invisible. DnsClient.NET concatenates them (RFC 7208 §3.3).
+/// - Q12: top-level NXDOMAIN yielded Temperror where RFC 7208 §4.3 says "none" (Q12a), and a redirect
+///   to a nonexistent domain inherited that instead of permerror (Q12c, RFC §6.1). A failed `a`/`mx`
+///   lookup returning the mechanism's qualifier instead of temperror (Q12b, RFC §5) was fixed earlier.
 /// - Q13: `redirect=` is evaluated in positional order and short-circuits later mechanisms; RFC 7208
 ///   §6.1/§4.7 only consults the redirect after ALL mechanisms have failed to match.
 /// </summary>
@@ -92,16 +92,21 @@ public sealed class SpfValidatorTests
     }
 
     [Fact]
-    public async Task MultiStringTxtRecord_IsDroppedByDnsClient_ReturnsNone_PinQ11()
+    public async Task MultiStringTxtRecord_IsConcatenated_AndEvaluated()
     {
-        // Real-world SPF records are often split into multiple character-strings (255-byte limit).
-        // zabszk.DnsClient only parses single-string TXT RDATA and silently drops the whole record,
-        // so the validator sees no v=spf1 record at all → None. Pin this library limitation (Q11).
+        // RFC 7208 §3.3: a TXT record split across several character-strings is evaluated as their
+        // concatenation with no separator, which is how any real SPF record longer than 255 bytes is
+        // published — notably the provider include-chains this relay sees constantly.
+        //
+        // This pinned deviation Q11: the previous DNS client parsed only single-string TXT RDATA and
+        // silently dropped the whole record, so such a domain looked as though it published no SPF at
+        // all and validation returned None. Combined with the DMARC fix, that mattered more than it
+        // used to — "no SPF record" now means DMARC cannot authenticate the sender.
         using var stub = new DnsStub();
-        // One TXT RR whose RDATA contains two character-strings.
+        // One TXT RR whose RDATA contains two character-strings: "v=spf1 " + "-all".
         stub.AddRawTxt(Domain, [.. TxtRdata("v=spf1 "), .. TxtRdata("-all")]);
 
-        Assert.Equal(ValidationResult.None, await ValidatorFor(stub).CheckHost(ClientV4, Domain));
+        Assert.Equal(ValidationResult.Fail, await ValidatorFor(stub).CheckHost(ClientV4, Domain));
     }
 
     private static byte[] TxtRdata(string s) => [.. new byte[] { (byte)s.Length }, .. System.Text.Encoding.ASCII.GetBytes(s)];

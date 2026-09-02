@@ -1,12 +1,10 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
-using DnsClient;
-using DnsClient.Data.Records;
-using DnsClient.Enums;
-using DnsClient.Logging;
+using CSharp_SMTP_Server.Protocol.Dns;
 // ReSharper disable MemberCanBePrivate.Global
 
 namespace CSharp_SMTP_Server.Protocol.SPF;
@@ -17,52 +15,33 @@ namespace CSharp_SMTP_Server.Protocol.SPF;
 public class SpfValidator
 {
 	/// <summary>
-	/// DNS Client used to validate SPF records
+	/// Resolver used to look up SPF records.
 	/// </summary>
-	public readonly DnsClient.DnsClient DnsClient;
+	/// <remarks>
+	/// This was a public field typed on the concrete third-party client, which made the resolver
+	/// library part of this package's API surface — swapping it was a source and binary break over an
+	/// implementation detail. It is an interface now; see <see cref="IDnsResolver"/>.
+	/// </remarks>
+	public readonly IDnsResolver Resolver;
 
 	#region Constructors
 	/// <summary>
 	/// Class constructor
 	/// </summary>
 	/// <param name="server">SMTP server which configuration should be used</param>
-	public SpfValidator(SMTPServer server) => DnsClient = server.DnsClient ?? throw new ArgumentException("Server has a null DnsClient", nameof(server));
+	public SpfValidator(SMTPServer server) => Resolver = server.DnsResolver ?? throw new ArgumentException("Server has a null DnsResolver", nameof(server));
 
 	/// <summary>
 	/// Class constructor
 	/// </summary>
-	/// <param name="dnsClient">DNS client used for SPF validation</param>
-	public SpfValidator(DnsClient.DnsClient dnsClient) => DnsClient = dnsClient;
-
-	/// <summary>
-	/// Class constructor
-	/// </summary>
-	/// <param name="dnsServerEndpoint">DNS server endpoint</param>
-	/// <param name="dnsClientOptions">DNS client options</param>
-	public SpfValidator(EndPoint dnsServerEndpoint, DnsClientOptions? dnsClientOptions = null) : this(new DnsClient.DnsClient(dnsServerEndpoint, dnsClientOptions)) { }
+	/// <param name="resolver">Resolver used for SPF validation</param>
+	public SpfValidator(IDnsResolver resolver) => Resolver = resolver;
 
 	/// <summary>
 	/// Class constructor
 	/// </summary>
 	/// <param name="dnsServerEndpoint">DNS server endpoint</param>
-	/// <param name="errorLogging">DNS client error logging interface</param>
-	public SpfValidator(EndPoint dnsServerEndpoint, IErrorLogging? errorLogging) : this(dnsServerEndpoint, new DnsClientOptions {ErrorLogging = errorLogging}) { }
-
-	/// <summary>
-	/// Class constructor
-	/// </summary>
-	/// <param name="dnsServerAddress">DNS server IP address</param>
-	/// <param name="dnsServerPort">DNS server port</param>
-	/// <param name="dnsClientOptions">DNS client options</param>
-	public SpfValidator(IPAddress dnsServerAddress, ushort dnsServerPort = 53, DnsClientOptions? dnsClientOptions = null) : this(new DnsClient.DnsClient(dnsServerAddress, dnsServerPort, dnsClientOptions)) { }
-
-	/// <summary>
-	/// Class constructor
-	/// </summary>
-	/// <param name="dnsServerAddress">DNS server IP address</param>
-	/// <param name="dnsServerPort">DNS server port</param>
-	/// <param name="dnsClientOptions">DNS client options</param>
-	public SpfValidator(string dnsServerAddress, ushort dnsServerPort = 53, DnsClientOptions? dnsClientOptions = null) : this(new DnsClient.DnsClient(dnsServerAddress, dnsServerPort, dnsClientOptions)) { }
+	public SpfValidator(IPEndPoint dnsServerEndpoint) : this(SMTPServer.CreateResolver(DnsResolverMode.Explicit, new[] {dnsServerEndpoint})) { }
 	#endregion
 
 	/// <summary>
@@ -79,7 +58,7 @@ public class SpfValidator
 		if (ipAddress.IsIPv4MappedToIPv6)
 			ipAddress = ipAddress.MapToIPv4();
 
-		var txtQuery = await DnsClient.Query(domain, QType.TXT);
+		var txtQuery = await Resolver.QueryAsync(domain, DnsRecordType.Txt);
 
 		// RFC 7208 §4.3: if the domain does not exist, the result is None — "no SPF record" — not a
 		// transient failure. The MX and A/AAAA paths below already draw this line (see §5); the initial
@@ -88,23 +67,23 @@ public class SpfValidator
 		// That was survivable while nothing consumed Temperror, but DMARC now defers on it (451 4.7.1
 		// per RFC 7489 §6.6.3). Left unfixed, mail from any domain without a DNS entry would be
 		// retried forever instead of being handled as the unauthenticated mail it is.
-		if (txtQuery.ErrorCode == DnsErrorCode.NameError)
+		if (txtQuery.Status == DnsQueryStatus.NameError)
 			return ValidationResult.None;
 
-		if (txtQuery.ErrorCode != DnsErrorCode.NoError || txtQuery.Records == null)
+		if (txtQuery.Status != DnsQueryStatus.Success)
 			return ValidationResult.Temperror;
 
 		string? record = null;
 
 		foreach (var r in txtQuery.Records)
 		{
-			if (r is not DnsRecord.TXTRecord t || !t.Text.StartsWith("v=spf1 ", StringComparison.Ordinal))
+			if (r.Text == null || !r.Text.StartsWith("v=spf1 ", StringComparison.Ordinal))
 				continue;
 
 			if (record != null)
 				return ValidationResult.Permerror;
 
-			record = t.Text;
+			record = r.Text;
 		}
 
 		if (record == null)
@@ -215,20 +194,20 @@ public class SpfValidator
 
 						requestsMade++;
 
-						var mxQuery = await DnsClient.Query(args ?? domain, QType.MX);
+						var mxQuery = await Resolver.QueryAsync(args ?? domain, DnsRecordType.Mx);
 
 						// NXDOMAIN: the name does not exist, so there are no MX hosts to match against.
 						// That is a definitive no-match, not a transient failure — fall through to the
 						// next mechanism (see the note in CheckAddressMatch).
-						if (mxQuery.ErrorCode == DnsErrorCode.NameError)
+						if (mxQuery.Status == DnsQueryStatus.NameError)
 							break;
 
-						if (mxQuery.ErrorCode != DnsErrorCode.NoError || mxQuery.Records == null)
+						if (mxQuery.Status != DnsQueryStatus.Success)
 							return ValidationResult.Temperror;
 
 						foreach (var q in mxQuery.Records)
 						{
-							if (q is not DnsRecord.MXRecord ar)
+							if (q.DomainName == null)
 								continue;
 
 							if (requestsMade > 10)
@@ -236,7 +215,7 @@ public class SpfValidator
 
 							requestsMade++;
 
-							var result = await CheckAddressMatch(ipAddress, ar.MailExchange, null, cidr, qualifier);
+							var result = await CheckAddressMatch(ipAddress, q.DomainName, null, cidr, qualifier);
 
 							// Same fail-open as the "a" mechanism above: a failed A/AAAA lookup for an
 							// MX host is a temperror, not a match (RFC 7208 §5).
@@ -256,17 +235,17 @@ public class SpfValidator
 
 						requestsMade++;
 
-						var ptrQuery = await DnsClient.QueryReverseDNS(ipAddress);
+						var ptrQuery = await Resolver.QueryReverseAsync(ipAddress);
 
-						if (ptrQuery.ErrorCode != DnsErrorCode.NoError || ptrQuery.Records == null)
+						if (ptrQuery.Status != DnsQueryStatus.Success)
 							continue;
 
 						foreach (var q in ptrQuery.Records)
 						{
-							if (q is not DnsRecord.PTRRecord ar)
+							if (q.DomainName == null)
 								continue;
 
-							if (!ar.DomainName.Equals(domain, StringComparison.OrdinalIgnoreCase) && !ar.DomainName.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase))
+							if (!q.DomainName.Equals(domain, StringComparison.OrdinalIgnoreCase) && !q.DomainName.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase))
 								continue;
 
 							if (requestsMade > 10)
@@ -275,7 +254,7 @@ public class SpfValidator
 							requestsMade++;
 							ptrWasUsed = true;
 
-							if (await CheckAddressMatch(ipAddress, ar.DomainName, null, null, ValidationResult.Pass) == ValidationResult.Pass)
+							if (await CheckAddressMatch(ipAddress, q.DomainName, null, null, ValidationResult.Pass) == ValidationResult.Pass)
 								return qualifier;
 						}
 					}
@@ -344,17 +323,17 @@ public class SpfValidator
 
 	private async Task<ValidationResult> CheckAddressMatch(IPAddress ipAddress, string domain, string? args, int? cidr, ValidationResult qualifier)
 	{
-		var aQuery = await DnsClient.Query(args ?? domain, ipAddress.AddressFamily == AddressFamily.InterNetwork ? QType.A : QType.AAAA);
+		var aQuery = await Resolver.QueryAsync(args ?? domain, ipAddress.AddressFamily == AddressFamily.InterNetwork ? DnsRecordType.A : DnsRecordType.Aaaa);
 
 		// RFC 7208 §5: NXDOMAIN ("NameError") is a definitive answer — the name simply does not exist,
 		// so the mechanism does NOT match and evaluation continues to the next one (typically reaching
 		// a terminal "-all"). Only a genuinely transient failure (SERVFAIL, no response, unparseable)
 		// is a temperror. Collapsing the two would make "v=spf1 a:missing.test -all" return Temperror
 		// instead of Fail, and since SMTP rejects only on Fail, that accepts mail it should reject.
-		if (aQuery.ErrorCode == DnsErrorCode.NameError)
+		if (aQuery.Status == DnsQueryStatus.NameError)
 			return ValidationResult.None;
 
-		if (aQuery.ErrorCode != DnsErrorCode.NoError || aQuery.Records == null)
+		if (aQuery.Status != DnsQueryStatus.Success)
 			return ValidationResult.Temperror;
 
 		if (ipAddress.AddressFamily == AddressFamily.InterNetwork)
@@ -364,10 +343,10 @@ public class SpfValidator
 
 			foreach (var q in aQuery.Records)
 			{
-				if (q is not DnsRecord.ARecord ar)
+				if (q.Address == null)
 					continue;
 
-				if (CheckCIDR(ar.Address, ipAddress, (byte)cidr))
+				if (CheckCIDR(q.Address, ipAddress, (byte)cidr))
 					return qualifier;
 			}
 		}
@@ -378,10 +357,10 @@ public class SpfValidator
 
 			foreach (var q in aQuery.Records)
 			{
-				if (q is not DnsRecord.AAAARecord ar)
+				if (q.Address == null)
 					continue;
 
-				if (CheckCIDR(ar.Address, ipAddress, (byte)cidr))
+				if (CheckCIDR(q.Address, ipAddress, (byte)cidr))
 					return qualifier;
 			}
 		}

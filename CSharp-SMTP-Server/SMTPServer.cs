@@ -10,6 +10,7 @@ using CSharp_SMTP_Server.Protocol;
 using CSharp_SMTP_Server.Protocol.Responses;
 using CSharp_SMTP_Server.Protocol.SPF;
 using CSharp_SMTP_Server.Protocol.DMARC;
+using CSharp_SMTP_Server.Protocol.Dns;
 using DnsClient;
 
 namespace CSharp_SMTP_Server
@@ -37,9 +38,9 @@ namespace CSharp_SMTP_Server
 		public readonly ServerOptions Options;
 
 		/// <summary>
-		/// DNS Client used for email messages authentication
+		/// Resolver used for email message authentication, or null when validation is disabled.
 		/// </summary>
-		public readonly DnsClient.DnsClient? DnsClient;
+		public readonly IDnsResolver? DnsResolver;
 
 		/// <summary>
 		/// SPF validator
@@ -82,30 +83,21 @@ namespace CSharp_SMTP_Server
 			LoggerInterface = loggerInterface;
 			Certificate = certificate;
 
-			if (Options.DnsServerEndpoint != null)
+			if (Options.ResolverMode != DnsResolverMode.Disabled)
 			{
-				// The Cloudflare fallback is silent at construction time — ServerOptions has no logger.
-				// Surface it here instead: a deployment that never chose a resolver still sends every
-				// SPF/DMARC lookup, and with it the sending domains of its inbound mail, to a third party.
-				if (Options.DnsServerEndpointIsDefault)
-					LoggerInterface?.LogError(
-						$"[Startup] No DNS server endpoint was configured; SPF/DMARC validation will use the default public resolver {Options.DnsServerEndpoint}. " +
-						"All SPF and DMARC lookups — including the sending domains of inbound mail — will be sent to that third-party operator. " +
-						"Pass an explicit endpoint to ServerOptions to keep DNS resolution on infrastructure you control.");
-
 				// DMARC authenticates by checking that an already-AUTHENTICATED identifier aligns with the
 				// header-From domain (RFC 7489 §4.1). DKIM verification is unimplemented here
 				// (KNOWN_ISSUES.md), so SPF is the only mechanism that can supply one. With SPF off, DMARC
 				// has nothing to align and can never return Pass — it is enabled, visibly configured, and
 				// inert. Warn rather than throw: refusing to start would break existing deployments, and
-				// the validator now answers None instead of the Pass it used to invent.
+				// the validator answers None instead of the Pass it used to invent.
 				if (Options.ValidateDMARC && !Options.ValidateSPF)
 					LoggerInterface?.LogError(
 						"[Startup] DMARC validation is enabled but SPF validation is disabled. DMARC needs an authenticated identifier to align, " +
 						"and with DKIM verification unimplemented SPF is the only source of one, so DMARC cannot authenticate any message and will " +
 						"never return a pass. Enable SPF validation, or disable DMARC to make its inertness explicit.");
 
-				DnsClient = new DnsClient.DnsClient(Options.DnsServerEndpoint, new DnsClientOptions {ErrorLogging = new DnsLogger(this)});
+				DnsResolver = CreateResolver(Options.ResolverMode, Options.DnsServerEndpoints);
 				SpfValidator = new SpfValidator(this);
 				DmarcValidator = new DmarcValidator(this);
 			}
@@ -124,6 +116,37 @@ namespace CSharp_SMTP_Server
 						foreach (var port in parameter.TlsPorts)
 							_listeners.Add(new Listener(parameter.IpAddress, port, this, true, parameter.DualMode));
 				}
+		}
+
+		/// <summary>
+		/// Builds the resolver for a mode, with caching enabled.
+		/// </summary>
+		/// <param name="mode">Resolver mode. <see cref="DnsResolverMode.Disabled"/> is not valid here.</param>
+		/// <param name="endpoints">Endpoints to query; required for <see cref="DnsResolverMode.Explicit"/>.</param>
+		/// <remarks>
+		/// No public resolver is ever substituted. <see cref="DnsResolverMode.System"/> resolves the
+		/// machine's configured name servers, which is what retires the old silent Cloudflare fallback —
+		/// and with it the problem that its startup warning was invisible whenever the caller passed no
+		/// logger, which was exactly the least-configured, highest-risk deployment.
+		/// </remarks>
+		public static IDnsResolver CreateResolver(DnsResolverMode mode, IReadOnlyList<IPEndPoint>? endpoints = null)
+		{
+			switch (mode)
+			{
+				case DnsResolverMode.System:
+					return new DnsClientResolver(new LookupClientOptions {AutoResolveNameServers = true});
+
+				case DnsResolverMode.Explicit:
+					if (endpoints == null || endpoints.Count == 0)
+						throw new ArgumentException("At least one endpoint is required for Explicit resolver mode.", nameof(endpoints));
+
+					// The endpoint array constructor pins these servers; AutoResolveNameServers defaults to
+					// false once servers are supplied, so nothing else is consulted.
+					return new DnsClientResolver(new LookupClientOptions(System.Linq.Enumerable.ToArray(endpoints)));
+
+				default:
+					throw new ArgumentOutOfRangeException(nameof(mode), mode, "Cannot create a resolver for this mode.");
+			}
 		}
 
 		/// <summary>

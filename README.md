@@ -277,8 +277,10 @@ and the relay-specific defaults; see [`TESTING.md`](TESTING.md#load-and-integrit
 
 ## Third-party services and libraries
 
-* By default this library uses Cloudflare Public DNS (1.1.1.1) for SPF and DMARC validation. The DNS endpoint can be changed or both validations disabled via `ServerOptions`.
-* By default this library downloads the Public Suffix List managed by the Mozilla Foundation from GitHub (licensed under MPL v2.0). The URL can be changed in `ServerOptions`. The list is not downloaded when `DnsServerEndpoint` is `null`.
+* By default this library resolves SPF and DMARC through **the machine's own configured name servers** (`DnsResolverMode.System`). No public resolver is substituted: earlier versions silently fell back to Cloudflare `1.1.1.1`, which sent the sending domains of all inbound mail to a third-party operator the deployment never chose. Pass an endpoint for `DnsResolverMode.Explicit`, or use `DnsResolverMode.Disabled` to switch validation off entirely.
+* Responses are cached in process (TTL-aware, 5 s floor / 5 min ceiling). Transient DNS failures are deliberately not cached.
+* This library uses [DnsClient.NET](https://github.com/MichaCo/DnsClient.NET) 1.8.0 by Michael Conrad, licensed under the Apache License 2.0.
+* By default this library downloads the Public Suffix List managed by the Mozilla Foundation from GitHub (licensed under MPL v2.0). The URL can be changed in `ServerOptions`. The list is not downloaded when the resolver mode is `Disabled`.
 * This library uses [MimeKit](https://github.com/jstedfast/MimeKit) 4.17.0 by the .NET Foundation and Contributors, licensed under the MIT License.
 
 ---

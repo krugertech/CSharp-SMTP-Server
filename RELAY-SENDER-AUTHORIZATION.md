@@ -84,34 +84,39 @@ again before `CanProcessTransaction` runs.
 
 ### The DNS resolver default
 
-The property setters for `ValidateSPF` / `ValidateDMARC` throw if the flag is turned on while
-`DnsServerEndpoint` is null — but the **constructor assigns the backing fields directly**, bypassing
-those setters, so that guard does not apply on the normal path. Instead the constructor substitutes
-a default: if either check is enabled and no endpoint was supplied, `DnsServerEndpoint` becomes
-`1.1.1.1:53` — Cloudflare's public resolver
-([ServerOptions.cs:131-141](CSharp-SMTP-Server/ServerOptions.cs#L131-L141)).
-
-The setter guard can therefore only fire in one narrow case: constructing with both checks off, then
-enabling one later.
-
-The consequence of the default matters more than the guard. A deployment that never chose a resolver
-sends **every SPF and DMARC lookup to Cloudflare** — which means the sending domains of all inbound
-mail, and the query volume, leave the network to a third party. For a journaling product with
-compliance obligations that is worth an explicit decision rather than a silent default.
-
-Set `DnsServerEndpoint` explicitly to keep resolution on infrastructure you control:
+Resolution is selected by `DnsResolverMode`, and the default is `System` — the machine's own
+configured name servers. Nothing is substituted silently on any path.
 
 ```cs
-var options = new ServerOptions(
+// Default: the machine's configured name servers.
+var options = new ServerOptions(validateSPF: true, validateDMARC: true);
+
+// Or pin a resolver you control.
+var pinned = new ServerOptions(
     validateSPF: true,
     validateDMARC: true,
     dnsServerEndpoint: new IPEndPoint(IPAddress.Parse("10.0.0.53"), 53));
 ```
 
-`ServerOptions.DnsServerEndpointIsDefault` reports whether the fallback was applied, and
-`SMTPServer` logs a warning through `ILogger` at startup when it was. The fallback is kept rather
-than made a hard error so existing callers keep working — the fix is visibility, not a breaking
-change.
+This replaces a worse arrangement worth recording, because it is the kind of default that looks
+harmless in a constructor signature. `ServerOptions` took a nullable endpoint whose null meant two
+different things, and when either check was enabled with no endpoint supplied the constructor
+substituted `1.1.1.1:53` — Cloudflare's public resolver. A deployment that never chose a resolver
+therefore sent **every SPF and DMARC lookup to a third party**: the sending domains of all inbound
+mail, and the query volume, left the network. For a journaling product with compliance obligations
+that needed to be an explicit decision.
+
+A startup warning was added for it first. That turned out to be ineffective on precisely the path
+that mattered: `ILogger` defaults to null, so `new SMTPServer(params, null, delivery)` — the
+least-configured, highest-risk call — emitted nothing at all. Retiring the fallback fixed the
+underlying problem instead of reporting it.
+
+The constructor also used to write the `ValidateSPF`/`ValidateDMARC` backing fields directly,
+bypassing the property setters that guarded the same state, so the guard could only fire when
+constructing with both checks off and enabling one later — and since the endpoint was `readonly`,
+that path then threw permanently. Constructor and setters now share one rule.
+
+See [the shipped DNS section](#dns-resolution-and-caching-shipped) for caching and its bounds.
 
 ### There is no built-in observe-only mode
 
@@ -237,96 +242,91 @@ Requiring aligned SPF `Pass` is what RFC 7489 §4.1 calls for, but with no DKIM 
 mail that a DKIM-capable receiver would accept — SPF breaks by design on forwarding and there is no
 second chance. That is an argument for the observe-only rollout below, not against the fix.
 
-## DNS resolution and caching (design)
+## DNS resolution and caching (shipped)
 
 ### The problem: no caching anywhere
 
-The current resolver, `zabszk.DnsClient` 1.0.1, has **no response cache**. Its `DnsClientOptions`
-exposes `Timeout`, `MaxAttempts`, `TimeoutInnerDelay`, `UseTCPForTruncated`, `TCPEndpointOverride`
-and `ErrorLogging` — and nothing else. Every lookup goes to the wire.
+`zabszk.DnsClient` 1.0.1 had **no response cache**. Its `DnsClientOptions` exposed `Timeout`,
+`MaxAttempts`, `TimeoutInnerDelay`, `UseTCPForTruncated`, `TCPEndpointOverride` and `ErrorLogging` —
+and nothing else. Every lookup went to the wire.
 
-The only caching in the library is `SpfResultsCache`
+The only caching in the library was `SpfResultsCache`
 ([ClientProcessor.cs:45](CSharp-SMTP-Server/Networking/ClientProcessor.cs#L45)), a `Dictionary` of
-final SPF verdicts keyed by domain and scoped to **a single connection**. It is discarded when the
-connection closes, and it caches verdicts rather than DNS records, so it does nothing for the
-lookups underneath.
+final SPF verdicts keyed by domain and scoped to **a single connection**, discarded on close. It
+cached verdicts rather than DNS records, so it did nothing for the lookups underneath.
 
-The cost per message is not one query. SPF evaluation issues TXT
-([SpfValidator.cs:82](CSharp-SMTP-Server/Protocol/SPF/SpfValidator.cs#L82)), MX
-([line 208](CSharp-SMTP-Server/Protocol/SPF/SpfValidator.cs#L208)) and A/AAAA
-([line 337](CSharp-SMTP-Server/Protocol/SPF/SpfValidator.cs#L337)) queries, recursing through
-`include:` and `redirect=` up to the RFC 7208 limit of 10 DNS-consuming terms. DMARC adds a TXT
-lookup ([DmarcValidator.cs:148](CSharp-SMTP-Server/Protocol/DMARC/DmarcValidator.cs#L148)).
+The cost per message was not one query. SPF evaluation issues TXT, MX and A/AAAA queries, recursing
+through `include:` and `redirect=` up to the RFC 7208 limit of 10 DNS-consuming terms, and DMARC adds
+a TXT lookup. For a journal relay taking sustained traffic from a small set of customer domains, that
+re-resolved the same Exchange Online `include:` chain on every message, and that chain fans out
+several levels.
 
-For a journal relay taking sustained traffic from a small set of customer domains, this re-resolves
-the same Exchange Online `include:` chain on every message. That chain fans out several levels.
+### Resolution: DnsClient.NET behind a resolver abstraction
 
-### Decision: replace the resolver rather than build a cache
+`zabszk.DnsClient` is replaced by DnsClient.NET 1.8.0, reached through `IDnsResolver`
+([Protocol/Dns/](CSharp-SMTP-Server/Protocol/Dns/)). The abstraction exists so the DNS library is not
+part of this package's public API — the previous design exposed the concrete client as a public field
+on `SpfValidator`, which made replacing it a source and binary break over an implementation detail.
 
-An earlier version of this note proposed writing a TTL-aware cache in front of the existing client.
-That is the wrong order of work. `DnsClient.NET` (package id `DnsClient`, MichaConrad) already
-provides it, is far more widely deployed than the current dependency, and ships `netstandard2.1`
-and `net8.0` targets — both compatible with this project's `netstandard2.1;net10.0`.
+Caching is on, TTL-aware, with a 5-second floor and a 5-minute ceiling. `DnsResolverCacheTests` proves
+it by query count against the stub rather than by assertion: a repeated lookup inside the TTL issues
+no second wire query, and an SPF include chain resolves once across eleven evaluations.
 
-Verified against `DnsClient` 1.8.0's shipped XML documentation:
+Two things are deliberately *not* cached:
 
-| Capability | Member | Notes |
-|---|---|---|
-| Response cache, TTL-aware | `DnsQueryOptions.UseCache` | Honours record TTL |
-| TTL floor | `LookupClientOptions.MinimumCacheTimeout` | Default null; guards zero-TTL records |
-| TTL ceiling | `LookupClientOptions.MaximumCacheTimeout` | Default null |
-| Negative caching | `DnsQueryOptions.CacheFailedResults` | With `FailedResultsCacheDuration` |
-| System name servers | `LookupClientOptions.AutoResolveNameServers` | Default **true** |
-| TCP fallback | `DnsQueryOptions.UseTcpFallback` | |
-| Retries | `DnsQueryOptions.Retries` | |
+- **Transient failures** (`CacheFailedResults = false`). SPF reports `Temperror` for a failed lookup
+  and DMARC defers on it, so a cached SERVFAIL would keep deferring a sender that retries within the
+  window, after resolution recovered. Definitive negatives — NXDOMAIN and empty NOERROR — are still
+  cached by the normal TTL path, so a domain that genuinely publishes no record is not re-queried per
+  message.
+- **`Temperror` in `SpfResultsCache`.** The same trap one layer up: that cache is connection-scoped
+  with no TTL and survives `RSET`, so one SERVFAIL would have pinned a 451 for the whole session.
 
-`AutoResolveNameServers` also settles the "use the OS resolver" question raised earlier. The
-concern was that .NET exposes no managed API for TXT/MX through the platform stub resolver, making
-an OS mode a P/Invoke exercise. `DnsClient.NET` resolves the *system-configured name servers* and
-queries them directly — which delivers the intent (use the network's own resolvers, no hardcoded
-public IP) without native interop. Note the distinction: this uses the OS's configured servers, not
-the OS's cache. Caching happens in-process, via `UseCache`.
+The replacement also fixed the split-TXT defect (Q11): the old client dropped multi-string TXT records
+entirely, so any SPF record over 255 bytes — which is how provider include-chains are published —
+looked absent. Under the DMARC fix that is no longer a silent inefficiency: "no SPF record" now means
+the sender cannot be authenticated.
 
-### Proposed resolver modes
+### Cache bounds under hostile load
 
-Three modes on `ServerOptions`, replacing the current single nullable endpoint:
+Worth being precise about, because it is not solved. DnsClient.NET's cache is keyed by query and
+bounded only in **time**. `MaximumCacheTimeout` limits how long an entry lives; there is no
+entry-count limit and no eviction policy. Sending domains are chosen by whoever connects, so cache
+keys are attacker-influenced and a flood of distinct names grows the cache.
 
-1. **System** *(proposed default)* — `AutoResolveNameServers = true`. Uses the network's configured
-   resolvers. Nothing leaves for a third party that was not already the machine's resolver.
-2. **Explicit** — caller supplies one or more endpoints. Current behaviour, minus the silent
-   Cloudflare substitution.
-3. **Disabled** — no validation, no resolver.
+The 5-minute ceiling is a mitigation: it keeps the working set bounded by connection rate rather than
+by uptime, at the cost of re-resolving long-TTL records more often than their TTL requires. A hard
+bound would need something the library does not provide — a bounded LRU in front of the resolver, or
+admission control per connection. Recorded in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-This makes the Cloudflare fallback unnecessary rather than merely loud. The
-`DnsServerEndpointIsDefault` flag and startup warning added alongside this document are the interim
-mitigation; under mode 1 the default becomes "the resolver this machine already uses", which is the
-correct default for a compliance-sensitive deployment.
+### Resolver selection retires the Cloudflare fallback
 
-### Migration considerations
+`ServerOptions` previously took a nullable endpoint whose null meant two different things: "no
+validation", and "validate, using a resolver we picked for you" — `1.1.1.1:53`. The second sent every
+SPF and DMARC lookup, and with it the sending domains of all inbound mail, to a third-party operator
+the deployment never chose. A startup warning was added for it, but it was invisible on exactly the
+riskiest path, because `ILogger` defaults to null and the least-configured deployment passes none.
 
-- **`SpfValidator` has four public constructors** taking `DnsClient.DnsClient`, `EndPoint`,
-  `IPAddress`, and `string` ([SpfValidator.cs:29-65](CSharp-SMTP-Server/Protocol/SPF/SpfValidator.cs#L29-L65)).
-  These are public API on a published NuGet package; swapping the resolver type is a **breaking
-  change** for anyone constructing a validator directly. The package is already at
-  `2.0.0-krugertech.1`, so a major-version boundary is available.
-- `DnsLogger` adapts the current client's `IErrorLogging`; `DnsClient.NET` uses
-  `Microsoft.Extensions.Logging`, so that shim needs rewriting or dropping.
-- Record types differ (`DnsClient.Data.Records` vs `DnsClient.Protocol`), touching both validators.
-- The test `DnsStub` serves wire-format DNS over UDP, so it should work against either client — but
-  cache behaviour must be tested explicitly, since a stub that counts queries is the only way to
-  prove a cache hit actually avoided the wire.
-- Caching changes failure semantics in a useful way: with `CacheFailedResults` and a modest
-  `FailedResultsCacheDuration`, a resolver hiccup stops translating into a burst of SPF
-  `TemporaryFail` responses.
+`DnsResolverMode` makes the choice explicit:
 
-### Sizing the cache
+| Mode | Behaviour |
+|---|---|
+| `System` (default) | The machine's own configured name servers |
+| `Explicit` | Caller-supplied endpoints, with no substitution on any path |
+| `Disabled` | No resolver, and therefore no SPF or DMARC validation |
 
-`DnsClient.NET`'s cache is keyed by query and is process-wide. Sending domains are chosen by
-whoever connects, so cache keys are attacker-influenced — worth confirming what bound, if any, the
-implementation places on cache size before relying on it under hostile load. `MaximumCacheTimeout`
-limits entry lifetime but not entry count.
+`System` resolves the system name servers and queries them directly rather than going through the OS
+stub resolver, so caching is in-process. No public resolver is substituted on any path, logger present
+or not.
 
----
+**Check before upgrading:** a deployment that relied on the Cloudflare fallback now queries its own
+network's resolvers. If those cannot resolve external names, SPF and DMARC report `Temperror`, which
+DMARC defers on. Pass an explicit endpoint to keep the old behaviour deliberately.
+
+This also removed the constructor/setter contradiction in `ServerOptions`: the constructor wrote the
+validation flags directly and invented an endpoint while the setters threw for that same state, and
+because the endpoint was `readonly`, an instance built with validation off could never enable it
+later. Identical configuration succeeded or failed based only on the order it was applied in.
 
 ## Recommended sequence
 

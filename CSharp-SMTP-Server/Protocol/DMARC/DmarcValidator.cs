@@ -3,8 +3,7 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading.Tasks;
 using CSharp_SMTP_Server.Protocol.Commands;
-using DnsClient.Data.Records;
-using DnsClient.Enums;
+using CSharp_SMTP_Server.Protocol.Dns;
 
 namespace CSharp_SMTP_Server.Protocol.DMARC;
 
@@ -179,32 +178,29 @@ public class DmarcValidator
 	/// </returns>
 	private async Task<(string? Record, bool TemporaryFailure)> GetDmarcRecord(string domain)
 	{
-		var dmarcQuery = await _server.DnsClient!.Query("_dmarc." + domain, QType.TXT);
+		var dmarcQuery = await _server.DnsResolver!.QueryAsync("_dmarc." + domain, DnsRecordType.Txt);
 
 		// RFC 7208 §5 draws this line for SPF and it holds here: NXDOMAIN is a definitive answer — the
 		// name does not exist, so there is no policy. Any other error code means the question went
 		// unanswered, which says nothing about the domain.
-		if (dmarcQuery.ErrorCode == DnsErrorCode.NameError)
+		if (dmarcQuery.Status == DnsQueryStatus.NameError)
 			return (null, false);
 
-		if (dmarcQuery.ErrorCode != DnsErrorCode.NoError)
+		if (dmarcQuery.Status != DnsQueryStatus.Success)
 			return (null, true);
-
-		if (dmarcQuery.Records == null)
-			return (null, false);
 
 		string? record = null;
 
 		foreach (var r in dmarcQuery.Records)
 		{
-			if (r is not DnsRecord.TXTRecord t || !t.Text.StartsWith("v=DMARC1;", StringComparison.Ordinal))
+			if (r.Text == null || !r.Text.StartsWith("v=DMARC1;", StringComparison.Ordinal))
 				continue;
 
 			// §7: two v=DMARC1; records for one name are treated as if no record existed.
 			if (record != null)
 				return (null, false);
 
-			record = t.Text;
+			record = r.Text;
 		}
 
 		return (record, false);

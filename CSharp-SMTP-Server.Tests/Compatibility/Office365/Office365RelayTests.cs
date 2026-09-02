@@ -1,3 +1,4 @@
+using CSharp_SMTP_Server.Protocol.Dns;
 using System.Net;
 using CSharp_SMTP_Server.Networking;
 using CSharp_SMTP_Server.Protocol.Responses;
@@ -89,7 +90,10 @@ public sealed class Office365RelayTests
     /// </remarks>
     private static ServerOptions JournalingOptions()
     {
-        var options = new ServerOptions(validateSPF: false, validateDMARC: false, null)
+                // Disabled, not merely "no endpoint": with SPF and DMARC both off there is nothing to resolve,
+        // and DnsResolverMode.Disabled says so outright rather than leaving a resolver configured and
+        // unused. A null endpoint now selects the system resolvers, so it would build one.
+        var options = new ServerOptions(validateSPF: false, validateDMARC: false, DnsResolverMode.Disabled, null)
         {
             ServerName = "journal.local",
             MessageCharactersLimit = JournalingSizeLimit,
@@ -913,12 +917,12 @@ public sealed class Office365RelayTests
 
         Assert.False(options.ValidateSPF);
         Assert.False(options.ValidateDMARC);
-        Assert.Null(options.DnsServerEndpoint);
+        Assert.Equal(DnsResolverMode.Disabled, options.ResolverMode);
 
         using var server = new SMTPServer(null, options, NoopDelivery.Instance);
 
-        // No DNS endpoint means no validators are built, so no lookup can occur on the session path.
-        Assert.Null(server.DnsClient);
+        // A disabled resolver means no validators are built, so no lookup can occur on the session path.
+        Assert.Null(server.DnsResolver);
         Assert.Null(server.SpfValidator);
         Assert.Null(server.DmarcValidator);
     }
