@@ -614,5 +614,59 @@ public sealed class SpfDmarcIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task SpfTemperror_IsNotCachedForTheConnection_RecoversOnRetry()
+    {
+        // A Temperror says the resolver failed, not that the domain is bad, so it must not be cached.
+        // SpfResultsCache is connection-scoped with no TTL and survives RSET, so caching one SERVFAIL
+        // would keep deferring every later transaction on the same session with 451 — long after DNS
+        // recovered, until the sender's queue expired. The sender is doing exactly the right thing by
+        // retrying, and must be able to get through.
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=reject");
+        stub.AddTxt("victim.example", "v=spf1 ip4:127.0.0.1 -all");
+        stub.SetServFail("victim.example"); // resolver is down for this name
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            // First attempt, while DNS is broken → deferred.
+            await s.Send("MAIL FROM:<sender@victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("From: sender@victim.example");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+            Assert.Equal("451 4.7.1 Temporary error validating DMARC, please retry later", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
+
+            // DNS recovers, and the sender retries on the SAME connection.
+            stub.ClearServFail("victim.example");
+
+            await s.Send("MAIL FROM:<sender@victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+            await s.Send("From: sender@victim.example");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            // Re-queried rather than served from a stale Temperror: SPF now passes, DMARC aligns.
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+            Assert.Equal(ValidationResult.Pass, delivery.Delivered.Single().DMARCValidationResult);
+        }
+    }
+
     #endregion
 }

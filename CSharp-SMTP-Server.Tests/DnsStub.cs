@@ -99,6 +99,15 @@ public sealed class DnsStub : IDisposable
         lock (_lock) foreach (var d in domains) _nxdomain.Add(d);
     }
 
+    /// <summary>
+    /// Stops these names failing with SERVFAIL — i.e. simulates the resolver recovering, so a
+    /// transient failure can be shown to be transient.
+    /// </summary>
+    public void ClearServFail(params string[] domains)
+    {
+        lock (_lock) foreach (var d in domains) _servfail.Remove(d);
+    }
+
     #endregion
 
     #region Observation

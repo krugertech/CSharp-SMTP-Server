@@ -271,6 +271,13 @@ is the barrier.
 
 ### Fixed
 
+- **A transient SPF failure is no longer cached for the life of the connection.**
+  `ClientProcessor.SpfResultsCache` is connection-scoped, has no TTL and is not cleared by `RSET`, so
+  a cached `Temperror` pinned one SERVFAIL for the whole session. Now that DMARC defers on
+  `Temperror` (`451 4.7.1`), that would have kept deferring a sender retrying on the same connection
+  long after DNS recovered, turning a brief outage into queue expiry. `Temperror` results are no
+  longer cached — a re-query costs one lookup and only happens while resolution is actually broken.
+
 - **The DMARC public suffix list is no longer rebuilt in place while it is being read.**
   `DownloadList` cleared and repopulated one shared `HashSet` that `GetOrganizationalDomain` reads
   from arbitrary connection threads, so a reader could observe the set empty or partially filled and

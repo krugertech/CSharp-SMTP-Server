@@ -80,7 +80,16 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 									else
 									{
 										spfValidation = await processor.Server.SpfValidator!.CheckHost(processor.RemoteEndPoint.Address, checkDomain);
-										processor.SpfResultsCache.Add(checkDomain, spfValidation);
+
+										// Temperror is a statement about the resolver, not about the domain, so it
+										// must not be cached: the cache is connection-scoped with no TTL and is not
+										// cleared by RSET. Caching it would pin one SERVFAIL for the life of the
+										// connection, and since DMARC now defers on Temperror (451 4.7.1) a sender
+										// retrying on the same session would keep being deferred long after DNS
+										// recovered — turning a brief outage into queue expiry. Re-querying costs one
+										// lookup and is only reached while resolution is actually broken.
+										if (spfValidation != ValidationResult.Temperror)
+											processor.SpfResultsCache.Add(checkDomain, spfValidation);
 									}
 
 									if (spfValidation == ValidationResult.Fail)
