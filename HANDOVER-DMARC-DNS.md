@@ -305,12 +305,21 @@ the wire. Also cover TTL expiry and negative-cache behaviour.
 
 ## Open questions for whoever picks this up
 
+Still open after both tasks — these are deployment decisions, not implementation work. The live copy
+is [RELAY-SENDER-AUTHORIZATION.md](RELAY-SENDER-AUTHORIZATION.md#open-questions); this list is kept
+so the handover reads whole.
+
 - Is DKIM verification worth prioritising? It is the missing half of DMARC and directly bounds how
-  well Task 1 can work. The unfinished upstream `dkim` branch was deliberately not merged
-  ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
-- Should `ServerOptions` gain a first-class observe-only mode for SPF/DMARC? Both currently reject
+  well Task 1 can work — with SPF as the only mechanism, forwarded mail has no second chance and a
+  `p=reject` domain publishing no SPF record still cannot be protected here. The unfinished upstream
+  `dkim` branch was deliberately not merged ([KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+- Should `ServerOptions` gain a first-class observe-only mode for SPF/DMARC? Both still reject
   before the filter hooks run, so consumers cannot measure without disabling the checks entirely.
-- Do external consumers of the NuGet package exist? Determines how much compatibility shimming
-  Task 2 needs.
 - Which customers move to per-customer mTLS ([TENANT-CRYPTO-AUTH.md](TENANT-CRYPTO-AUTH.md)) rather
   than domain-based authentication?
+
+Answered while doing the work:
+
+- ~~Do external consumers of the NuGet package exist?~~ Treated as none: clean break at the
+  `2.0.0-krugertech.1` prerelease boundary, no compatibility shims. Migration table in
+  [CHANGELOG.md](CHANGELOG.md).

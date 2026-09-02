@@ -381,15 +381,33 @@ SPF/DMARC as the fallback for everyone else.
 
 ## Open questions
 
+Decisions for the deployment. Everything here is genuinely undecided — questions this document used
+to carry that the DMARC/DNS work has since answered are listed under "Resolved" below, with where
+the answer now lives.
+
 - Should `ServerOptions` gain a first-class observe-only / report-only mode for SPF and DMARC?
-- Is DKIM verification worth prioritising, given it is currently the missing half of DMARC?
-- Which customers are candidates for mTLS versus domain-based authentication?
-- Which resolver should the relay actually use? The Cloudflare fallback is now logged rather than
-  silent, but the deployment still needs to make the choice deliberately — and resolver mode 1
-  would make the question mostly go away.
-- Should the constructor honour the same DNS-endpoint invariant its property setters enforce? The
-  two paths currently disagree, which is what made the fallback easy to miss.
-- Is the `SpfValidator` public-constructor break acceptable at `2.0.0`, or do the existing
-  overloads need shims to keep external callers compiling?
-- What bounds does `DnsClient.NET`'s cache place on entry count, given cache keys are
-  attacker-influenced?
+  Both checks still reject before their filter hooks run, so measuring real traffic means disabling
+  the built-in check and calling the validator from a hook — see
+  [There is no built-in observe-only mode](#there-is-no-built-in-observe-only-mode). This is the
+  main friction in step 3 of the rollout sequence.
+- Is DKIM verification worth prioritising, given it is the missing half of DMARC? It directly bounds
+  how much the DMARC fix can achieve: with SPF as the only mechanism, forwarded mail has no second
+  chance, and a `p=reject` domain publishing no SPF record still cannot be protected here.
+- Which customers are candidates for mTLS ([TENANT-CRYPTO-AUTH.md](TENANT-CRYPTO-AUTH.md)) versus
+  domain-based authentication?
+
+### Resolved
+
+- ~~Which resolver should the relay actually use?~~ `DnsResolverMode.System` — the machine's own
+  name servers — is now the default, and the Cloudflare fallback is gone rather than merely logged.
+  Pass an endpoint for `Explicit` mode to pin a resolver deliberately.
+- ~~Should the constructor honour the same DNS-endpoint invariant its property setters enforce?~~
+  Yes. Both paths now enforce one rule, and the readonly-endpoint trap that made validation
+  impossible to enable after construction is gone.
+- ~~Is the `SpfValidator` public-constructor break acceptable at `2.0.0`?~~ Yes — clean break, no
+  shims. Migration table in [CHANGELOG.md](CHANGELOG.md).
+- ~~What bounds does `DnsClient.NET`'s cache place on entry count?~~ **None**, verified against the
+  package's shipped XML docs and confirmed by test: its whole cache surface is durations and
+  booleans over a `ConcurrentDictionary`, and 6000 distinct resolving names evict nothing. This is a
+  finding rather than an answered question — it is tracked in [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+  under "The positive DNS response cache has no entry-count bound", which is the copy to trust.

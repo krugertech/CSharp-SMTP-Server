@@ -86,9 +86,19 @@ include chain resolves once across repeated evaluations rather than per message.
 
 ### The positive DNS response cache has no entry-count bound
 
-DnsClient.NET's own cache is keyed by query and bounded only in *time*: `MaximumCacheTimeout` limits
-how long an entry lives, and there is no setting for how many entries may exist. Sending domains are
-chosen by whoever connects, so cache keys are attacker-influenced.
+DnsClient.NET's own cache is keyed by query and bounded only in *time*. Sending domains are chosen by
+whoever connects, so cache keys are attacker-influenced.
+
+Verified rather than assumed, against the package's shipped `DnsClient.xml`: the entire cache
+configuration surface is `UseCache`, `MinimumCacheTimeout`, `MaximumCacheTimeout`,
+`CacheFailedResults`, `FailedResultsCacheDuration`, and a read-only `QueryCache()` lookup. Every one
+is a duration or a boolean — there is no count, size, or eviction setting, and the backing store is a
+`ConcurrentDictionary`. `MaximumCacheTimeout`'s own documentation confirms its scope: it "can override
+the TTL of a resource record in case the TTL of the record is higher than this maximum value", which
+clamps retention and says nothing about entry count.
+
+Confirmed by test as well: after 6000 distinct resolving names, the first entry is still cached.
+Nothing evicts.
 
 This applies to **positive** answers only, and exploiting it takes more than junk traffic: an
 attacker needs each made-up name to actually resolve, which means controlling a zone with wildcard
@@ -100,6 +110,12 @@ connection rate rather than by uptime. That is a mitigation, not a fix: the ceil
 effectiveness for a bounded window, and a sustained flood of resolvable unique names can still grow
 memory within it. A hard bound would need an eviction policy the library does not expose — a bounded
 LRU in front of it, or per-connection DNS admission control.
+
+**What has not been measured**, so severity here is reasoned rather than established: the wildcard-zone
+attack has not been run end-to-end through SMTP under load, and per-entry memory cost has not been
+measured, so the point at which growth becomes operationally painful is unknown. The unbounded-growth
+mechanism itself is proven; the exploitability argument above rests on the attacker needing a
+resolvable zone, which is a higher bar than sending junk but not a high one.
 
 Negative answers and transient failures are handled by the adapter rather than the library, because
 DnsClient.NET lumps them together under `CacheFailedResults` and they need opposite treatment:
