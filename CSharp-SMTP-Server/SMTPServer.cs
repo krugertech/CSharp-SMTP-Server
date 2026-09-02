@@ -97,7 +97,7 @@ namespace CSharp_SMTP_Server
 						"and with DKIM verification unimplemented SPF is the only source of one, so DMARC cannot authenticate any message and will " +
 						"never return a pass. Enable SPF validation, or disable DMARC to make its inertness explicit.");
 
-				DnsResolver = CreateResolver(Options.ResolverMode, Options.DnsServerEndpoints);
+				DnsResolver = CreateResolver(Options.ResolverMode, Options.DnsServerEndpoints, LoggerInterface);
 				SpfValidator = new SpfValidator(this);
 				DmarcValidator = new DmarcValidator(this);
 			}
@@ -123,18 +123,23 @@ namespace CSharp_SMTP_Server
 		/// </summary>
 		/// <param name="mode">Resolver mode. <see cref="DnsResolverMode.Disabled"/> is not valid here.</param>
 		/// <param name="endpoints">Endpoints to query; required for <see cref="DnsResolverMode.Explicit"/>.</param>
+		/// <param name="logger">Optional logger; failed lookups are reported through it.</param>
 		/// <remarks>
 		/// No public resolver is ever substituted. <see cref="DnsResolverMode.System"/> resolves the
 		/// machine's configured name servers, which is what retires the old silent Cloudflare fallback —
 		/// and with it the problem that its startup warning was invisible whenever the caller passed no
 		/// logger, which was exactly the least-configured, highest-risk deployment.
+		///
+		/// The returned type is deliberately only <see cref="IDnsResolver"/>: the concrete implementation
+		/// names DnsClient.NET types, and exposing it would put the resolver library back into this
+		/// package's API surface.
 		/// </remarks>
-		public static IDnsResolver CreateResolver(DnsResolverMode mode, IReadOnlyList<IPEndPoint>? endpoints = null)
+		public static IDnsResolver CreateResolver(DnsResolverMode mode, IReadOnlyList<IPEndPoint>? endpoints = null, ILogger? logger = null)
 		{
 			switch (mode)
 			{
 				case DnsResolverMode.System:
-					return new DnsClientResolver(new LookupClientOptions {AutoResolveNameServers = true});
+					return new DnsClientResolver(new LookupClientOptions {AutoResolveNameServers = true}, logger);
 
 				case DnsResolverMode.Explicit:
 					if (endpoints == null || endpoints.Count == 0)
@@ -142,7 +147,7 @@ namespace CSharp_SMTP_Server
 
 					// The endpoint array constructor pins these servers; AutoResolveNameServers defaults to
 					// false once servers are supplied, so nothing else is consulted.
-					return new DnsClientResolver(new LookupClientOptions(System.Linq.Enumerable.ToArray(endpoints)));
+					return new DnsClientResolver(new LookupClientOptions(System.Linq.Enumerable.ToArray(endpoints)), logger);
 
 				default:
 					throw new ArgumentOutOfRangeException(nameof(mode), mode, "Cannot create a resolver for this mode.");

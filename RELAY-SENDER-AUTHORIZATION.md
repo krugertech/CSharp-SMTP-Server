@@ -276,11 +276,22 @@ Two things are deliberately *not* cached:
 
 - **Transient failures** (`CacheFailedResults = false`). SPF reports `Temperror` for a failed lookup
   and DMARC defers on it, so a cached SERVFAIL would keep deferring a sender that retries within the
-  window, after resolution recovered. Definitive negatives — NXDOMAIN and empty NOERROR — are still
-  cached by the normal TTL path, so a domain that genuinely publishes no record is not re-queried per
-  message.
+  window, after resolution recovered.
 - **`Temperror` in `SpfResultsCache`.** The same trap one layer up: that cache is connection-scoped
   with no TTL and survives `RSET`, so one SERVFAIL would have pinned a 451 for the whole session.
+
+Definitive negatives *are* cached, but by the adapter rather than the library. DnsClient.NET
+classifies NXDOMAIN and NODATA as "failed results" under that same `CacheFailedResults` flag, so it
+cannot separate them from a SERVFAIL — turning the flag off to protect against stale transients would
+have stopped caching definitive negatives too. That matters here more than it might elsewhere:
+"publishes no SPF record" is the common case for exactly the unauthenticated mail this relay sees, and
+re-querying it per message turns junk traffic into amplified outbound DNS load.
+
+`DnsClientResolver` therefore keeps its own negative cache, honouring the SOA MINIMUM (RFC 2308)
+clamped to the same 5-second/5-minute bounds, with a **hard 4096-entry cap**. That cap is not
+decoration: negative answers are precisely what a flood of made-up sender domains produces, so this is
+the half of the cache most exposed to attacker-chosen keys. `DnsResolverCacheTests` asserts both that
+NXDOMAIN and NODATA avoid a second wire query, and that the cap actually evicts under a flood.
 
 The replacement also fixed the split-TXT defect (Q11): the old client dropped multi-string TXT records
 entirely, so any SPF record over 255 bytes — which is how provider include-chains are published —

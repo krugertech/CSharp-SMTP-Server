@@ -134,4 +134,94 @@ public sealed class DnsResolverCacheTests
 
         Assert.Equal(afterFirstMessage, stub.QueryCount);
     }
+
+    [Fact]
+    public async Task NxdomainIsCached_SecondLookupDoesNotReachTheWire()
+    {
+        // "This domain does not exist" is a definitive answer, and it is the answer for a large share
+        // of the unauthenticated mail this relay sees. Re-querying it per message turns junk traffic
+        // into amplified outbound DNS load.
+        //
+        // DnsClient.NET lumps definitive negatives in with transient failures under CacheFailedResults,
+        // which has to stay off, so the resolver caches this half itself.
+        using var stub = new DnsStub();
+        stub.SetNxDomain("gone.test");
+
+        var resolver = ResolverFor(stub);
+
+        Assert.Equal(DnsQueryStatus.NameError, (await resolver.QueryAsync("gone.test", DnsRecordType.Txt)).Status);
+        var afterFirst = stub.QueryCount;
+        Assert.True(afterFirst > 0);
+
+        for (var i = 0; i < 5; i++)
+            Assert.Equal(DnsQueryStatus.NameError, (await resolver.QueryAsync("gone.test", DnsRecordType.Txt)).Status);
+
+        Assert.Equal(afterFirst, stub.QueryCount);
+    }
+
+    [Fact]
+    public async Task NoDataIsCached_SecondLookupDoesNotReachTheWire()
+    {
+        // NODATA: the name exists but publishes no record of this type — which is exactly "this domain
+        // has no SPF record", the most common negative in normal traffic.
+        using var stub = new DnsStub();
+        stub.AddA("nospf.test", IPAddress.Parse("198.51.100.4")); // exists, but no TXT
+
+        var resolver = ResolverFor(stub);
+
+        var first = await resolver.QueryAsync("nospf.test", DnsRecordType.Txt);
+        Assert.Equal(DnsQueryStatus.Success, first.Status);
+        Assert.Empty(first.Records);
+
+        var afterFirst = stub.QueryCount;
+
+        for (var i = 0; i < 5; i++)
+            Assert.Empty((await resolver.QueryAsync("nospf.test", DnsRecordType.Txt)).Records);
+
+        Assert.Equal(afterFirst, stub.QueryCount);
+    }
+
+    [Fact]
+    public async Task NegativeCacheIsBounded_UnderAFloodOfDistinctNames()
+    {
+        // Negative answers are what a flood of made-up sender domains produces, and cache keys are
+        // therefore attacker-chosen. The negative cache has a hard entry cap so that traffic cannot
+        // grow it without limit; this asserts the cap is enforced rather than merely intended, by
+        // showing an early name is evicted once the cap is passed.
+        using var stub = new DnsStub();
+        var resolver = ResolverFor(stub);
+
+        // The stub answers NOERROR/empty for any unregistered name, so each of these is a NODATA.
+        await resolver.QueryAsync("first.flood.test", DnsRecordType.Txt);
+        var afterFirst = stub.QueryCount;
+
+        // Still cached before the flood.
+        await resolver.QueryAsync("first.flood.test", DnsRecordType.Txt);
+        Assert.Equal(afterFirst, stub.QueryCount);
+
+        for (var i = 0; i < 4200; i++) // past the 4096-entry cap
+            await resolver.QueryAsync($"n{i}.flood.test", DnsRecordType.Txt);
+
+        var beforeRecheck = stub.QueryCount;
+        await resolver.QueryAsync("first.flood.test", DnsRecordType.Txt);
+
+        Assert.True(stub.QueryCount > beforeRecheck, "the negative cache grew past its cap instead of evicting");
+    }
+
+    [Fact]
+    public async Task TransientFailure_IsNotServedFromTheNegativeCache()
+    {
+        // The negative cache must never absorb a transient failure: that would reintroduce the stale
+        // Temperror trap one layer down, deferring a retrying sender after DNS recovered.
+        using var stub = new DnsStub();
+        stub.SetServFail("broken.test");
+
+        var resolver = ResolverFor(stub);
+
+        Assert.Equal(DnsQueryStatus.Failure, (await resolver.QueryAsync("broken.test", DnsRecordType.Txt)).Status);
+        var afterFailure = stub.QueryCount;
+
+        Assert.Equal(DnsQueryStatus.Failure, (await resolver.QueryAsync("broken.test", DnsRecordType.Txt)).Status);
+        Assert.True(stub.QueryCount > afterFailure, "a transient failure was cached");
+    }
 }

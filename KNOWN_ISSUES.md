@@ -84,22 +84,31 @@ DnsClient.NET with a TTL-aware in-process cache. `DnsResolverCacheTests` proves 
 count against the stub — a repeated lookup within TTL issues no second wire query, and an SPF
 include chain resolves once across repeated evaluations rather than per message.
 
-### The DNS response cache has no entry-count bound
+### The positive DNS response cache has no entry-count bound
 
-DnsClient.NET's cache is keyed by query and bounded only in *time*: `MaximumCacheTimeout` limits how
-long an entry lives, and there is no setting for how many entries may exist. Sending domains are
-chosen by whoever connects, so cache keys are attacker-influenced and a flood of distinct domains
-grows the cache with nothing evicting entries early.
+DnsClient.NET's own cache is keyed by query and bounded only in *time*: `MaximumCacheTimeout` limits
+how long an entry lives, and there is no setting for how many entries may exist. Sending domains are
+chosen by whoever connects, so cache keys are attacker-influenced.
 
-`DnsClientResolver` caps `MaximumCacheTimeout` at 5 minutes to keep the working set bounded by
+This applies to **positive** answers only, and exploiting it takes more than junk traffic: an
+attacker needs each made-up name to actually resolve, which means controlling a zone with wildcard
+records. A flood of nonexistent domains produces negative answers, and those go to the resolver's own
+negative cache, which *is* hard-bounded at 4096 entries.
+
+`DnsClientResolver` caps `MaximumCacheTimeout` at 5 minutes so the positive working set is bounded by
 connection rate rather than by uptime. That is a mitigation, not a fix: the ceiling trades some cache
-effectiveness for a bounded window, and a sustained flood of unique names can still grow memory
-within it. A hard bound would need an eviction policy the library does not provide — a bounded LRU in
-front of the resolver, or per-connection admission control.
+effectiveness for a bounded window, and a sustained flood of resolvable unique names can still grow
+memory within it. A hard bound would need an eviction policy the library does not expose — a bounded
+LRU in front of it, or per-connection DNS admission control.
 
-Transient failures are deliberately not cached (`CacheFailedResults = false`), because SPF reports
-`Temperror` for them and DMARC defers on `Temperror`; a cached SERVFAIL would keep deferring a sender
-that retries after resolution recovered.
+Negative answers and transient failures are handled by the adapter rather than the library, because
+DnsClient.NET lumps them together under `CacheFailedResults` and they need opposite treatment:
+
+- **Transient failures are never cached.** SPF reports `Temperror` and DMARC defers on it, so a cached
+  SERVFAIL would keep deferring a sender that retries after resolution recovered.
+- **Definitive negatives (NXDOMAIN, NODATA) are cached**, honouring the SOA MINIMUM per RFC 2308 with
+  a hard 4096-entry cap. "Publishes no SPF record" is the common case for unauthenticated mail here,
+  so re-querying it per message would amplify junk traffic into outbound DNS load.
 
 ### SPF result deviations (Q12a/Q12c) — fixed
 

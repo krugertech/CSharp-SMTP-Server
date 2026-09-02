@@ -57,11 +57,16 @@ skip decisions are retained in the architecture's
   | `SpfValidator(EndPoint, DnsClientOptions?)` and `(EndPoint, IErrorLogging?)` | `SpfValidator(IPEndPoint)` |
   | `SpfValidator(IPAddress, ushort, DnsClientOptions?)` and `(string, ushort, DnsClientOptions?)` | `SpfValidator(IPEndPoint)` |
   | `SMTPServer.DnsClient` | `SMTPServer.DnsResolver`, typed `IDnsResolver` |
-  | `DnsLogger` (implemented the old client's `IErrorLogging`) | Removed. DnsClient.NET uses `Microsoft.Extensions.Logging`; failed lookups surface as `DnsQueryStatus.Failure` |
+  | `DnsLogger` (implemented the old client's `IErrorLogging`) | Removed. Failed lookups surface as `DnsQueryStatus.Failure` and are reported through the server's own `ILogger`, so DNS outages stay visible |
 
   Supply a custom resolver by implementing `IDnsResolver`; build the stock one with
-  `SMTPServer.CreateResolver(DnsResolverMode, endpoints)`. Responses are cached in process, TTL-aware,
-  with a 5-second floor and a 5-minute ceiling. Transient failures are **not** cached — see Fixed.
+  `SMTPServer.CreateResolver(DnsResolverMode, endpoints, logger)`. Responses are cached in process,
+  TTL-aware, with a 5-second floor and a 5-minute ceiling. Transient failures are **not** cached,
+  while definitive negatives are, in a separately bounded cache — see Fixed.
+
+  The concrete implementation is `internal`: its constructor takes a DnsClient.NET options type, and
+  exposing that would put the resolver library straight back into the API surface this abstraction
+  exists to clear.
 
   This also resolves upstream issue #11, the namespace collision with Couchbase's `DnsClient`
   package: the collision was with DnsClient.NET, which is now the dependency.
@@ -338,8 +343,10 @@ is the barrier.
 - **Transient DNS failures are not cached.** `CacheFailedResults` is off deliberately. SPF reports
   `Temperror` for a failed lookup and DMARC defers on it, so a cached SERVFAIL would keep deferring a
   sender that retries within the cache window, after resolution had already recovered. Definitive
-  negatives (NXDOMAIN, empty NOERROR) are still cached by the normal TTL path, so a domain that
-  genuinely publishes no record is not re-queried per message.
+  negatives are cached separately by the adapter — DnsClient.NET classifies NXDOMAIN and NODATA as
+  "failed results" under the same flag, so it cannot tell them apart from a SERVFAIL. That negative
+  cache honours the SOA MINIMUM (RFC 2308) and carries a hard 4096-entry cap, because negative
+  answers are precisely what a flood of made-up sender domains produces.
 
 - **Two wire-format defects in the `DnsStub` test server.** Neither was reachable with the previous
   DNS client, and both broke every SPF and DMARC test against a stricter one: answer RRs carried a
