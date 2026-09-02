@@ -142,6 +142,36 @@ handled as unauthenticated. See [RELAY-SENDER-AUTHORIZATION.md](RELAY-SENDER-AUT
 The former DNS fail-open for `a` and `mx` mechanisms (Q12b) is fixed and is documented in the
 changelog.
 
+### The `exists:` mechanism is unimplemented and silently skipped
+
+`exists:` (RFC 7208 §5.7) is absent from the mechanism switch in `SpfValidator.CheckHost`. Because
+that switch has no `default` case, an unmatched term falls out of it and evaluation simply continues
+to the next one, so the mechanism is **skipped rather than rejected**.
+
+Confirmed by probe: for `v=spf1 exists:%{i}._spf.example -all` with the client's lookup name present
+in DNS, `CheckHost` returns `Fail` — the `exists:` term is ignored and the terminal `-all` applies —
+where RFC 7208 requires `Pass`.
+
+The error direction is the concerning part: this **rejects mail it should accept**. A customer whose
+provider publishes `exists:` gets a `554 5.7.23` at `MAIL FROM`. It also interacts with the DMARC
+work, since an SPF result that should have been `Pass` instead denies DMARC its only authenticated
+identifier.
+
+Related: SPF macro expansion (`%{i}`, `%{s}`, `%{d}` …, RFC 7208 §7) is not implemented at all, and
+`exists:` is rarely useful without it. Implementing one without the other has limited value.
+
+### An unrecognized SPF mechanism is skipped instead of producing `permerror`
+
+The same missing `default` case. RFC 7208 §4.6.1 makes an unknown mechanism a syntax error, and
+§4.6/§6.6 require `permerror`; this implementation ignores the term and keeps evaluating.
+
+Confirmed by probe: `v=spf1 bogusmech:xyz -all` returns `Fail` rather than `Permerror`.
+
+That means a malformed record is evaluated as though the bad term were not there, so the verdict
+reflects a policy the domain did not publish. Both this and `exists:` above are fixed by giving the
+switch a `default` — but the two need opposite handling (`exists:` implemented, unknown terms
+rejected), so the `default` must come with `exists:` support rather than before it.
+
 ### `redirect=` is evaluated positionally (Q13)
 
 The validator evaluates `redirect=` where it appears and can skip mechanisms that follow it. RFC

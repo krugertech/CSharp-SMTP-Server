@@ -1,3 +1,4 @@
+using System.Text;
 using System.Net;
 using CSharp_SMTP_Server.Interfaces;
 using CSharp_SMTP_Server.Protocol;
@@ -17,7 +18,8 @@ namespace CSharp_SMTP_Server.Tests;
 public sealed class SpfDmarcIntegrationTests
 {
     private static async Task<(SmtpSession S, SMTPServer Server, RecordingDelivery Delivery)> ConnectReadyAsync(
-        DnsStub stub, string suffixListUrl, bool validateSpf, bool validateDmarc, string helo = "test.client")
+        DnsStub stub, string suffixListUrl, bool validateSpf, bool validateDmarc, string helo = "test.client",
+        IAuthLogin? auth = null)
     {
         var options = new ServerOptions(validateSpf, validateDmarc, new IPEndPoint(IPAddress.Loopback, (ushort)stub.Port))
         {
@@ -25,9 +27,12 @@ public sealed class SpfDmarcIntegrationTests
             PublicSuffixList = suffixListUrl
         };
 
+        if (auth != null)
+            options.RequireEncryptionForAuth = false; // plaintext loopback session
+
         var port = TestPorts.Allocate();
         var delivery = new RecordingDelivery();
-        var server = TestServers.Build(port, options, delivery: delivery);
+        var server = TestServers.Build(port, options, delivery: delivery, auth: auth);
         server.Start();
 
         var s = await SmtpSession.ConnectAsync(port);
@@ -36,6 +41,20 @@ public sealed class SpfDmarcIntegrationTests
         await s.ReadResponseAsync();
         return (s, server, delivery);
     }
+
+    /// <summary>Accepts exactly user/pass, so a session can be put into the authenticated state.</summary>
+    private sealed class StaticAuth : IAuthLogin
+    {
+        public Task<bool> AuthPlain(string authorizationIdentity, string authenticationIdentity,
+            string password, EndPoint? remoteEndPoint, bool secureConnection) =>
+            Task.FromResult(authenticationIdentity == "user" && password == "pass");
+
+        public Task<bool> AuthLogin(string login, string password,
+            EndPoint? remoteEndPoint, bool secureConnection) =>
+            Task.FromResult(login == "user" && password == "pass");
+    }
+
+    private static string B64(string value) => Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
 
     #region SPF at MAIL FROM (§6)
 
@@ -665,6 +684,158 @@ public sealed class SpfDmarcIntegrationTests
             // Re-queried rather than served from a stale Temperror: SPF now passes, DMARC aligns.
             Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
             Assert.Equal(ValidationResult.Pass, delivery.Delivered.Single().DMARCValidationResult);
+        }
+    }
+
+    #endregion
+
+    #region Authenticated sessions bypass both checks
+
+    /// <summary>
+    /// An authenticated session skips DMARC entirely, exactly as it skips SPF. The handover asked for
+    /// this to be confirmed rather than assumed, because the DMARC fix made the bypass matter more:
+    /// DMARC now needs an authenticated identifier, and an authenticated session has one that did not
+    /// come from SPF at all.
+    /// </summary>
+    /// <remarks>
+    /// The scenario is deliberately one that would be REFUSED unauthenticated — a spoofed From under
+    /// p=reject, unaligned with the envelope — so a passing result proves the bypass is what delivered
+    /// it, not some incidental leniency. The transaction must record UserAuthenticated rather than any
+    /// evaluated verdict.
+    /// </remarks>
+    [Fact]
+    public async Task AuthenticatedSession_BypassesDmarc_EvenWhenItWouldOtherwiseFail()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+        stub.AddTxt("_dmarc.header.com", "v=DMARC1; p=reject");
+
+        var (s, server, delivery) = await ConnectReadyAsync(
+            stub, http.Url, validateSpf: true, validateDmarc: true, auth: new StaticAuth());
+
+        using (server)
+        await using (s)
+        {
+            await s.Send("AUTH PLAIN " + B64("\0user\0pass"));
+            Assert.Equal("235 2.7.0 Authentication Succeeded", await s.ReadLineAsync());
+
+            await s.Send("MAIL FROM:<env@example.com>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            // Unaligned with the envelope, under p=reject: a 554 for an unauthenticated client.
+            await s.Send("From: a@header.com");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("250 2.0.0 OK", await s.ReadLineAsync());
+
+            var tx = delivery.Delivered.Single();
+            Assert.Equal("user", tx.AuthenticatedUser);
+            Assert.Equal(ValidationResult.UserAuthenticated, tx.SPFValidationResult);
+            Assert.Equal(ValidationResult.UserAuthenticated, tx.DMARCValidationResult);
+
+            // No dmarc= verdict is claimed for a message that was never evaluated.
+            Assert.DoesNotContain("dmarc=", tx.RawBody);
+        }
+    }
+
+    #endregion
+
+    #region DMARC policy lookup failure (§6.6.3)
+
+    /// <summary>
+    /// A DNS failure while fetching the DMARC policy itself defers the message, rather than reading as
+    /// "this domain publishes no policy".
+    /// </summary>
+    /// <remarks>
+    /// This is the second Temperror source and it is distinct from the SPF one: here SPF succeeds
+    /// outright and only the <c>_dmarc</c> lookup fails. Collapsing that into None would have let a
+    /// resolver outage silently disable DMARC enforcement for every domain at once — precisely the
+    /// window an attacker would pick — so the branch exists, and this is what exercises it.
+    /// </remarks>
+    [Fact]
+    public async Task Data_DmarcRecordLookupFails_DeferredWith451_NoDelivery()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+
+        // SPF authenticates the envelope domain cleanly...
+        stub.AddTxt("victim.example", "v=spf1 ip4:127.0.0.1 -all");
+        // ...but the policy lookup itself is broken, for the domain and its organizational domain.
+        stub.SetServFail("_dmarc.victim.example");
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<sender@victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync()); // SPF passed — nothing refused here
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: sender@victim.example");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("451 4.7.1 Temporary error validating DMARC, please retry later", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
+        }
+    }
+
+    /// <summary>
+    /// The same deferral, but failing on the FIRST policy lookup — the exact subdomain name — while the
+    /// organizational domain would have answered.
+    /// </summary>
+    /// <remarks>
+    /// Worth separating because the two lookups are distinct branches and a single-label test cannot
+    /// tell them apart: for <c>victim.example</c> the domain and its organizational domain are the same
+    /// name, so one SERVFAIL covers both calls and the first branch can be deleted without any test
+    /// noticing. Here <c>sub.victim.example</c> fails while <c>victim.example</c> resolves, so only the
+    /// first branch can produce the 451.
+    ///
+    /// The org record deliberately says <c>p=none</c>: if the first failure were swallowed, evaluation
+    /// would fall through to that record, find it aligned, and deliver — a resolver outage on the
+    /// specific name silently downgrading the policy actually in force.
+    /// </remarks>
+    [Fact]
+    public async Task Data_DmarcSubdomainLookupFails_DeferredWith451_NotFallingBackToOrgPolicy()
+    {
+        using var stub = new DnsStub();
+        using var http = new LocalHttpServer(SuffixListFixture.CanonicalList);
+
+        stub.AddTxt("sub.victim.example", "v=spf1 ip4:127.0.0.1 -all"); // SPF passes for the subdomain
+        stub.SetServFail("_dmarc.sub.victim.example");                  // its own policy is unreachable
+        stub.AddTxt("_dmarc.victim.example", "v=DMARC1; p=none");       // the org policy WOULD answer
+
+        var (s, server, delivery) = await ConnectReadyAsync(stub, http.Url, validateSpf: true, validateDmarc: true);
+        using (server)
+        await using (s)
+        {
+            await s.Send("MAIL FROM:<sender@sub.victim.example>");
+            Assert.Equal("250 2.0.0", await s.ReadLineAsync());
+            await s.Send("RCPT TO:<r@example.com>");
+            Assert.Equal("250 2.1.5", await s.ReadLineAsync());
+            await s.Send("DATA");
+            Assert.StartsWith("354", await s.ReadLineAsync());
+
+            await s.Send("From: sender@sub.victim.example");
+            await s.Send("To: r@example.com");
+            await s.Send("");
+            await s.Send("body");
+            await s.Send(".");
+
+            Assert.Equal("451 4.7.1 Temporary error validating DMARC, please retry later", await s.ReadLineAsync());
+            Assert.Empty(delivery.Delivered);
         }
     }
 
