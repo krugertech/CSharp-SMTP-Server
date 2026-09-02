@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Standalone load harness. Deliberately NOT part of the test project: the point of this
+       benchmark is that the traffic generator runs in its own OS process with its own CPU
+       affinity, so pinning the server does not also pin the client that feeds it. The in-test
+       harness under CSharp-SMTP-Server.Tests/Load co-locates both and therefore cannot separate
+       server cost from generator cost. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>CSharp_SMTP_Server.Bench</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <LangVersion>12</LangVersion>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- ProcessorAffinity is Windows/Linux only; this harness targets those by design. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CSharp-SMTP-Server\CSharp-SMTP-Server.csproj" />
+  </ItemGroup>
+
+</Project>
