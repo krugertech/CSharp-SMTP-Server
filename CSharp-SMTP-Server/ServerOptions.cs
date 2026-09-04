@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Security.Authentication;
+using CSharp_SMTP_Server.Interfaces;
 using CSharp_SMTP_Server.Protocol.Dns;
 // ReSharper disable FieldCanBeMadeReadOnly.Global
 // ReSharper disable ConvertToConstant.Global
@@ -50,6 +51,53 @@ namespace CSharp_SMTP_Server
 		/// URL of list of all public suffixes of domains
 		/// </summary>
 		public string PublicSuffixList = "https://raw.githubusercontent.com/publicsuffix/list/master/public_suffix_list.dat";
+
+		/// <summary>
+		/// Deadline for the delivery handler (<see cref="IMailDelivery.EmailReceivedAsync"/>). When it
+		/// expires, the handler's cancellation token is cancelled and the message is answered
+		/// <c>451 4.4.7</c> regardless of what the handler subsequently returns.
+		/// <para>
+		/// This bounds whether the message is <i>accepted</i>, not how long the session lasts: a handler
+		/// that does not observe its cancellation token is still awaited to completion, because the
+		/// message body must stay alive until it returns.
+		/// </para>
+		/// <para>
+		/// Enabling this requires the delivery handler to be cancellation-aware (otherwise the deadline
+		/// buys nothing) and delivery storage to be idempotent or deduplicating (a handler can commit the
+		/// message, observe cancellation only afterwards, and have that <c>Ok</c> discarded in favour of
+		/// <c>451</c> — the sender then retries a message that is already stored).
+		/// </para>
+		/// <para>
+		/// Classification is decided from elapsed monotonic time (<see cref="System.Diagnostics.Stopwatch"/>),
+		/// read directly by the same code path immediately after the handler's task completes — not from a
+		/// timer callback's own completion (measured to lose a race against the handler's own continuation
+		/// often enough to matter), and not from a synchronous continuation racing the handler's own await
+		/// resumption (measured to lose that race in roughly 70% of trials, because
+		/// <see cref="System.Threading.Tasks.TaskContinuationOptions.ExecuteSynchronously"/> is only a
+		/// scheduling hint, not a guarantee). Both were tried and rejected; see the implementation notes in
+		/// <c>TransactionCommands</c>.
+		/// </para>
+		/// <para>
+		/// This still leaves an unavoidable, and potentially not small, scheduling margin: <b>this thread
+		/// only learns the handler is done when its own <c>await</c> resumes</b>, and if that resumption is
+		/// itself queued behind other work — a busy thread pool, a handler using
+		/// <see cref="System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously"/> under
+		/// load — the delay between "the handler actually finished" and "this code notices" can reach tens
+		/// of milliseconds under realistic queueing (measured), not merely microseconds. A handler that
+		/// finishes just inside the deadline can still receive <c>451</c> if this thread does not get to
+		/// check in time. There is no fix for this within the library: nothing outside the handler can learn
+		/// of its completion earlier than its own continuation is scheduled to run, short of requiring every
+		/// <see cref="IMailDelivery"/> implementation to report a completion timestamp itself, which this
+		/// design does not require. This is inherent to any timeout built on cooperative async scheduling
+		/// (the same applies to <c>HttpClient.Timeout</c> and comparable mechanisms); it is not a defect this
+		/// implementation introduces, and a busier check cannot remove it.
+		/// </para>
+		/// <see cref="TimeSpan.Zero"/> disables the deadline. A negative value, or a value at or beyond
+		/// approximately 49.7 days, is rejected when a delivery is attempted — the message is answered
+		/// <c>451 4.3.0</c> rather than silently treated as disabled or immediate.
+		/// Default: <see cref="TimeSpan.Zero"/> (disabled).
+		/// </summary>
+		public TimeSpan DeliveryTimeout = TimeSpan.Zero;
 
 		/// <summary>
 		/// Enables or disables SPF validation of emails sent by unauthenticated users.

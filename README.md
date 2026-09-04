@@ -249,6 +249,7 @@ var options = new ServerOptions(
     ServerName = "journal.example.com",
     MessageCharactersLimit = 200u * 1024 * 1024,
     RecipientsLimit = 0,
+    DeliveryTimeout = TimeSpan.FromMinutes(2),
 };
 ```
 
@@ -269,6 +270,14 @@ For this deployment:
 - Make storage idempotent. Current shutdown stops active sessions rather than draining them, so a
   commit followed by a lost `250` can cause the sender to retry. See
   [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#graceful-shutdown-and-duplicate-delivery).
+- `DeliveryTimeout` bounds how long a delivery handler may hold a session open before the message is
+  answered `451 4.4.7` instead of accepted. It requires the same idempotent storage as above — a
+  handler that commits the record and only afterwards observes the expired deadline still gets its
+  `Ok` discarded in favour of `451`, so the sender retries a report that is already archived. It also
+  requires the handler's write path to observe its `CancellationToken`; otherwise the deadline cannot
+  make the handler return any sooner and the session is not actually bounded. Leave it at its default
+  (`TimeSpan.Zero`, disabled) unless both hold. See
+  [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md#delivery-cancellation-does-not-detect-an-idle-peer-disconnect-q8).
 
 The heavy test tier validates 150 MB delivery, concurrent large messages, bounded memory behavior,
 and the relay-specific defaults; see [`TESTING.md`](TESTING.md#load-and-integrity-tests).

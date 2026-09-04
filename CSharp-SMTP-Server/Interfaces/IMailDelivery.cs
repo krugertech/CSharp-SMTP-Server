@@ -16,9 +16,16 @@ namespace CSharp_SMTP_Server.Interfaces
 		/// </summary>
 		/// <param name="transaction">The completed mail transaction.</param>
 		/// <param name="cancellationToken">
-		/// Cancelled when the server tears down the client connection. A remote disconnect is not
-		/// independently observed while this handler is running, so consumers should also enforce any
-		/// required delivery timeout.
+		/// Cancelled when the server tears down the client connection, and also when
+		/// <see cref="ServerOptions.DeliveryTimeout"/> expires (if configured). A remote disconnect is
+		/// not independently observed while this handler is running, so consumers should also enforce
+		/// any required delivery timeout.
+		/// <para>
+		/// A handler that does not observe this token is still awaited to completion — the message body
+		/// stays alive only until the handler returns — so an unresponsive handler will hold the session
+		/// open past the configured <see cref="ServerOptions.DeliveryTimeout"/>. To have the timeout take
+		/// effect promptly, the handler's write path must observe cancellation.
+		/// </para>
 		/// </param>
 		Task<SmtpDeliveryResult> EmailReceivedAsync(MailTransaction transaction, CancellationToken cancellationToken = default);
 

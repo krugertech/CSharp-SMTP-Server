@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using CSharp_SMTP_Server.Misc;
 using CSharp_SMTP_Server.Networking;
@@ -406,14 +408,145 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 					var delivery = (MailTransaction)processor.Transaction.Clone();
 					processor.Transaction = null;
 
-					SmtpDeliveryResult deliveryResult;
+					// Everything from here on must run under try/finally: delivery.Body is now solely
+					// owned by this scope (see Clone() above), and a throw from timeout validation or the
+					// Timer constructor's own range check (its internal due-time conversion is a uint
+					// millisecond count, so a TimeSpan of ~49.7 days or more overflows it) must not leak
+					// its temp file.
+					SmtpDeliveryResult? deliveryResult = null;
+					CancellationTokenSource? deadlineOnlySource = null;
+					CancellationTokenSource? linkedSource = null;
+					Timer? deadlineTimer = null;
 					try
 					{
-						deliveryResult = await processor.Server.DeliverMessage(delivery, processor.ConnectionToken);
+						var deliveryTimeout = processor.Server.Options.DeliveryTimeout;
+						if (deliveryTimeout < TimeSpan.Zero)
+							throw new InvalidOperationException($"{nameof(ServerOptions.DeliveryTimeout)} must not be negative.");
+
+						var timeoutEnabled = deliveryTimeout != TimeSpan.Zero;
+						CancellationToken deliveryToken;
+						// Monotonic: computed once, before anything is awaited, and compared directly
+						// against a fresh Stopwatch.GetTimestamp() read after deliveryTask completes —
+						// not against a flag set by a Timer callback (an earlier version of this code did
+						// that). Measured directly: with a Timer racing a completing task under ordinary
+						// (not even adversarial) scheduling, the Timer's callback lost that race and left
+						// its flag still false in 27/200 trials — the callback that sets the flag is
+						// itself just more queued work, so "flag not yet set" does not mean "deadline not
+						// yet reached" whenever the flag-setting callback is the thing that got delayed.
+						// A direct Stopwatch read has no equivalent gap: nothing else needs to run first,
+						// because it is read by the same thread, in the same statement, that just resumed
+						// from awaiting deliveryTask — there is no second scheduled operation to race.
+						var deadline = 0L;
+						if (timeoutEnabled)
+						{
+							deadline = Stopwatch.GetTimestamp() +
+								(long)(deliveryTimeout.Ticks * ((double)Stopwatch.Frequency / TimeSpan.TicksPerSecond));
+
+							// deadlineOnlySource still exists to give the handler itself a cancellation
+							// signal (so a cooperative handler can return promptly) — deliveryToken is
+							// linked from it below — but it is no longer read to decide the outcome; see
+							// the Stopwatch comparison after the await, which cannot have this gap.
+							deadlineOnlySource = new CancellationTokenSource();
+							linkedSource = CancellationTokenSource.CreateLinkedTokenSource(
+								processor.ConnectionToken, deadlineOnlySource.Token);
+							deliveryToken = linkedSource.Token;
+
+							// Deliberately NOT `new CancellationTokenSource(deliveryTimeout)`, whose own
+							// built-in timer calls Cancel() directly on a thread-pool timer thread with
+							// nothing to catch a throw. Cancel() synchronously runs every callback
+							// registered on this token AND on linkedSource's token — including any the
+							// handler itself registered via deliveryToken.Register(...), a supported,
+							// expected IMailDelivery pattern (see SynchronousCallbackRaceDelivery in the
+							// tests). If such a callback throws, CancellationTokenSource rethrows it
+							// wrapped in an AggregateException from wherever Cancel() was invoked; on
+							// .NET's own timer thread that is unhandled and terminates the process —
+							// confirmed by direct experiment (a throwing Token.Register callback reliably
+							// crashed the test host when driven by CancellationTokenSource's built-in
+							// timer). Routing the fire through an explicit Timer with its own try/catch
+							// means a misbehaving handler can only corrupt its own delivery, never bring
+							// down the server.
+							deadlineTimer = new Timer(_ =>
+							{
+								try
+								{
+									deadlineOnlySource.Cancel();
+								}
+								catch (Exception ex)
+								{
+									processor.Server.LoggerInterface?.LogError(
+										"[DATA] A DeliveryTimeout cancellation callback threw: " + ex.GetType().FullName + ": " + ex.Message);
+								}
+							}, null, deliveryTimeout, Timeout.InfiniteTimeSpan);
+						}
+						else
+						{
+							deliveryToken = processor.ConnectionToken;
+						}
+
+						// DeliverMessage is a direct pass-through to the handler's own EmailReceivedAsync
+						// (see SMTPServer.DeliverMessage): a handler that throws OperationCanceledException
+						// synchronously — e.g. token.ThrowIfCancellationRequested() before returning any
+						// Task — throws right here, out of this call, not out of an awaited Task. That is
+						// why this call is inside the same try/catch as the await below rather than left
+						// bare: excluding it would let a synchronous throw skip both the deadline/exception
+						// classification and the final SMTP response entirely, leaving the client hanging.
+						Exception? deliveryException = null;
+						try
+						{
+							// Never abandon the await: delivery.Body is disposed in the outer finally once
+							// deliveryTask itself completes, and a handler that is still writing to it when
+							// this method returns would have it disposed out from under it. This holds
+							// regardless of how classification below turns out — the deadline only decides
+							// which response goes out, not whether the handler is still awaited to completion.
+							deliveryResult = await processor.Server.DeliverMessage(delivery, deliveryToken);
+						}
+						catch (Exception ex)
+						{
+							deliveryException = ex;
+						}
+
+						// The deadline is authoritative over the handler's result: a handler may observe
+						// cancellation and still return normally (including Ok), or simply finish late. If
+						// the timeout were inferred only from a thrown OperationCanceledException, that
+						// returned result would be written below and a 250 would be sent after the deadline
+						// expired. So the classification is settled here from the elapsed monotonic time
+						// against the deadline snapshotted above — read directly, by this thread, with no
+						// intervening scheduled operation — and from processor.ConnectionToken, checked
+						// first because local teardown is the more specific truth when both have fired.
+						if (processor.ConnectionToken.IsCancellationRequested)
+						{
+							// Local teardown: the socket is going away. No response is attempted — this
+							// is the only branch that takes the no-write path.
+							return;
+						}
+
+						if (timeoutEnabled && Stopwatch.GetTimestamp() >= deadline)
+						{
+							processor.Server.LoggerInterface?.LogError("[DATA] Delivery handler exceeded DeliveryTimeout; answering 451 4.4.7.");
+							// Best-effort: the peer may already be gone (a remote FIN/RST is not observed
+							// while delivery was awaited). WriteText swallows IOException, so this fails
+							// harmlessly if so.
+							await processor.WriteCode(451, "4.4.7", "Requested action aborted: delivery timeout exceeded");
+							deliveryResult = null;
+							return;
+						}
+
+						if (deliveryException != null)
+						{
+							processor.Server.LoggerInterface?.LogError("[DATA] Delivery handler threw before SMTP ACK: " + deliveryException.GetType().FullName + ": " + deliveryException.Message);
+							await processor.WriteCode(451, "4.3.0", "Requested action aborted: local error in processing");
+							deliveryResult = null;
+							return;
+						}
 					}
-					catch (Exception ex)
+					catch (Exception ex) when (!(ex is OperationCanceledException))
 					{
-						processor.Server.LoggerInterface?.LogError("[DATA] Delivery handler threw before SMTP ACK: " + ex.GetType().FullName + ": " + ex.Message);
+						// Configuration-time failures (negative timeout, or a positive one so large — at
+						// or beyond ~49.7 days — that the Timer constructor's internal millisecond
+						// conversion overflows) reach here before any delivery attempt. The client still
+						// sent a complete DATA transaction and is waiting for a final response, so it
+						// gets one rather than being left hanging.
+						processor.Server.LoggerInterface?.LogError("[DATA] Delivery setup failed before dispatch: " + ex.GetType().FullName + ": " + ex.Message);
 						await processor.WriteCode(451, "4.3.0", "Requested action aborted: local error in processing");
 						return;
 					}
@@ -426,9 +559,17 @@ namespace CSharp_SMTP_Server.Protocol.Commands
 						// This is why GetBodyStream() is documented as valid only for the duration of the
 						// call: a handler that stashes the transaction for later gets a disposed body.
 						delivery.Body.Dispose();
+
+						// Disposed after the catch-path writes above and before the success write below —
+						// safe with respect to those writes, and does not touch processor's own _ts. The
+						// timer is disposed first so it cannot fire (and race a fresh use of the now-being-
+						// disposed deadlineOnlySource) during the sources' own disposal.
+						deadlineTimer?.Dispose();
+						linkedSource?.Dispose();
+						deadlineOnlySource?.Dispose();
 					}
 
-					await processor.WriteCode((ushort)deliveryResult.StatusCode, deliveryResult.EnhancedStatus, deliveryResult.Message);
+					await processor.WriteCode((ushort)deliveryResult!.StatusCode, deliveryResult.EnhancedStatus, deliveryResult.Message);
 					return;
 				}
 

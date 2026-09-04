@@ -20,13 +20,62 @@ the Kubernetes termination grace period, and then disposes the server. The host 
 
 ### Delivery cancellation does not detect an idle peer disconnect (Q8)
 
+**Mitigated, not fixed**, by `ServerOptions.DeliveryTimeout` (opt-in, default off).
+
 The token passed to `EmailReceivedAsync` is cancelled when the server tears down the connection.
 While the handler is running, the receive loop is awaiting that handler and does not poll the socket,
 so a remote disconnect alone may not cancel the token until the handler returns and the response
-write fails.
+write fails. `DeliveryTimeout` bounds this by cancelling the handler's token and answering `451 4.4.7`
+after a configured deadline, regardless of what the handler subsequently returns — but it is a
+deadline on message *acceptance*, not a detector of the disconnect itself: the peer may already be
+gone by the time the timeout fires, the `451` write is best-effort against that peer, and a handler
+that does not observe cancellation is still awaited to completion rather than abandoned (its message
+body must stay alive until it returns), so the session is not actually bounded in that case. Enabling
+it also requires idempotent/deduplicating delivery storage — see
+[Graceful shutdown and duplicate delivery](#graceful-shutdown-and-duplicate-delivery) — because a
+handler can commit the message, observe cancellation only afterwards, and have that `Ok` discarded in
+favour of `451`, causing a retry of an already-stored message.
 
-Pending work: add independent disconnect detection or a configurable delivery timeout. Handlers
-should enforce their own timeout until then.
+A real fix needs TLS-aware stream-level EOF handling with tests for `close_notify`, half-close,
+buffered pipelining, FIN and RST — a much larger piece of work, not currently justified. Until then,
+handlers should also enforce their own timeout independent of this option.
+
+The deadline itself is also a scheduling deadline, not a hard wall-clock cutoff: the server only
+learns a handler is done when its own `await` on the handler's task resumes, and under a busy thread
+pool — or a handler backed by a `TaskCompletionSource` using `RunContinuationsAsynchronously` — that
+resumption can lag true completion by tens of milliseconds under realistic queueing (measured), not
+merely microseconds. A handler that genuinely finishes just inside the deadline can still receive
+`451` if the server does not get scheduled to notice in time. This is inherent to any timeout built on
+cooperative async scheduling (the same applies to `HttpClient.Timeout`) and cannot be fixed without
+requiring every `IMailDelivery` implementation to report its own completion timestamp, which this
+design deliberately does not require. See `ServerOptions.DeliveryTimeout`'s XML doc for the mechanisms
+that were tried and rejected (a timer-set flag, and a synchronous continuation racing the handler's own
+await) before settling on this.
+
+### Concurrent processor disposal is reachable today, not latent
+
+`ClientProcessor.Dispose` guards with a non-atomic `if (_dispose) return; _dispose = true;`. Two
+callers can both pass this check: the receive path calls `Dispose(false, true)` after a write
+`IOException`, while `Listener.Dispose` is iterating its own snapshot of the same processor. One can
+then set `LingerState` or touch the streams after the other has already closed them, throwing
+`ObjectDisposedException`; because the listener's `foreach` does not isolate per-processor failures,
+that throw aborts teardown of every remaining session in the loop.
+
+**Concrete trigger: a remote disconnect during delivery coinciding with a deployment shutdown** —
+routine in a Kubernetes rollout. An earlier draft of the delivery-timeout plan called this
+unreachable; that was wrong.
+
+Fix: `Interlocked.Exchange` for disposal ownership, plus a try/catch around each processor in the
+listener's teardown loop. Deliberately not fixed alongside `ServerOptions.DeliveryTimeout` — see
+`plan-graceful-shutdown-delivery-cancel.md` — because it requires touching `Listener.Dispose()`,
+the most race-sensitive code in the repository, and that was kept out of scope for that change.
+
+### Unsynchronized listener list
+
+`SMTPServer.AddListener` mutates the `_listeners` `List` while `Dispose` enumerates it. Adding a
+listener concurrently with shutdown can throw `InvalidOperationException` (collection modified) or
+skip/duplicate an entry in the enumeration. Fix: guard `_listeners` with a lock, or switch to a
+thread-safe collection.
 
 ### No DKIM verification
 
